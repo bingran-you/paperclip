@@ -1431,46 +1431,6 @@ export function issueRoutes(
     };
   }
 
-  function queueAnnotationCommentWakeup(input: {
-    issue: { id: string; assigneeAgentId: string | null; status: string };
-    actor: { actorType: "user" | "agent"; actorId: string };
-    threadId: string;
-    commentId: string;
-    documentKey: string;
-  }) {
-    const assigneeId = input.issue.assigneeAgentId;
-    const selfComment = input.actor.actorType === "agent" && input.actor.actorId === assigneeId;
-    if (!assigneeId || selfComment || isClosedIssueStatus(input.issue.status)) return;
-    void heartbeat.wakeup(assigneeId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_commented",
-      payload: {
-        issueId: input.issue.id,
-        annotationThreadId: input.threadId,
-        annotationCommentId: input.commentId,
-        documentKey: input.documentKey,
-        mutation: "document_annotation_comment",
-      },
-      requestedByActorType: input.actor.actorType,
-      requestedByActorId: input.actor.actorId,
-      contextSnapshot: {
-        issueId: input.issue.id,
-        taskId: input.issue.id,
-        annotationThreadId: input.threadId,
-        annotationCommentId: input.commentId,
-        documentKey: input.documentKey,
-        source: "issue.document.annotation",
-        wakeReason: "issue_commented",
-      },
-    }).catch((err) => logger.warn({
-      err,
-      issueId: input.issue.id,
-      annotationThreadId: input.threadId,
-      annotationCommentId: input.commentId,
-    }, "failed to wake assignee on document annotation comment"));
-  }
-
   async function canonicalizePaperclipArtifactMetadata(input: {
     issue: { id: string; companyId: string };
     metadata: Record<string, unknown> | null | undefined;
@@ -2165,6 +2125,18 @@ export function issueRoutes(
     }
     if (!resolved.agent) {
       throw notFound("Agent not found");
+    }
+    if (resolved.agent.status === "pending_approval") {
+      throw conflict("Cannot assign work to pending approval agents");
+    }
+    if (resolved.agent.status === "terminated") {
+      throw conflict("Cannot assign work to terminated agents");
+    }
+    if (resolved.agent.orgChainHealth?.status === "invalid_org_chain") {
+      throw conflict(
+        resolved.agent.orgChainHealth?.repairGuidance ??
+          "Cannot assign work to agents with invalid org chains",
+      );
     }
     return resolved.agent.id;
   }
@@ -3123,16 +3095,6 @@ export function issueRoutes(
         },
       });
 
-      if (firstComment) {
-        queueAnnotationCommentWakeup({
-          issue,
-          actor,
-          threadId: thread.id,
-          commentId: firstComment.id,
-          documentKey: thread.documentKey,
-        });
-      }
-
       res.status(201).json(thread);
     },
   );
@@ -3213,14 +3175,6 @@ export function issueRoutes(
             currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
           }),
         },
-      });
-
-      queueAnnotationCommentWakeup({
-        issue,
-        actor,
-        threadId: comment.threadId,
-        commentId: comment.id,
-        documentKey: keyParsed.data,
       });
 
       res.status(201).json(comment);
@@ -4227,7 +4181,15 @@ export function issueRoutes(
       }
       if (!(await assertIssueReadAllowed(req, res, parent))) return;
     }
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, req.body))) return;
+    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+      companyId,
+      req.body.assigneeAgentId as string | null | undefined,
+    );
+    const createBody = {
+      ...req.body,
+      ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+    };
+    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, createBody))) return;
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
       await assertCanAssignTasks(req, companyId, {
         projectId: await resolveAssignmentProjectId({
@@ -4236,27 +4198,27 @@ export function issueRoutes(
           parentIssueId: req.body.parentId,
         }),
         parentIssueId: req.body.parentId ?? null,
-        assigneeAgentId: req.body.assigneeAgentId ?? null,
+        assigneeAgentId: createBody.assigneeAgentId ?? null,
         assigneeUserId: req.body.assigneeUserId ?? null,
       });
     }
-    await assertIssueEnvironmentSelection(companyId, req.body.executionWorkspaceSettings?.environmentId);
+    await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(req.body.executionPolicy),
+      normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
-    await assertCanManageIssueMonitor(access, req, companyId, req.body.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    await assertCanManageIssueMonitor(access, req, companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
       companyId,
-      projectId: req.body.projectId ?? null,
+      projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
     const issue = await svc.create(companyId, {
-      ...req.body,
+      ...createBody,
       id: issueId,
       executionPolicy,
       ...(sourceTrust ? { sourceTrust } : {}),
@@ -4343,32 +4305,40 @@ export function issueRoutes(
     if (!(await assertIssueReadAllowed(req, res, parent))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, req.body))) return;
+    const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+      parent.companyId,
+      req.body.assigneeAgentId as string | null | undefined,
+    );
+    const createBody = {
+      ...req.body,
+      ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+    };
+    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
       await assertCanAssignTasks(req, parent.companyId, {
-        projectId: req.body.projectId ?? parent.projectId ?? null,
+        projectId: createBody.projectId ?? parent.projectId ?? null,
         parentIssueId: parent.id,
-        assigneeAgentId: req.body.assigneeAgentId ?? null,
-        assigneeUserId: req.body.assigneeUserId ?? null,
+        assigneeAgentId: createBody.assigneeAgentId ?? null,
+        assigneeUserId: createBody.assigneeUserId ?? null,
       });
     }
-    await assertIssueEnvironmentSelection(parent.companyId, req.body.executionWorkspaceSettings?.environmentId);
+    await assertIssueEnvironmentSelection(parent.companyId, createBody.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
     const executionPolicy = applyActorMonitorScheduledBy(
-      normalizeIssueExecutionPolicy(req.body.executionPolicy),
+      normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
     );
-    await assertCanManageIssueMonitor(access, req, parent.companyId, req.body.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
+    await assertCanManageIssueMonitor(access, req, parent.companyId, createBody.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
     const issueId = randomUUID();
     const sourceTrust = await sourceTrustForActorWrite({
       id: issueId,
       companyId: parent.companyId,
-      projectId: req.body.projectId ?? parent.projectId ?? null,
+      projectId: createBody.projectId ?? parent.projectId ?? null,
       executionPolicy,
     }, actor);
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
-      ...req.body,
+      ...createBody,
       id: issueId,
       executionPolicy,
       ...(sourceTrust ? { sourceTrust } : {}),
@@ -4457,23 +4427,33 @@ export function issueRoutes(
     assertCompanyAccess(req, sourceIssue.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, sourceIssue))) return;
 
+    const requestedChildren = [];
     for (const child of req.body.children as Array<typeof req.body.children[number]>) {
-      assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(child));
-      if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, child))) return;
-      if (child.assigneeAgentId || child.assigneeUserId) {
+      const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
+        sourceIssue.companyId,
+        child.assigneeAgentId as string | null | undefined,
+      );
+      const childBody = {
+        ...child,
+        ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
+      };
+      requestedChildren.push(childBody);
+      assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
+      if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, childBody))) return;
+      if (childBody.assigneeAgentId || childBody.assigneeUserId) {
         await assertCanAssignTasks(req, sourceIssue.companyId, {
-          projectId: child.projectId ?? sourceIssue.projectId ?? null,
+          projectId: childBody.projectId ?? sourceIssue.projectId ?? null,
           parentIssueId: sourceIssue.id,
-          assigneeAgentId: child.assigneeAgentId ?? null,
-          assigneeUserId: child.assigneeUserId ?? null,
+          assigneeAgentId: childBody.assigneeAgentId ?? null,
+          assigneeUserId: childBody.assigneeUserId ?? null,
         });
       }
-      await assertIssueEnvironmentSelection(sourceIssue.companyId, child.executionWorkspaceSettings?.environmentId);
+      await assertIssueEnvironmentSelection(sourceIssue.companyId, childBody.executionWorkspaceSettings?.environmentId);
     }
 
     const actor = getActorInfo(req);
     const normalizedChildren = [];
-    for (const child of req.body.children as Array<typeof req.body.children[number]>) {
+    for (const child of requestedChildren) {
       const executionPolicy = applyActorMonitorScheduledBy(
         normalizeIssueExecutionPolicy(child.executionPolicy),
         actor.actorType,
@@ -5508,20 +5488,17 @@ export function issueRoutes(
 
       if (commentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
-        const actorIsAgent = actor.actorType === "agent";
-        const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        if (assigneeId && !assigneeChanged && reopened) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
-            reason: reopened ? "issue_reopened_via_comment" : "issue_commented",
+            reason: "issue_reopened_via_comment",
             payload: {
               issueId: id,
               commentId: comment.id,
               mutation: "comment",
-              ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+              reopenedFrom: reopenFromStatus,
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
@@ -5532,9 +5509,9 @@ export function issueRoutes(
               taskId: id,
               commentId: comment.id,
               wakeCommentId: comment.id,
-              source: reopened ? "issue.comment.reopen" : "issue.comment",
-              wakeReason: reopened ? "issue_reopened_via_comment" : "issue_commented",
-              ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+              source: "issue.comment.reopen",
+              wakeReason: "issue_reopened_via_comment",
+              reopenedFrom: reopenFromStatus,
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
@@ -6033,7 +6010,9 @@ export function issueRoutes(
         });
       }
 
-      const acceptedPlanTarget = readAcceptedPlanConfirmationTarget(interaction.payload);
+      const acceptedPlanTarget = interaction.kind === "request_confirmation"
+        ? readAcceptedPlanConfirmationTarget(interaction.payload)
+        : null;
       const acceptedPlanConfirmation =
         interaction.kind === "request_confirmation" &&
         interaction.status === "accepted" &&
@@ -6091,7 +6070,7 @@ export function issueRoutes(
           rejectionReason:
             interaction.kind === "suggest_tasks"
               ? (interaction.result?.rejectionReason ?? null)
-              : interaction.kind === "request_confirmation"
+              : interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation"
                 ? (interaction.result?.reason ?? null)
               : null,
         },
@@ -6674,62 +6653,33 @@ export function issueRoutes(
       const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
-      const selfComment = actorIsAgent && actor.actorId === assigneeId;
-      const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake)) {
-        if (reopened) {
-          wakeups.set(assigneeId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_reopened_via_comment",
-            payload: {
-              issueId: currentIssue.id,
-              commentId: comment.id,
-              reopenedFrom: reopenFromStatus,
-              mutation: "comment",
-              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: currentIssue.id,
-              taskId: currentIssue.id,
-              commentId: comment.id,
-              wakeCommentId: comment.id,
-              source: "issue.comment.reopen",
-              wakeReason: "issue_reopened_via_comment",
-              reopenedFrom: reopenFromStatus,
-              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
-          });
-        } else {
-          wakeups.set(assigneeId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_commented",
-            payload: {
-              issueId: currentIssue.id,
-              commentId: comment.id,
-              mutation: "comment",
-              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: currentIssue.id,
-              taskId: currentIssue.id,
-              commentId: comment.id,
-              wakeCommentId: comment.id,
-              source: "issue.comment",
-              wakeReason: "issue_commented",
-              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
-              ...(interruptedRunId ? { interruptedRunId } : {}),
-            },
-          });
-        }
+      if (assigneeId && reopened) {
+        wakeups.set(assigneeId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_reopened_via_comment",
+          payload: {
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            reopenedFrom: reopenFromStatus,
+            mutation: "comment",
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: currentIssue.id,
+            taskId: currentIssue.id,
+            commentId: comment.id,
+            wakeCommentId: comment.id,
+            source: "issue.comment.reopen",
+            wakeReason: "issue_reopened_via_comment",
+            reopenedFrom: reopenFromStatus,
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+        });
       }
 
       let mentionedIds: string[] = [];

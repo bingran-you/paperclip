@@ -59,6 +59,7 @@ import type {
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   IssueThreadInteraction,
+  RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   SuggestTasksInteraction,
 } from "../lib/issue-thread-interactions";
@@ -156,16 +157,24 @@ interface IssueChatMessageContext {
   stopRunLabel?: string;
   stoppingRunLabel?: string;
   stopRunVariant?: "stop" | "pause";
+  runFinalizationActions?: readonly IssueChatRunFinalizationAction[];
   onInterruptQueued?: (runId: string) => Promise<void>;
   onCancelQueued?: (commentId: string) => void;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   onImageClick?: (src: string) => void;
   onAcceptInteraction?: (
-    interaction: SuggestTasksInteraction | RequestConfirmationInteraction,
+    interaction:
+      | SuggestTasksInteraction
+      | RequestConfirmationInteraction
+      | RequestCheckboxConfirmationInteraction,
     selectedClientKeys?: string[],
+    selectedOptionIds?: string[],
   ) => Promise<void> | void;
   onRejectInteraction?: (
-    interaction: SuggestTasksInteraction | RequestConfirmationInteraction,
+    interaction:
+      | SuggestTasksInteraction
+      | RequestConfirmationInteraction
+      | RequestCheckboxConfirmationInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
@@ -185,6 +194,15 @@ const IssueChatCtx = createContext<IssueChatMessageContext>({
   issueStatus: undefined,
   successfulRunHandoff: null,
 });
+
+export type IssueChatRunFinalizationAction = {
+  id: "cancel" | "done";
+  label: string;
+  pendingLabel: string;
+  onSelect: (runId: string) => Promise<void> | void;
+  isPending?: boolean;
+  disabled?: boolean;
+};
 
 export function resolveAssistantMessageFoldedState(args: {
   messageId: string;
@@ -334,6 +352,7 @@ interface IssueChatThreadProps {
   stopRunLabel?: string;
   stoppingRunLabel?: string;
   stopRunVariant?: "stop" | "pause";
+  runFinalizationActions?: readonly IssueChatRunFinalizationAction[];
   imageUploadHandler?: (file: File) => Promise<string>;
   onAttachImage?: (file: File) => Promise<IssueAttachment | void>;
   draftKey?: string;
@@ -361,11 +380,18 @@ interface IssueChatThreadProps {
   stoppingRunId?: string | null;
   onImageClick?: (src: string) => void;
   onAcceptInteraction?: (
-    interaction: SuggestTasksInteraction | RequestConfirmationInteraction,
+    interaction:
+      | SuggestTasksInteraction
+      | RequestConfirmationInteraction
+      | RequestCheckboxConfirmationInteraction,
     selectedClientKeys?: string[],
+    selectedOptionIds?: string[],
   ) => Promise<void> | void;
   onRejectInteraction?: (
-    interaction: SuggestTasksInteraction | RequestConfirmationInteraction,
+    interaction:
+      | SuggestTasksInteraction
+      | RequestConfirmationInteraction
+      | RequestCheckboxConfirmationInteraction,
     reason?: string,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
@@ -501,7 +527,7 @@ function IssueChatFallbackThread({
           <div className="space-y-1">
             <p className="font-medium">Chat renderer hit an internal state error.</p>
             <p className="text-xs opacity-80">
-              Showing a safe fallback transcript instead of crashing the issues page.
+              Showing a safe fallback transcript instead of crashing the tasks page.
             </p>
           </div>
         </div>
@@ -1498,6 +1524,7 @@ function IssueChatAssistantMessage({
     stopRunLabel = "Stop run",
     stoppingRunLabel = "Stopping...",
     stopRunVariant = "stop",
+    runFinalizationActions = [],
   } = useContext(IssueChatCtx);
   const custom = message.metadata.custom as Record<string, unknown>;
   const anchorId = typeof custom.anchorId === "string" ? custom.anchorId : undefined;
@@ -1716,6 +1743,29 @@ function IssueChatAssistantMessage({
                         {isStoppingRun ? stoppingRunLabel : stopRunLabel}
                       </DropdownMenuItem>
                     ) : null}
+                    {canStopRun && runId
+                      ? runFinalizationActions.map((action) => (
+                        <DropdownMenuItem
+                          key={action.id}
+                          disabled={isStoppingRun || action.isPending || action.disabled}
+                          className={cn(
+                            action.id === "cancel"
+                              ? "text-red-700 focus:text-red-800 dark:text-red-300 dark:focus:text-red-200"
+                              : "text-green-700 focus:text-green-800 dark:text-green-300 dark:focus:text-green-200",
+                          )}
+                          onSelect={() => {
+                            void action.onSelect(runId);
+                          }}
+                        >
+                          {action.id === "cancel" ? (
+                            <Square className="mr-2 h-3.5 w-3.5 fill-current" />
+                          ) : (
+                            <Check className="mr-2 h-3.5 w-3.5" />
+                          )}
+                          {action.isPending ? action.pendingLabel : action.label}
+                        </DropdownMenuItem>
+                      ))
+                      : null}
                     {runHref ? (
                       <DropdownMenuItem asChild>
                         <Link to={runHref} target="_blank" rel="noreferrer noopener">
@@ -3534,7 +3584,7 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
             <div className="min-w-0">
               <div className="text-sm font-medium text-foreground">Drop to upload</div>
               <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
-                Images insert into the reply. Other files are added to this issue.
+                Images insert into the reply. Other files are added to this task.
               </div>
             </div>
           </div>
@@ -3569,12 +3619,12 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
             const sizeLabel = formatAttachmentSize(attachment.size);
             const statusLabel =
               attachment.status === "uploading"
-                ? "Uploading to issue"
+                ? "Uploading to task"
                 : attachment.status === "error"
                   ? attachment.error ?? "Upload failed"
                   : attachment.inline
                     ? "Inserted inline"
-                    : "Attached to issue";
+                    : "Attached to task";
             return (
               <div
                 key={attachment.id}
@@ -3758,6 +3808,7 @@ export function IssueChatThread({
   stopRunLabel,
   stoppingRunLabel,
   stopRunVariant,
+  runFinalizationActions,
   imageUploadHandler,
   onAttachImage,
   draftKey,
@@ -4275,6 +4326,7 @@ export function IssueChatThread({
       stopRunLabel,
       stoppingRunLabel,
       stopRunVariant,
+      runFinalizationActions,
       onInterruptQueued: stableOnInterruptQueued,
       onCancelQueued: stableOnCancelQueued,
       onDeleteComment: stableOnDeleteComment,
@@ -4298,6 +4350,7 @@ export function IssueChatThread({
       stopRunLabel,
       stoppingRunLabel,
       stopRunVariant,
+      runFinalizationActions,
       stableOnInterruptQueued,
       stableOnCancelQueued,
       stableOnDeleteComment,
@@ -4315,7 +4368,7 @@ export function IssueChatThread({
   const resolvedEmptyMessage = emptyMessage
     ?? (variant === "embedded"
       ? "No run output yet."
-      : "This issue conversation is empty. Start with a message below.");
+      : "This task conversation is empty. Start with a message below.");
   const previousErrorBoundaryMessagesRef = useRef<readonly ThreadMessage[] | null>(null);
   const errorBoundaryResetVersionRef = useRef(0);
   if (previousErrorBoundaryMessagesRef.current !== messages) {
@@ -4405,10 +4458,10 @@ export function IssueChatThread({
                   {legacyRecoverySourceIssue ? (
                     <SystemNotice
                       tone="info"
-                      label="Legacy recovery issue"
+                      label="Legacy recovery task"
                       body={
                         <span>
-                          Legacy recovery issue. Newer recovery actions live on the source issue
+                          Legacy recovery task. Newer recovery actions live on the source task
                           {legacyRecoverySourceIssue.identifier ? (
                             <>
                               {" — "}
