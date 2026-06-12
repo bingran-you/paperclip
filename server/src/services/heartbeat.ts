@@ -133,6 +133,10 @@ import {
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
+  evaluateExecutionAllowlist,
+  isExecutionForcedToKubernetes,
+} from "./execution-allowlist.js";
+import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -182,7 +186,9 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { environmentService } from "./environments.js";
+import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
+import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
@@ -550,7 +556,7 @@ export function applyRunScopedMentionedSkillKeys(
 
   const existingPreference = readPaperclipSkillSyncPreference(config);
   return writePaperclipSkillSyncPreference(config, [
-    ...existingPreference.desiredSkills,
+    ...existingPreference.desiredSkillEntries,
     ...normalizedSkillKeys,
   ]);
 }
@@ -2101,6 +2107,37 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
   };
 }
 
+/**
+ * A run is a "zombie" if it's marked as running in the DB but has no live
+ * execution tracked in memory. This happens when the server restarts and the
+ * execution is lost, or when the DB row outlives the in-memory run state.
+ *
+ * Queued runs are never zombies — they don't have processes yet.
+ */
+export function isZombieRun(
+  run: { status: string; id: string },
+  tracked: { has(id: string): boolean },
+): boolean {
+  return run.status === "running" && !tracked.has(run.id);
+}
+
+/**
+ * Filter a coalesce target — if it's a zombie run, return null so the
+ * wakeup falls through to create a new queued run instead of coalescing
+ * into the dead process (which would refresh updatedAt and make it immortal).
+ *
+ * Queued runs pass through unchanged (they have no process yet).
+ * Null targets pass through unchanged.
+ */
+export function filterZombieCoalesceTarget<
+  T extends { status: string; id: string },
+>(
+  target: T | null,
+  tracked: { has(id: string): boolean },
+): T | null {
+  return target && isZombieRun(target, tracked) ? null : target;
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -2129,6 +2166,49 @@ export function shouldDeferFollowupWakeForSameIssue(input: {
   if (input.wakeCommentId) return true;
   if (input.forceFreshSession) return true;
   return false;
+}
+
+const SESSION_CONFIGURED_MODEL_KEY = "__paperclipConfiguredModel";
+
+function readConfiguredModelFromAdapterConfig(
+  adapterConfig: Record<string, unknown> | null | undefined,
+) {
+  return readNonEmptyString(adapterConfig?.model);
+}
+
+function attachConfiguredModelToSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+  configuredModel: string | null,
+) {
+  if (!configuredModel) return sessionParams ?? null;
+  const next = { ...(sessionParams ?? {}) };
+  next[SESSION_CONFIGURED_MODEL_KEY] = configuredModel;
+  return next;
+}
+
+function readConfiguredModelFromSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+) {
+  return readNonEmptyString(sessionParams?.[SESSION_CONFIGURED_MODEL_KEY]);
+}
+
+export function shouldResetTaskSessionForModelChange(input: {
+  configuredModel: string | null;
+  taskSessionParams: Record<string, unknown> | null | undefined;
+}) {
+  const { configuredModel, taskSessionParams } = input;
+  if (!configuredModel || !taskSessionParams) return false;
+  const sessionModel = readConfiguredModelFromSessionParams(taskSessionParams);
+  return !!sessionModel && sessionModel !== configuredModel;
+}
+
+export function stripConfiguredModelFromSessionParams(
+  sessionParams: Record<string, unknown> | null | undefined,
+) {
+  if (!sessionParams) return null;
+  const next = { ...sessionParams };
+  delete next[SESSION_CONFIGURED_MODEL_KEY];
+  return next;
 }
 
 function shouldAutoCheckoutIssueForWake(input: {
@@ -2846,7 +2926,7 @@ function getAdapterSessionCodec(adapterType: string) {
   return adapter.sessionCodec ?? defaultSessionCodec;
 }
 
-function normalizeSessionParams(params: Record<string, unknown> | null | undefined) {
+export function normalizeSessionParams(params: Record<string, unknown> | null | undefined) {
   if (!params) return null;
   return Object.keys(params).length > 0 ? params : null;
 }
@@ -3039,6 +3119,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  const liveRunExecutions = {
+    has(id: string) {
+      return runningProcesses.has(id) || activeRunExecutions.has(id);
+    },
+  };
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -5539,6 +5624,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: retryRun.id,
             executionAgentNameKey: normalizeAgentNameKey(agent.name),
             executionLockedAt: now,
@@ -7475,6 +7561,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues();
   }
 
+  async function sweepStaleIssueLocks() {
+    return recovery.sweepStaleIssueLocks();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -7828,11 +7918,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null,
     });
+    const config = parseObject(agent.adapterConfig);
+    const configuredModel = readConfiguredModelFromAdapterConfig(config);
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
-    const resetTaskSession = shouldResetTaskSessionForWake(context);
-    const sessionResetReason = describeSessionResetReason(context);
+    const taskSessionDecodedParams = normalizeSessionParams(
+      sessionCodec.deserialize(taskSession?.sessionParamsJson ?? null),
+    );
+    const modelChangedSinceTaskSession = shouldResetTaskSessionForModelChange({
+      configuredModel,
+      taskSessionParams: taskSessionDecodedParams,
+    });
+    const resetTaskSession = shouldResetTaskSessionForWake(context) || modelChangedSinceTaskSession;
+    const wakeSessionResetReason = describeSessionResetReason(context);
+    const taskSessionConfiguredModel = readConfiguredModelFromSessionParams(taskSessionDecodedParams);
+    const modelSessionResetReason = modelChangedSinceTaskSession && taskSessionConfiguredModel
+      ? `configured model changed from "${taskSessionConfiguredModel}" to "${configuredModel}"`
+      : null;
+    const sessionResetReason = [modelSessionResetReason, wakeSessionResetReason]
+      .filter((value): value is string => Boolean(value))
+      .join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const explicitResumeSessionParams = normalizeResumeParamsForAdapter(
       agent.adapterType,
@@ -7850,9 +7956,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null) ??
       normalizeResumeParamsForAdapter(
         agent.adapterType,
-        sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+        stripConfiguredModelFromSessionParams(
+          sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+        ),
       );
-    const config = parseObject(agent.adapterConfig);
     const resolvedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -8016,7 +8123,72 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       persistedExecutionWorkspaceMode === "agent_default"
         ? persistedExecutionWorkspaceMode
         : requestedExecutionWorkspaceMode;
-    const selectedEnvironmentId = environmentResolution.environmentId;
+    const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
+    let selectedEnvironmentId = environmentResolution.environmentId;
+    if (isExecutionForcedToKubernetes(executionPolicy)) {
+      let kubernetesEnvironment = await environmentsSvc.findKubernetesEnvironment(agent.companyId);
+      if (!kubernetesEnvironment) {
+        // Lazy recovery for companies created after the startup bootstrap ran
+        // (the boot hook only provisions environments for companies that exist
+        // at boot). Re-derive the managed-env config from the bootstrap env.
+        // If the process env no longer forces Kubernetes (rollback / config
+        // drift relative to the persisted executionMode setting), skip the
+        // provisioning gracefully: the guard below still refuses local
+        // fallback with the explicit error, instead of crashing here on
+        // undefined config.
+        let bootstrap: ReturnType<typeof parseExecutionPolicyBootstrapEnv> = null;
+        let bootstrapSkipReason: string | null = null;
+        try {
+          bootstrap = parseExecutionPolicyBootstrapEnv(process.env);
+          if (!bootstrap) {
+            bootstrapSkipReason =
+              'PAPERCLIP_EXECUTION_MODE bootstrap env is not kubernetes-forced (absent or "any")';
+          }
+        } catch (err) {
+          bootstrapSkipReason = `PAPERCLIP_EXECUTION_MODE bootstrap env failed to parse: ${
+            err instanceof Error ? err.message : String(err)
+          }`;
+        }
+        if (bootstrap) {
+          await environmentsSvc.ensureKubernetesEnvironment(
+            agent.companyId,
+            bootstrap.kubernetesConfig,
+          );
+          kubernetesEnvironment = await environmentsSvc.findKubernetesEnvironment(agent.companyId);
+        } else {
+          logger.warn(
+            {
+              runId: run.id,
+              agentId: agent.id,
+              companyId: agent.companyId,
+              reason: bootstrapSkipReason,
+            },
+            "executionMode=kubernetes is persisted but the bootstrap env cannot provision a managed Kubernetes environment; skipping lazy provisioning for this company (the run will fail with the explicit no-managed-environment error)",
+          );
+        }
+      }
+      if (!kubernetesEnvironment) {
+        throw new Error(
+          "Instance execution policy requires the Kubernetes sandbox provider " +
+            "(executionMode=kubernetes) but no managed Kubernetes environment is " +
+            "configured for this company. Configure one (PAPERCLIP_K8S_* env on the " +
+            "cloud instance) before running agents; refusing to fall back to local execution.",
+        );
+      }
+      if (kubernetesEnvironment.id !== selectedEnvironmentId) {
+        logger.info(
+          {
+            runId: run.id,
+            issueId,
+            agentId: agent.id,
+            resolvedEnvironmentId: selectedEnvironmentId,
+            forcedKubernetesEnvironmentId: kubernetesEnvironment.id,
+          },
+          "Forcing run onto the managed Kubernetes environment (executionMode=kubernetes)",
+        );
+      }
+      selectedEnvironmentId = kubernetesEnvironment.id;
+    }
     const {
       selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
       workspace: resolvedWorkspace,
@@ -8129,7 +8301,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resolvedConfig,
       runScopedMentionedSkillKeys,
     );
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
+    const runtimeSkillPreference = readPaperclipSkillSyncPreference(effectiveResolvedConfig);
+    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
+      versionSelections: skillVersionSelectionMap(runtimeSkillPreference.desiredSkillEntries),
+    });
     let runtimeConfig = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
@@ -8337,7 +8512,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
-    const persistedEnvironmentId = persistedExecutionWorkspace?.config?.environmentId ?? selectedEnvironmentId;
+    // When execution is forced to Kubernetes, `selectedEnvironmentId` is already
+    // pinned to the managed k8s environment above; ignore any persisted workspace
+    // environmentId (which could point at a stale local/ssh env) so a reused
+    // workspace can never downgrade us off the sandbox.
+    const persistedEnvironmentId = isExecutionForcedToKubernetes(executionPolicy)
+      ? selectedEnvironmentId
+      : persistedExecutionWorkspace?.config?.environmentId ?? selectedEnvironmentId;
     const acquiredEnvironment = await envOrchestrator.acquireForRun({
       companyId: agent.companyId,
       selectedEnvironmentId: persistedEnvironmentId,
@@ -8349,6 +8530,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       persistedExecutionWorkspace,
     });
     const selectedEnvironment = acquiredEnvironment.environment;
+    // Defense-in-depth: re-check the actually-acquired environment against the
+    // execution allowlist. Even if selection were bypassed, a denied (local/ssh/
+    // non-k8s) environment FAILS the run here rather than executing untrusted.
+    const allowlistDecision = evaluateExecutionAllowlist(executionPolicy, {
+      driver: selectedEnvironment.driver,
+      provider:
+        typeof selectedEnvironment.config?.provider === "string"
+          ? selectedEnvironment.config.provider
+          : null,
+    });
+    if (!allowlistDecision.allowed) {
+      logger.error(
+        {
+          runId: run.id,
+          issueId,
+          agentId: agent.id,
+          environmentId: selectedEnvironment.id,
+          deniedDriver: allowlistDecision.deniedDriver,
+          deniedProvider: allowlistDecision.deniedProvider,
+        },
+        "Execution allowlist denied the resolved environment; failing run",
+      );
+      throw new Error(allowlistDecision.reason);
+    }
     let activeEnvironmentLease = {
       environment: acquiredEnvironment.environment,
       lease: acquiredEnvironment.lease,
@@ -8485,7 +8690,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : runtimeSessionDisplayId;
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
-    let runtimeSessionParamsForAdapter = runtimeSessionParams;
+    let runtimeSessionParamsForAdapter = normalizeSessionParams(
+      stripConfiguredModelFromSessionParams(runtimeSessionParams),
+    );
 
     const sessionCompaction = await evaluateSessionCompaction({
       agent,
@@ -9154,7 +9361,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               agentId: agent.id,
               adapterType: agent.adapterType,
               taskKey,
-              sessionParamsJson: nextSessionState.params,
+              sessionParamsJson: attachConfiguredModelToSessionParams(nextSessionState.params, configuredModel),
               sessionDisplayId: nextSessionState.displayId,
               lastRunId: finalizedRun.id,
               lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
@@ -9237,7 +9444,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
-            sessionParamsJson: previousSessionParams,
+            sessionParamsJson: attachConfiguredModelToSessionParams(previousSessionParams, configuredModel),
             sessionDisplayId: previousSessionDisplayId,
             lastRunId: failedRun.id,
             lastError: message,
@@ -9353,42 +9560,109 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
     const promotionResult = await db.transaction(async (tx) => {
-      if (contextIssueId) {
-        await tx.execute(
-          sql`select id from issues where company_id = ${run.companyId} and id = ${contextIssueId} for update`,
-        );
-      } else {
-        await tx.execute(
-          sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
-        );
-      }
+      // Lock the context issue (if any) AND every issue that still references this run.
+      //
+      // A single run can hold execution locks on multiple issues: the caller's context
+      // issue (set via svc.checkout) plus any additional issues stamped by
+      // enqueueWakeup's "legacy run" fallback when the run was the only queued/running
+      // run matching their contextSnapshot.issueId. Historically this function only
+      // resolved and cleared the lock on *one* issue (rows[0]), leaving the others
+      // with an executionRunId pointing at a finalized run. Subsequent checkouts from
+      // the assigned agent then failed with 409 and the issue stayed blocked forever.
+      // `order by id` makes row-lock acquisition deterministic across concurrent
+      // finalizations, which keeps deadlock risk independent of PostgreSQL's plan
+      // choice when multiple issues match.
+      await tx.execute(
+        contextIssueId
+          ? sql`
+              select id from issues
+              where company_id = ${run.companyId}
+                and (
+                  id = ${contextIssueId}
+                  or execution_run_id = ${run.id}
+                  or checkout_run_id = ${run.id}
+                )
+              order by id
+              for update
+            `
+          : sql`
+              select id from issues
+              where company_id = ${run.companyId}
+                and (execution_run_id = ${run.id} or checkout_run_id = ${run.id})
+              order by id
+              for update
+            `,
+      );
 
-      let issue = await tx
+      const candidateIssues = await tx
         .select()
         .from(issues)
         .where(
           and(
             eq(issues.companyId, run.companyId),
-            contextIssueId ? eq(issues.id, contextIssueId) : eq(issues.executionRunId, run.id),
+            contextIssueId
+              ? or(
+                  eq(issues.id, contextIssueId),
+                  eq(issues.executionRunId, run.id),
+                  eq(issues.checkoutRunId, run.id),
+                )
+              : or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
           ),
         )
-        .then((rows) => rows[0] ?? null);
+        .orderBy(asc(issues.id));
+
+      // Clear orphaned execution-lock columns that still point at this finalizing
+      // run, across every sibling issue in one statement so it scales with N
+      // orphans without N round-trips. Rows are already held under FOR UPDATE from
+      // the lock query above.
+      //
+      // The two columns are cleared in separate UPDATEs so we never clobber a
+      // retry's executionRunId pointer: when a process-loss or codex-transient
+      // retry is scheduled mid-finalization, it moves `executionRunId` from this
+      // run to the retry run while leaving `checkoutRunId` pinned at this run.
+      // Only the checkout column should be released in that case; the execution
+      // column now belongs to the retry.
+      const promotionUpdateTimestamp = new Date();
+      await tx
+        .update(issues)
+        .set({
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: promotionUpdateTimestamp,
+        })
+        .where(
+          and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)),
+        );
+      // `checkoutRunId` clear is symmetric to #6008's per-issue self-heal,
+      // extended to all siblings: covers paths where the issue's assignee or
+      // status changed between checkout and termination, which
+      // adoptStaleCheckoutRun's narrow WHERE clause cannot reach.
+      await tx
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          updatedAt: promotionUpdateTimestamp,
+        })
+        .where(
+          and(eq(issues.companyId, run.companyId), eq(issues.checkoutRunId, run.id)),
+        );
+
+      // Deferred-wake promotion is bound to a single primary issue: the run's context
+      // issue when present, otherwise the first candidate we found (preserves the
+      // legacy rows[0] selection for runs that were not tied to a specific issue).
+      let issue =
+        (contextIssueId
+          ? candidateIssues.find((candidate) => candidate.id === contextIssueId)
+          : candidateIssues[0]) ?? null;
 
       if (!issue) return null;
       if (issue.executionRunId && issue.executionRunId !== run.id) return null;
 
-      if (issue.executionRunId === run.id) {
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: null,
-            executionAgentNameKey: null,
-            executionLockedAt: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, issue.id));
-      }
-
+      // Workspace-validation recovery: if the finalizing run failed workspace
+      // validation, surface the primary issue for the blocked-recovery comment path.
+      // Sibling lock cleanup is already done above; only the primary issue carries
+      // the recovery surface because the comment is attached to a single issue.
       if (
         isWorkspaceValidationFailedRun(run) &&
         (issue.status === "todo" || issue.status === "in_progress") &&
@@ -9403,6 +9677,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           recoveryCause: WORKSPACE_VALIDATION_RECOVERY_CAUSE,
         };
       }
+
 
       while (true) {
         const deferred = await tx
@@ -9495,10 +9770,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        // Local-CLI agents post comments under user auth, so a self-comment from
+        // the run that is now ending would otherwise look like a real human
+        // comment and trigger a reopen on the very issue this run just closed.
+        // Suppress reopen only when every referenced comment came from this run;
+        // mixed batches must still reopen because they contain a real follow-up.
+        let deferredCommentWakeIsSelfAuthored = false;
+        if (deferredCommentIds.length > 0) {
+          const deferredComments = await tx
+            .select({ createdByRunId: issueComments.createdByRunId })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, deferredCommentIds),
+              ),
+            )
+            .then((rows) => rows);
+          deferredCommentWakeIsSelfAuthored =
+            deferredComments.length > 0 &&
+            deferredComments.every((comment) => comment.createdByRunId === run.id);
+        }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
+          !deferredCommentWakeIsSelfAuthored &&
           (issue.status === "done" || issue.status === "cancelled") &&
           (
             deferred.requestedByActorType === "user" ||
@@ -10144,6 +10442,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun = null;
         }
 
+        // A queued/scheduled run holding the lock for an agent that is
+        // no longer the issue's assignee is stale by design — the issue
+        // has been re-routed (e.g. blocked → in_review with a different
+        // assignee). Cancel it and release the lock; otherwise the new
+        // assignee's wake gets parked in `deferred_issue_execution`
+        // forever, because the original queued holder will never run
+        // (the issue's status / target now belongs to someone else).
+        //
+        // Race guard: pin the cancel UPDATE to the exact non-running
+        // status we read above. A worker could transition the holder
+        // from `queued` → `running` between the SELECT and this UPDATE;
+        // the status predicate ensures we never clobber a freshly-
+        // claimed running run. If zero rows matched, leave
+        // `activeExecutionRun` populated so the defer path runs
+        // normally against the now-running holder.
+        if (
+          activeExecutionRun &&
+          activeExecutionRun.status !== "running" &&
+          issue.assigneeAgentId &&
+          activeExecutionRun.agentId !== issue.assigneeAgentId
+        ) {
+          const cancelled = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Execution lock released after issue reassigned to a different agent",
+              errorCode: "lock_released_on_reassignment",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, activeExecutionRun.id),
+                eq(heartbeatRuns.status, activeExecutionRun.status),
+              ),
+            )
+            .returning({ id: heartbeatRuns.id });
+          if (cancelled.length > 0) {
+            if (activeExecutionRun.wakeupRequestId) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "cancelled",
+                  finishedAt: new Date(),
+                  error: "Execution lock released after issue reassigned to a different agent",
+                  updatedAt: new Date(),
+                })
+                .where(eq(agentWakeupRequests.id, activeExecutionRun.wakeupRequestId));
+            }
+            activeExecutionRun = null;
+          }
+        }
+
         if (!activeExecutionRun && issue.executionRunId) {
           await tx
             .update(issues)
@@ -10265,10 +10616,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId }) &&
             activeExecutionRun.status === "running" &&
             isSameExecutionAgent;
+          const availableActiveExecutionRun = isSameExecutionAgent
+            ? filterZombieCoalesceTarget(activeExecutionRun, liveRunExecutions)
+            : activeExecutionRun;
 
-          if (isSameExecutionAgent && !shouldDeferFollowupWake && !shouldQueueFollowupForRunningWake) {
+          if (
+            isSameExecutionAgent
+            && !shouldDeferFollowupWake
+            && !shouldQueueFollowupForRunningWake
+            && availableActiveExecutionRun
+          ) {
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
-              activeExecutionRun.contextSnapshot,
+              availableActiveExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
             );
             const mergedRun = await tx
@@ -10277,9 +10636,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
               })
-              .where(eq(heartbeatRuns.id, activeExecutionRun.id))
+              .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
               .returning()
-              .then((rows) => rows[0] ?? activeExecutionRun);
+              .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
             await tx.insert(agentWakeupRequests).values({
               companyId: agent.companyId,
@@ -10300,67 +10659,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             return { kind: "coalesced" as const, run: mergedRun };
           }
 
-          const deferredPayload = {
-            ...(payload ?? {}),
-            issueId,
-            [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
-          };
-
-          const existingDeferred = await tx
-            .select()
-            .from(agentWakeupRequests)
-            .where(
-              and(
-                eq(agentWakeupRequests.companyId, agent.companyId),
-                eq(agentWakeupRequests.agentId, agentId),
-                eq(agentWakeupRequests.status, "deferred_issue_execution"),
-                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
-              ),
-            )
-            .orderBy(asc(agentWakeupRequests.requestedAt))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-
-          if (existingDeferred) {
-            const existingDeferredPayload = parseObject(existingDeferred.payload);
-            const existingDeferredContext = parseObject(existingDeferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
-            const mergedDeferredContext = mergeCoalescedContextSnapshot(
-              existingDeferredContext,
-              enrichedContextSnapshot,
-            );
-            const mergedDeferredPayload = {
-              ...existingDeferredPayload,
+          if (availableActiveExecutionRun) {
+            const deferredPayload = {
               ...(payload ?? {}),
               issueId,
-              [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
+              [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
             };
 
-            await tx
-              .update(agentWakeupRequests)
-              .set({
-                payload: mergedDeferredPayload,
-                coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
-                updatedAt: new Date(),
-              })
-              .where(eq(agentWakeupRequests.id, existingDeferred.id));
+            const existingDeferred = await tx
+              .select()
+              .from(agentWakeupRequests)
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                ),
+              )
+              .orderBy(asc(agentWakeupRequests.requestedAt))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+
+            if (existingDeferred) {
+              const existingDeferredPayload = parseObject(existingDeferred.payload);
+              const existingDeferredContext = parseObject(existingDeferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
+              const mergedDeferredContext = mergeCoalescedContextSnapshot(
+                existingDeferredContext,
+                enrichedContextSnapshot,
+              );
+              const mergedDeferredPayload = {
+                ...existingDeferredPayload,
+                ...(payload ?? {}),
+                issueId,
+                [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
+              };
+
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  payload: mergedDeferredPayload,
+                  coalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
+                  updatedAt: new Date(),
+                })
+                .where(eq(agentWakeupRequests.id, existingDeferred.id));
+
+              return { kind: "deferred" as const };
+            }
+
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: "issue_execution_deferred",
+              payload: deferredPayload,
+              status: "deferred_issue_execution",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+            });
 
             return { kind: "deferred" as const };
           }
-
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: "issue_execution_deferred",
-            payload: deferredPayload,
-            status: "deferred_issue_execution",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-          });
-
-          return { kind: "deferred" as const };
         }
 
         const wakeupRequest = await tx
@@ -10454,10 +10815,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       !sameScopeQueuedRun &&
       shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
 
-    const coalescedTargetRun =
+    const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
+
+    const coalescedTargetRun = filterZombieCoalesceTarget(
+      rawCoalescedTarget,
+      liveRunExecutions,
+    );
 
     if (coalescedTargetRun) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
@@ -11096,6 +11462,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    sweepStaleIssueLocks,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
