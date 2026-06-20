@@ -166,6 +166,7 @@ export function CompanyEnvironments() {
   const [editingEnvironmentId, setEditingEnvironmentId] = useState<string | null>(null);
   const [environmentForm, setEnvironmentForm] = useState<EnvironmentFormState>(createEmptyEnvironmentForm);
   const [probeResults, setProbeResults] = useState<Record<string, EnvironmentProbeResult | null>>({});
+  const [testingEnvironmentId, setTestingEnvironmentId] = useState<string | null>(null);
 
   useEffect(() => {
     setBreadcrumbs([
@@ -232,6 +233,12 @@ export function CompanyEnvironments() {
 
   const environmentProbeMutation = useMutation({
     mutationFn: async (environmentId: string) => await environmentsApi.probe(environmentId),
+    onMutate: (environmentId) => {
+      setTestingEnvironmentId(environmentId);
+    },
+    onSettled: (_probe, _error, environmentId) => {
+      setTestingEnvironmentId((current) => (current === environmentId ? null : current));
+    },
     onSuccess: (probe, environmentId) => {
       setProbeResults((current) => ({
         ...current,
@@ -287,6 +294,7 @@ export function CompanyEnvironments() {
     setEditingEnvironmentId(null);
     setEnvironmentForm(createEmptyEnvironmentForm());
     setProbeResults({});
+    setTestingEnvironmentId(null);
   }, [selectedCompanyId]);
 
   function handleEditEnvironment(environment: Environment) {
@@ -530,9 +538,9 @@ export function CompanyEnvironments() {
                           size="sm"
                           variant="outline"
                           onClick={() => environmentProbeMutation.mutate(environment.id)}
-                          disabled={environmentProbeMutation.isPending}
+                          disabled={testingEnvironmentId === environment.id}
                         >
-                          {environmentProbeMutation.isPending
+                          {testingEnvironmentId === environment.id
                             ? "Testing..."
                             : environment.driver === "ssh"
                               ? "Test connection"
@@ -589,7 +597,7 @@ export function CompanyEnvironments() {
                 onChange={(e) => setEnvironmentForm((current) => ({ ...current, description: e.target.value }))}
               />
             </Field>
-            <Field label="Driver" hint="Local runs on this host. SSH stores a remote machine target. Sandbox stores plugin-backed provider config on the shared environment seam.">
+            <Field label="Driver" hint="Sandbox stores plugin-backed provider config on the shared environment seam. SSH stores a remote machine target.">
               <select
                 className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
                 value={environmentForm.driver}
@@ -610,19 +618,16 @@ export function CompanyEnvironments() {
                                 : {}
                           )
                         : current.sandboxConfig,
-                    driver:
-                      e.target.value === "local"
-                        ? "local"
-                        : e.target.value === "sandbox"
-                          ? "sandbox"
-                          : "ssh",
+                    driver: e.target.value === "sandbox" ? "sandbox" : "ssh",
                   }))}
               >
-                <option value="ssh">SSH</option>
                 {sandboxCreationEnabled || environmentForm.driver === "sandbox" ? (
                   <option value="sandbox">Sandbox</option>
                 ) : null}
-                <option value="local">Local</option>
+                <option value="ssh">SSH</option>
+                {environmentForm.driver === "local" ? (
+                  <option value="local">Local</option>
+                ) : null}
               </select>
             </Field>
 
@@ -788,7 +793,7 @@ export function CompanyEnvironments() {
                   onClick={() => draftEnvironmentProbeMutation.mutate(environmentForm)}
                   disabled={draftEnvironmentProbeMutation.isPending || !environmentFormValid}
                 >
-                  {draftEnvironmentProbeMutation.isPending ? "Testing..." : "Test draft"}
+                  {draftEnvironmentProbeMutation.isPending ? "Testing..." : "Test"}
                 </Button>
               ) : null}
               {environmentMutation.isError ? (
