@@ -841,6 +841,7 @@ async function resolveRunScopedMentionedSkillKeys(input: {
 function leaseReleaseStatusForRunStatus(
   status: string | null | undefined,
 ): Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> {
+  if (status === "cancelled") return "expired";
   return status === "failed" || status === "timed_out" ? "failed" : "released";
 }
 
