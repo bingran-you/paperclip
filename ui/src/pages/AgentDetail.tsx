@@ -14,6 +14,7 @@ import { instanceSettingsApi } from "../api/instanceSettings";
 import { ApiError } from "../api/client";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { activityApi } from "../api/activity";
+import { accessApi } from "../api/access";
 import { issuesApi } from "../api/issues";
 import { projectsApi } from "../api/projects";
 import { usePanel } from "../context/PanelContext";
@@ -92,7 +93,10 @@ import {
   type AgentRuntimeState,
   type LiveEvent,
   type WorkspaceOperation,
+  isResponsibleUserDenialCode,
+  responsibleUserLabel,
 } from "@paperclipai/shared";
+import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
 import { buildPermissionsForTrustPreset, getTrustPreset } from "../lib/trust-policy-ui";
 import { redactHomePathUserSegments, redactHomePathUserSegmentsInValue } from "@paperclipai/adapter-utils";
 import { agentRouteRef } from "../lib/utils";
@@ -301,7 +305,11 @@ function runMetrics(run: HeartbeatRun) {
   };
 }
 
-type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
+export type RunLogChunk = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  chunk: string;
+};
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -312,6 +320,22 @@ function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+export function buildHeartbeatProgressLogLine(
+  payload: Record<string, unknown>,
+  fallbackTimestamp: string,
+): RunLogChunk | null {
+  const message = asNonEmptyString(payload.message);
+  if (!message) return null;
+  const phase = asNonEmptyString(payload.phase);
+  const ts = asNonEmptyString(payload.updatedAt) ?? fallbackTimestamp;
+  const chunk = phase ? `[${phase}] ${message}` : message;
+  return { ts, stream: "system", chunk };
+}
+
+export function heartbeatProgressLogLineKey(line: RunLogChunk): string {
+  return `${line.ts}\u0000${line.stream}\u0000${line.chunk}`;
 }
 
 export function RunInvocationCard({
@@ -3122,6 +3146,20 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   });
   const run = hydratedRun ?? initialRun;
   const metrics = runMetrics(run);
+  const { data: userDirectory } = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(run.companyId),
+    queryFn: () => accessApi.listUserDirectory(run.companyId),
+    enabled: Boolean(run.companyId && run.responsibleUserId),
+    retry: false,
+  });
+  const responsibleUserName = useMemo(() => {
+    if (!run.responsibleUserId) return null;
+    const entry = userDirectory?.users.find(
+      (candidate) => candidate.principalId === run.responsibleUserId,
+    );
+    return entry?.user?.name ?? entry?.user?.email ?? null;
+  }, [run.responsibleUserId, userDirectory]);
+  const responsibleDenialCode = isResponsibleUserDenialCode(run.errorCode) ? run.errorCode : null;
   const [sessionOpen, setSessionOpen] = useState(false);
   const [claudeLoginResult, setClaudeLoginResult] = useState<ClaudeLoginResult | null>(null);
 
@@ -3328,6 +3366,17 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 </div>
               );
             })()}
+            {run.responsibleUserId && (
+              <div
+                data-testid="run-detail-on-behalf-of"
+                className="text-xs text-muted-foreground"
+              >
+                On behalf of{" "}
+                <span className="text-foreground">
+                  {responsibleUserName ?? responsibleUserLabel(null)}
+                </span>
+              </div>
+            )}
             {resumeRun.isError && (
               <div className="text-xs text-destructive">
                 {resumeRun.error instanceof Error ? resumeRun.error.message : "Failed to resume run"}
@@ -3408,6 +3457,12 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                   </>
                 )}
               </div>
+            )}
+            {responsibleDenialCode && (
+              <ResponsibleUserDenialNotice
+                code={responsibleDenialCode}
+                userName={responsibleUserName}
+              />
             )}
             {hasNonZeroExit && (
               <div className="text-xs text-red-600 dark:text-red-400">
@@ -3591,6 +3646,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   const [transcriptMode, setTranscriptMode] = useState<TranscriptMode>("nice");
   const logEndRef = useRef<HTMLDivElement>(null);
   const pendingLogLineRef = useRef("");
+  const seenProgressLogLineKeysRef = useRef<Set<string>>(new Set());
   const scrollContainerRef = useRef<ScrollContainer | null>(null);
   const isFollowingRef = useRef(false);
   const lastMetricsRef = useRef<{ scrollHeight: number; distanceFromBottom: number }>({
@@ -3738,6 +3794,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   useEffect(() => {
     let cancelled = false;
     pendingLogLineRef.current = "";
+    seenProgressLogLineKeysRef.current = new Set();
     setLogLines([]);
     setLogOffset(0);
     setHasMoreLog(false);
@@ -3882,6 +3939,16 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           const stream = streamRaw === "stderr" || streamRaw === "system" ? streamRaw : "stdout";
           const ts = asNonEmptyString((payload as Record<string, unknown>).ts) ?? event.createdAt;
           setLogLines((prev) => [...prev, { ts, stream, chunk }]);
+          return;
+        }
+
+        if (event.type === "heartbeat.run.progress") {
+          const line = buildHeartbeatProgressLogLine(payload, event.createdAt);
+          if (!line) return;
+          const key = heartbeatProgressLogLineKey(line);
+          if (seenProgressLogLineKeysRef.current.has(key)) return;
+          seenProgressLogLineKeysRef.current.add(key);
+          setLogLines((prev) => [...prev, line]);
           return;
         }
 
