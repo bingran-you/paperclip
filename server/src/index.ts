@@ -583,6 +583,19 @@ export async function startServer(): Promise<StartedServer> {
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
   const backupSettingsSvc = instanceSettingsService(db);
+  const databaseBackupMaxAgeHours = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
+      Math.max(26, Math.ceil((config.databaseBackupIntervalMinutes / 60) * 2)),
+  );
+  const databaseBackupAlertFile =
+    process.env.PAPERCLIP_DB_BACKUP_ALERT_FILE ||
+    resolve(config.databaseBackupDir, "..", "health", "db-backup-to-s3.failure");
+  const databaseBackupAlertFiles = [
+    databaseBackupAlertFile,
+    resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
+    resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
+  ];
   let databaseBackupInFlight = false;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
@@ -657,6 +670,15 @@ export async function startServer(): Promise<StartedServer> {
         return result;
       },
     },
+    databaseBackupHealth: config.databaseBackupEnabled
+      ? {
+          enabled: config.databaseBackupEnabled,
+          backupDir: config.databaseBackupDir,
+          maxAgeHours: databaseBackupMaxAgeHours,
+          alertFile: databaseBackupAlertFile,
+          alertFiles: databaseBackupAlertFiles,
+        }
+      : undefined,
     deploymentMode: config.deploymentMode,
     deploymentExposure: config.deploymentExposure,
     allowedHostnames: config.allowedHostnames,

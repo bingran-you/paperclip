@@ -880,6 +880,37 @@ registry.registerPath({
       deploymentMode: z.string().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
+      databaseBackup: z.object({
+        enabled: z.boolean(),
+        status: z.enum(["ok", "warning"]),
+        backupDir: z.string().optional(),
+        maxAgeHours: z.number().optional(),
+        latestBackup: z.object({
+          name: z.string(),
+          path: z.string(),
+          mtime: z.string().datetime(),
+          ageHours: z.number(),
+          sizeBytes: z.number(),
+        }).nullable().optional(),
+        lastFailure: z.object({
+          path: z.string(),
+          mtime: z.string().datetime(),
+          message: z.string(),
+        }).nullable().optional(),
+        warnings: z.array(z.object({
+          code: z.enum([
+            "database_backup_check_failed",
+            "database_backup_last_failure",
+            "database_backup_missing",
+            "database_backup_stale",
+          ]),
+          message: z.string(),
+        })),
+      }).optional(),
+      warnings: z.array(z.object({
+        code: z.string(),
+        message: z.string(),
+      })).optional(),
       serverInfo: z.object({
         processStartedAt: z.string().datetime(),
         git: z.union([
@@ -4954,6 +4985,27 @@ registerCurrentRoute({
   tags: ["routines"],
   summary: "Update a routine description annotation thread",
   body: updateDocumentAnnotationThreadSchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/blockers",
+  tags: ["issues"],
+  summary: "Get blocker diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/wakes",
+  tags: ["issues"],
+  summary: "Get wake diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/subtree",
+  tags: ["issues"],
+  summary: "Get bounded subtree wake and blocker diagnostics for an issue",
 });
 
 registerCurrentRoute({
