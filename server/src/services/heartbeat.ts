@@ -40,6 +40,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   issueDocuments,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
@@ -113,8 +114,6 @@ import {
 import { issueService } from "./issues.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-  buildIssueBlockersResolvedWakeIdempotencyKey,
-  findExistingIssueBlockersResolvedWake,
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
@@ -137,13 +136,25 @@ import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./exec
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
+  HEARTBEAT_RUN_SCRATCH_MARKER,
+  buildHeartbeatRunScratchEnv,
+  cleanupHeartbeatRunScratch,
+  prepareHeartbeatRunScratch,
+  type HeartbeatRunScratch,
+} from "./run-scratch.js";
+import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
+  isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
+  resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+  WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import {
@@ -300,7 +311,6 @@ const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
-  "acpx_local",
   "claude_local",
   "codex_local",
   "cursor",
@@ -1377,19 +1387,6 @@ async function hasGitPushRemote(cwd: string | null | undefined) {
     if (pushUrl) return true;
   }
   return false;
-}
-
-function resolveEffectiveWorkspaceStrategyType(
-  mode: ReturnType<typeof resolveExecutionWorkspaceMode>,
-  config: Record<string, unknown>,
-): string {
-  const workspaceStrategy = parseObject(config.workspaceStrategy);
-  // Default mirrors workspace-runtime.ts realizeExecutionWorkspace: missing type → "project_primary".
-  // agent_default is a metadata-only mode that never creates a worktree, so it keeps "adapter_managed".
-  return (
-    readNonEmptyString(workspaceStrategy.type) ??
-    (mode === "agent_default" ? "adapter_managed" : "project_primary")
-  );
 }
 
 export async function assertGitWorktreeBaseWorkspaceReady(input: {
@@ -6244,6 +6241,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return runtimeForRun?.sessionId ?? null;
   }
 
+  async function hasResolvableSessionWorkspaceCwd(sessionParams: Record<string, unknown> | null | undefined) {
+    const cwd = readNonEmptyString(sessionParams?.cwd);
+    if (!cwd || isUnsafeSessionWorkspaceCwd(cwd)) return false;
+    return fs
+      .stat(cwd)
+      .then((stats) => stats.isDirectory())
+      .catch(() => false);
+  }
+
+  async function hasResolvablePriorSessionWorkspaceForWake(input: {
+    agent: typeof agents.$inferSelect;
+    contextSnapshot: Record<string, unknown>;
+    taskKey: string | null;
+    explicitResumeSession: Awaited<ReturnType<typeof resolveExplicitResumeSessionOverride>> | null;
+  }) {
+    if (await hasResolvableSessionWorkspaceCwd(input.explicitResumeSession?.sessionParams)) return true;
+    if (shouldResetTaskSessionForWake(input.contextSnapshot)) return false;
+    if (!input.taskKey) return false;
+
+    const codec = getAdapterSessionCodec(input.agent.adapterType);
+    const taskSession = await getTaskSession(
+      input.agent.companyId,
+      input.agent.id,
+      input.agent.adapterType,
+      input.taskKey,
+    );
+    const taskSessionParams = normalizeResumeParamsForAdapter(
+      input.agent.adapterType,
+      codec.deserialize(taskSession?.sessionParamsJson ?? null),
+    );
+    return hasResolvableSessionWorkspaceCwd(taskSessionParams);
+  }
+
   async function resolveExplicitResumeSessionOverride(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
@@ -10173,6 +10203,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    let runScratch: HeartbeatRunScratch | null = null;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -10678,7 +10709,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
       versionSelections: skillVersionSelectionMap(runtimeSkillPreference.desiredSkillEntries),
     });
-    let runtimeConfig = {
+    let runtimeConfig: Record<string, unknown> = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
@@ -11180,6 +11211,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const workspaceRealization = realizationResult.workspaceRealization;
     const executionTarget = realizationResult.executionTarget;
     const remoteExecution = realizationResult.remoteExecution;
+    if (!executionTarget || executionTarget.kind === "local") {
+      try {
+        runScratch = await prepareHeartbeatRunScratch({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          issueId: issueRef?.id ?? null,
+          issueIdentifier: issueRef?.identifier ?? null,
+        });
+        const existingRuntimeEnv = parseObject(runtimeConfig.env);
+        const scratchEnv = buildHeartbeatRunScratchEnv(existingRuntimeEnv, runScratch);
+        runtimeConfig = {
+          ...runtimeConfig,
+          env: {
+            ...existingRuntimeEnv,
+            ...scratchEnv.env,
+          },
+        };
+        context.paperclipScratch = {
+          type: "heartbeat_run",
+          dir: runScratch.dir,
+          cleanupPolicy: "terminal_run",
+          marker: HEARTBEAT_RUN_SCRATCH_MARKER,
+          tempKeysApplied: scratchEnv.tempKeysApplied,
+        };
+      } catch (scratchPrepareError) {
+        runScratch = null;
+        delete context.paperclipScratch;
+        logger.warn(
+          {
+            err: scratchPrepareError,
+            runId: run.id,
+            issueId,
+            agentId: agent.id,
+          },
+          "failed to prepare heartbeat run scratch directory; continuing without scratch env",
+        );
+      }
+    } else {
+      delete context.paperclipScratch;
+    }
     context.paperclipEnvironment = {
       id: selectedEnvironment.id,
       name: selectedEnvironment.name,
@@ -12171,11 +12243,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         // Dependency wake re-check: if this run's issue was marked done mid-run,
         // the route-time `issue_blockers_resolved` wake may have been gated by
-        // workspace finalization or merged into this run. Re-evaluate after any
-        // run completion, including failed adapter outcomes; this is safe because
-        // `listWakeableBlockedDependents` delegates to dependency readiness, which
-        // only returns dependents whose done blockers have crossed the successful
-        // `workspace_finalize` barrier.
+        // workspace finalization or merged into this run. Reuse the level-triggered
+        // dependency backstop so finalize and periodic recovery share idempotency,
+        // readiness, active-path, and observability rules.
         if (issueId && finalizedRun) {
           try {
             const blockerIssueStatus = await db
@@ -12184,63 +12254,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .where(eq(issues.id, issueId))
               .then((rows) => rows[0]?.status ?? null);
             if (blockerIssueStatus === "done") {
-              const dependents = await issuesSvc.listWakeableBlockedDependents(issueId);
-              for (const dependent of dependents) {
-                const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
-                  dependentIssueId: dependent.id,
-                  resolvedBlockerIssueId: issueId,
-                });
-                const existingWake = await findExistingIssueBlockersResolvedWake(db, {
-                  companyId: finalizedRun.companyId,
-                  idempotencyKey,
-                });
-                if (existingWake) continue;
-                await enqueueWakeup(dependent.assigneeAgentId, {
-                  source: "automation",
-                  triggerDetail: "system",
-                  reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-                  payload: {
-                    issueId: dependent.id,
-                    resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                    deferredFor: "workspace_finalize",
-                  },
-                  idempotencyKey,
-                  requestedByActorType: "system",
-                  requestedByActorId: "heartbeat_finalize",
-                  contextSnapshot: {
-                    issueId: dependent.id,
-                    taskId: dependent.id,
-                    wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-                    source: "workspace.finalize",
-                    resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                  },
-                }).then((wakeRun) =>
-                  logActivity(db, {
-                    companyId: finalizedRun.companyId,
-                    actorType: "system",
-                    actorId: "heartbeat_finalize",
-                    agentId: dependent.assigneeAgentId,
-                    runId: finalizedRun.id,
-                    action: "issue.blockers_resolved_wake_emitted",
-                    entityType: "issue",
-                    entityId: dependent.id,
-                    details: {
-                      source: "workspace.finalize",
-                      wakeupRunId: wakeRun?.id ?? null,
-                      idempotencyKey,
-                      resolvedBlockerIssueId: issueId,
-                      blockerIssueIds: dependent.blockerIssueIds,
-                    },
-                  })
-                ).catch((wakeErr) => {
-                  logger.warn(
-                    { err: wakeErr, issueId, dependentIssueId: dependent.id, agentId: dependent.assigneeAgentId },
-                    "failed to fire deferred dependent wake after workspace_finalize",
-                  );
-                });
-              }
+              await recovery.reconcileResolvedDependencyWakeBackstop({
+                runId: finalizedRun.id,
+                companyId: finalizedRun.companyId,
+                blockerIssueId: issueId,
+                source: "workspace.finalize",
+              });
             }
           } catch (finalizeWakeErr) {
             logger.warn(
@@ -12487,6 +12506,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            const scratchForCleanup = runScratch;
+            let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;
+            try {
+              scratchCleanup = await cleanupHeartbeatRunScratch({
+                scratch: scratchForCleanup,
+                processGroupId: latestRun.processGroupId,
+                isProcessGroupAlive,
+              });
+            } catch (scratchCleanupError) {
+              logger.warn(
+                {
+                  err: scratchCleanupError,
+                  runId: run.id,
+                  scratchDir: scratchForCleanup.dir,
+                },
+                "failed to clean heartbeat run scratch directory",
+              );
+              await appendRunEvent(latestRun, await nextRunEventSeq(latestRun.id), {
+                eventType: "error",
+                stream: "system",
+                level: "warn",
+                message: "run scratch cleanup failed",
+                payload: {
+                  dir: scratchForCleanup.dir,
+                  error: scratchCleanupError instanceof Error
+                    ? scratchCleanupError.message
+                    : String(scratchCleanupError),
+                },
+              }).catch(() => undefined);
+            }
+            if (scratchCleanup) {
+              await appendRunEvent(latestRun, await nextRunEventSeq(latestRun.id), {
+                eventType: "lifecycle",
+                stream: "system",
+                level: scratchCleanup.removed ? "info" : "warn",
+                message: scratchCleanup.removed
+                  ? "run scratch cleaned"
+                  : `run scratch cleanup skipped: ${scratchCleanup.reason}`,
+                payload: scratchCleanup,
+              }).catch((scratchCleanupEventError) => {
+                logger.warn(
+                  {
+                    err: scratchCleanupEventError,
+                    runId: run.id,
+                    scratchDir: scratchForCleanup.dir,
+                  },
+                  "failed to record heartbeat run scratch cleanup event",
+                );
+              });
+            }
+          }
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
@@ -13394,6 +13465,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
       await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
+    let hasResolvablePriorSessionWorkspace: boolean | null = null;
+    const resolveHasResolvablePriorSessionWorkspace = async () => {
+      if (hasResolvablePriorSessionWorkspace !== null) return hasResolvablePriorSessionWorkspace;
+      hasResolvablePriorSessionWorkspace = issueId
+        ? await hasResolvablePriorSessionWorkspaceForWake({
+            agent,
+            contextSnapshot: enrichedContextSnapshot,
+            taskKey: effectiveTaskKey,
+            explicitResumeSession,
+          })
+        : false;
+      return hasResolvablePriorSessionWorkspace;
+    };
     const continuationAttempt = readContinuationAttempt(enrichedContextSnapshot.livenessContinuationAttempt);
 
     let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
@@ -13430,6 +13514,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (projectId && !readNonEmptyString(enrichedContextSnapshot.projectId)) {
       enrichedContextSnapshot.projectId = projectId;
     }
+    const isolatedWorkspacesEnabled = issueId
+      ? (await instanceSettings.getExperimental()).enableIsolatedWorkspaces
+      : false;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
     const resolveQueuedResponsibleUserId = () => {
       queuedResponsibleUserIdPromise ??= (async () => {
@@ -13575,7 +13662,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            identifier: issues.identifier,
             status: issues.status,
+            projectId: issues.projectId,
+            projectWorkspaceId: issues.projectWorkspaceId,
+            executionWorkspaceId: issues.executionWorkspaceId,
+            executionWorkspacePreference: issues.executionWorkspacePreference,
+            executionWorkspaceSettings: issues.executionWorkspaceSettings,
             assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
@@ -13855,6 +13948,125 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             finishedAt: new Date(),
           });
           return { kind: "skipped" as const };
+        }
+
+        if (isolatedWorkspacesEnabled && !activeExecutionRun && issue.status !== "done" && issue.status !== "cancelled") {
+          const issueSettings = parseIssueExecutionWorkspaceSettings(issue.executionWorkspaceSettings);
+          const resolvedMode = resolveExecutionWorkspaceMode({
+            projectPolicy: null,
+            issueSettings,
+            legacyUseProjectWorkspace: null,
+          });
+          const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
+            agentConfig: parseObject(agent.adapterConfig),
+            projectPolicy: null,
+            issueSettings,
+            mode: resolvedMode,
+            legacyUseProjectWorkspace: null,
+          });
+          const resolvedStrategy = resolveEffectiveWorkspaceStrategyType(resolvedMode, workspaceManagedConfig);
+          const existingExecutionWorkspaceStatus = issue.executionWorkspaceId
+            ? await tx
+              .select({ status: executionWorkspaces.status })
+              .from(executionWorkspaces)
+              .where(and(
+                eq(executionWorkspaces.id, issue.executionWorkspaceId),
+                eq(executionWorkspaces.companyId, issue.companyId),
+              ))
+              .then((rows) => rows[0]?.status ?? null)
+            : null;
+          const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+            issueExecutionWorkspaceId: issue.executionWorkspaceId,
+            issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
+            existingExecutionWorkspaceStatus,
+          });
+          const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
+
+          if (
+            isUnrunnableWorktreeCombo({
+              issue: {
+                projectId: issue.projectId ?? projectId ?? null,
+                projectWorkspaceId: issue.projectWorkspaceId,
+                executionWorkspaceId: issue.executionWorkspaceId,
+                executionWorkspacePreference: issue.executionWorkspacePreference,
+              },
+              resolvedMode,
+              resolvedStrategy,
+              reusableExecutionWorkspaceAvailable: reuseRequest.existingExecutionWorkspaceAvailable,
+              hasResolvablePriorSessionWorkspace,
+            })
+          ) {
+            const now = new Date();
+            const issueLabel = formatIssueIdentifierLink(issue.identifier, issue.id);
+            const blockedComment = [
+              `Paperclip blocked ${issueLabel} before dispatch because its workspace settings are not runnable.`,
+              "",
+              `- Code: \`${WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE}\``,
+              `- Reason: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE}`,
+              `- Next action: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`,
+            ].join("\n");
+            await tx
+              .update(issues)
+              .set({
+                status: "blocked",
+                checkoutRunId: null,
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: now,
+              })
+              .where(eq(issues.id, issue.id));
+            await tx.insert(issueComments).values({
+              companyId: issue.companyId,
+              issueId: issue.id,
+              body: blockedComment,
+              createdAt: now,
+              updatedAt: now,
+            });
+            await tx.insert(agentWakeupRequests).values({
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+              payload: {
+                ...(payload ?? {}),
+                issueId,
+                heartbeatSkip: {
+                  code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+                  reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+                  remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                },
+              },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: now,
+            });
+            await logActivity(tx as unknown as Db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId,
+              runId: null,
+              action: "issue.workspace_preflight_blocked",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+                reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
+                remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                requestedReason: reason,
+                source,
+                triggerDetail,
+                resolvedMode,
+                resolvedStrategy,
+                hasResolvablePriorSessionWorkspace,
+              },
+            });
+            return { kind: "skipped" as const };
+          }
         }
 
         if (activeExecutionRun) {
