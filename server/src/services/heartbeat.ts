@@ -174,6 +174,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  selectEnvironmentExecutionWorkspaceSettings,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -294,6 +295,14 @@ export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   const normalized = summary.replace(/\s+/g, " ").trim();
   const redacted = redactSensitiveText(redactCurrentUserText(normalized, currentUserRedactionOptions));
   return redacted.length <= 280 ? redacted : `${redacted.slice(0, 277)}...`;
+}
+
+export function redactSuccessfulRunHandoffEvidence(
+  value: string | null,
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+) {
+  if (!value) return null;
+  return redactSensitiveText(redactCurrentUserText(value, currentUserRedactionOptions));
 }
 
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
@@ -7890,7 +7899,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function buildDetectedSuccessfulRunProgressSummary(run: typeof heartbeatRuns.$inferSelect) {
+  function buildDetectedSuccessfulRunProgressSummary(
+    run: typeof heartbeatRuns.$inferSelect,
+    currentUserRedactionOptions: CurrentUserRedactionOptions,
+  ) {
     const resultJson = parseObject(run.resultJson);
     const candidates = [
       hasUnmanagedBackgroundTaskEvidence(resultJson) ? UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON : null,
@@ -7904,7 +7916,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!summary) return null;
     return redactDetectedSuccessfulRunProgressSummaryForBoard(
       summary,
-      await getCurrentUserRedactionOptions(),
+      currentUserRedactionOptions,
     );
   }
 
@@ -7953,6 +7965,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         companyId: issues.companyId,
         identifier: issues.identifier,
         title: issues.title,
+        description: issues.description,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
@@ -7970,7 +7983,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       : null;
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
-    const detectedProgressSummary = await buildDetectedSuccessfulRunProgressSummary(run);
+    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+    const detectedProgressSummary = buildDetectedSuccessfulRunProgressSummary(
+      run,
+      currentUserRedactionOptions,
+    );
+    const resultJson = parseObject(run.resultJson);
+    const finalReport = redactSuccessfulRunHandoffEvidence(
+      [
+        readNonEmptyString(resultJson.summary),
+        readNonEmptyString(resultJson.result),
+        readNonEmptyString(resultJson.message),
+      ].find((value): value is string => Boolean(value)) ?? null,
+      currentUserRedactionOptions,
+    );
+    const nextAction = redactSuccessfulRunHandoffEvidence(
+      readNonEmptyString(run.nextAction),
+      currentUserRedactionOptions,
+    );
 
     const [
       activeExecutionPath,
@@ -8130,6 +8160,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       livenessState: run.livenessState as RunLivenessState | null,
       detectedProgressSummary,
+      finalReport,
+      nextAction,
       taskKey,
       hasActiveExecutionPath: Boolean(activeExecutionPath),
       hasQueuedWake: Boolean(queuedWake),
@@ -11928,9 +11960,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
         : null;
     const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+    const parsedIssueExecutionWorkspaceSettings = parseIssueExecutionWorkspaceSettings(
+      issueContext?.executionWorkspaceSettings,
+    );
     const issueExecutionWorkspaceSettings = isolatedWorkspacesEnabled
-      ? parseIssueExecutionWorkspaceSettings(issueContext?.executionWorkspaceSettings)
+      ? parsedIssueExecutionWorkspaceSettings
       : null;
+    const environmentExecutionWorkspaceSettings = selectEnvironmentExecutionWorkspaceSettings(
+      parsedIssueExecutionWorkspaceSettings,
+      isolatedWorkspacesEnabled,
+    );
     const contextProjectId = readNonEmptyString(context.projectId);
     const executionProjectId = issueContext?.projectId ?? contextProjectId;
     const projectContext = executionProjectId
@@ -12810,6 +12849,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       heartbeatRunId: run.id,
       agentId: agent.id,
       persistedExecutionWorkspace,
+      executionWorkspaceSettings: environmentExecutionWorkspaceSettings,
     });
     const selectedEnvironment = acquiredEnvironment.environment;
     // Defense-in-depth: re-check the actually-acquired environment against the
