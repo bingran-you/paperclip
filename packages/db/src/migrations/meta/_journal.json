@@ -1331,6 +1331,13 @@
       "when": 1784916885227,
       "tag": "0191_status_card_mentioned_issue_ids",
       "breakpoints": true
+    },
+    {
+      "idx": 192,
+      "version": "7",
+      "when": 1784916886226,
+      "tag": "0192_task_watchdog_stop_snapshots",
+      "breakpoints": true
     }
   ]
 }
