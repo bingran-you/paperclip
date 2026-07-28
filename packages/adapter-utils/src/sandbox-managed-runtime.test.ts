@@ -1,3 +1,4 @@
+import { promises as fsPromises } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,18 @@ import {
   prepareSandboxManagedRuntime,
   type SandboxManagedRuntimeClient,
 } from "./sandbox-managed-runtime.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    promises: {
+      ...actual.promises,
+      chmod: vi.fn(actual.promises.chmod),
+      rename: vi.fn(actual.promises.rename),
+    },
+  };
+});
 
 const execFile = promisify(execFileCallback);
 
@@ -62,6 +75,63 @@ describe("sandbox managed runtime", () => {
     await expect(readFile(path.join(targetDir, ".claude.json"), "utf8")).resolves.toBe("{\"keep\":true}\n");
     await expect(readFile(path.join(targetDir, ".paperclip-runtime", "state.json"), "utf8")).resolves.toBe("{}\n");
     await expect(readFile(path.join(targetDir, "stale.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("applies file mode on a staged sibling before renaming into place", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-mode-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const relativePath = path.join("nested", "script.sh");
+    const sourcePath = path.join(sourceDir, relativePath);
+    const targetPath = path.join(targetDir, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    await writeFile(sourcePath, "#!/bin/sh\necho hello\n", { mode: 0o600 });
+    await mkdir(targetDir, { recursive: true });
+
+    const chmodMock = vi.mocked(fsPromises.chmod);
+    const renameMock = vi.mocked(fsPromises.rename);
+    chmodMock.mockClear();
+    renameMock.mockClear();
+
+    await mirrorDirectory(sourceDir, targetDir);
+
+    await expect(readFile(targetPath, "utf8")).resolves.toBe("#!/bin/sh\necho hello\n");
+    expect(chmodMock).toHaveBeenCalledTimes(1);
+    expect(renameMock).toHaveBeenCalledTimes(1);
+    expect(chmodMock.mock.calls[0]?.[0]).toContain(".paperclip-copy.");
+    expect(chmodMock.mock.calls[0]?.[0]).not.toBe(targetPath);
+    expect(chmodMock.mock.invocationCallOrder[0]).toBeLessThan(renameMock.mock.invocationCallOrder[0]);
+  });
+
+  it("cleans up a staged sibling when chmod fails before rename", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-sandbox-copy-cleanup-"));
+    cleanupDirs.push(rootDir);
+    const sourceDir = path.join(rootDir, "source");
+    const targetDir = path.join(rootDir, "target");
+    const relativePath = path.join("nested", "script.sh");
+    const sourcePath = path.join(sourceDir, relativePath);
+    const targetPath = path.join(targetDir, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    await writeFile(sourcePath, "#!/bin/sh\necho hello\n", { mode: 0o600 });
+    await mkdir(targetDir, { recursive: true });
+
+    const chmodMock = vi.mocked(fsPromises.chmod);
+    const renameMock = vi.mocked(fsPromises.rename);
+    chmodMock.mockClear();
+    renameMock.mockClear();
+    chmodMock.mockImplementationOnce(async () => {
+      throw new Error("chmod failed");
+    });
+
+    await expect(mirrorDirectory(sourceDir, targetDir)).rejects.toThrow(/chmod failed/);
+
+    expect(chmodMock).toHaveBeenCalledTimes(1);
+    expect(renameMock).not.toHaveBeenCalled();
+    const stagedPath = chmodMock.mock.calls[0]?.[0];
+    expect(stagedPath).toContain(".paperclip-copy.");
+    await expect(readFile(stagedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(targetPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("syncs workspace and assets through a provider-neutral sandbox client", async () => {

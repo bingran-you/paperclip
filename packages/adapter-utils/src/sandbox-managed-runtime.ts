@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -138,6 +139,35 @@ export interface SandboxSyncFileMapping {
 }
 
 /**
+ * A control command run against the sandbox after a sync operation's files have
+ * landed. Mirrors the plugin SDK `PluginPostUploadCommand`; kept as a local
+ * structural type so `adapter-utils` does not depend on the plugin SDK. Ordered
+ * within {@link SandboxSyncOperation.postUploadCommands} and executed in array
+ * order, fail-fast (first non-zero exit or timeout aborts the operation).
+ *
+ * SECURITY — command origin (Stage-1 design review, condition C1). `command` is
+ * a **Paperclip/adapter-authored control operation**: it may be supplied ONLY by
+ * core/adapter code. No server route, issue/comment content, project/workspace
+ * file content, provider-plugin callback, or arbitrary adapter config may supply
+ * a raw `command` string; any path embedded in it MUST be built by adapter/core
+ * helpers from already-confined paths and shell-quoted (C3). Providers treat the
+ * command as **opaque** — execute or reject, never rewrite/concatenate/append.
+ */
+export interface SandboxPostUploadCommand {
+  /** The opaque, adapter-authored shell command to run after upload. */
+  command: string;
+  /**
+   * Working directory for the command. When present, MUST be an absolute POSIX
+   * path confined under the operation's allowed sandbox target root (C2). When
+   * absent, defaults to the runtime's stable command cwd — never a process
+   * default cwd.
+   */
+  cwd?: string;
+  /** Optional per-command timeout in milliseconds. */
+  timeoutMs?: number;
+}
+
+/**
  * An ordered, opaque unit of work handed to the native sync transport. The
  * `operationId` is an opaque, non-sensitive token authored by the orchestrator
  * (never a caller/asset identifier that could leak intent); a provider MUST NOT
@@ -146,6 +176,13 @@ export interface SandboxSyncFileMapping {
 export interface SandboxSyncOperation {
   operationId: string;
   files: SandboxSyncFileMapping[];
+  /**
+   * Optional ordered control commands run after this operation's files land, in
+   * array order, fail-fast. Absent means "no commands" — byte-identical to a
+   * pre-contract operation. See {@link SandboxPostUploadCommand} for the command
+   * origin/confinement security contract (C1–C4).
+   */
+  postUploadCommands?: SandboxPostUploadCommand[];
 }
 
 export interface SandboxSyncResult {
@@ -161,7 +198,7 @@ export interface SandboxManagedRuntimeClient {
   ): Promise<Buffer | Uint8Array | ArrayBuffer>;
   listFiles(remotePath: string): Promise<string[]>;
   remove(remotePath: string): Promise<void>;
-  run(command: string, options: { timeoutMs: number }): Promise<void>;
+  run(command: string, options: { timeoutMs: number; noProfile?: boolean }): Promise<void>;
   /**
    * Optional native inbound transfer. Present only when the sandbox provider
    * advertises both `environmentSyncIn` and `environmentSyncOut`; otherwise the
@@ -244,6 +281,10 @@ function buildDefaultExtractRuntimeAssetCommand(input: {
     `rm -f ${shellQuote(input.remoteAssetTar)}`;
 }
 
+function buildUniqueStagingPath(input: { targetPath: string; suffix: string }): string {
+  return `${input.targetPath}${input.suffix}.${randomUUID()}`;
+}
+
 export function parseSandboxRemoteExecutionSpec(value: unknown): SandboxRemoteExecutionSpec | null {
   const parsed = asObject(value);
   const transport = asString(parsed.transport).trim();
@@ -314,7 +355,7 @@ async function execTar(args: string[]): Promise<void> {
   });
 }
 
-async function createTarballFromDirectory(input: {
+export async function createTarballFromDirectory(input: {
   localDir: string;
   archivePath: string;
   exclude?: string[];
@@ -397,10 +438,17 @@ async function copyWorkspaceEntry(sourceRoot: string, targetRoot: string, relati
     return;
   }
 
-  await fs.copyFile(sourcePath, targetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
-    await fs.copyFile(sourcePath, targetPath);
-  });
-  await fs.chmod(targetPath, stats.mode);
+  const stagedTargetPath = buildUniqueStagingPath({ targetPath, suffix: ".paperclip-copy" });
+  await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  try {
+    await fs.copyFile(sourcePath, stagedTargetPath, fsConstants.COPYFILE_FICLONE).catch(async () => {
+      await fs.copyFile(sourcePath, stagedTargetPath);
+    });
+    await fs.chmod(stagedTargetPath, stats.mode);
+    await fs.rename(stagedTargetPath, targetPath);
+  } finally {
+    await fs.rm(stagedTargetPath, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 export async function mirrorDirectory(
