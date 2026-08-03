@@ -49,6 +49,7 @@ import {
   environmentCustomImageService,
   decisionService,
   decisionRetentionService,
+  externalObjectService,
   heartbeatService,
   issueService,
   instanceSettingsService,
@@ -912,6 +913,27 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  const startHeartbeatSchedulerInterval = (callback: () => void) => {
+    heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
+    heartbeatSchedulerInterval?.unref?.();
+  };
+  const externalObjects = externalObjectService(db as any, {
+    pluginWorkerManager,
+    enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,
+  });
+  const scheduleExternalObjectRefreshSweep = (now = new Date()) => {
+    if (heartbeatSchedulerStopped) return;
+    trackHeartbeatSchedulerWork(externalObjects
+      .refreshDueObjectsForActiveCompanies(50, now)
+      .then((result) => {
+        if (result.checked > 0 || result.refreshed > 0) {
+          logger.info({ ...result }, "external-object scheduler tick refreshed due objects");
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, "external-object scheduler tick failed");
+      }));
+  };
 
   if (heartbeat) {
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
@@ -1073,7 +1095,7 @@ export async function startServer(): Promise<StartedServer> {
     };
     await runRetentionSweep();
 
-    heartbeatSchedulerInterval = setInterval(() => {
+    startHeartbeatSchedulerInterval(() => {
       // Async so the suppression checks below can honor the override-aware
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
@@ -1105,6 +1127,9 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "heartbeat timer tick failed");
             }));
         }
+
+        if (heartbeatSchedulerStopped) return;
+        scheduleExternalObjectRefreshSweep(new Date());
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1230,7 +1255,11 @@ export async function startServer(): Promise<StartedServer> {
             }));
         }
       })();
-    }, config.heartbeatSchedulerIntervalMs);
+    });
+  } else {
+    startHeartbeatSchedulerInterval(() => {
+      scheduleExternalObjectRefreshSweep(new Date());
+    });
   }
   
   if (config.databaseBackupEnabled) {
