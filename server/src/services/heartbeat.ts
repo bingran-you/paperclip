@@ -193,6 +193,7 @@ import {
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
   resolveExecutionWorkspaceMode,
+  resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -736,44 +737,14 @@ function hasGithubPrWorkflowSkill(desiredSkills: string[]) {
   });
 }
 
-/**
- * Conservative, verb-anchored patterns for an issue whose deliverable is a
- * pushed branch or opened pull request. Verb anchoring keeps passing mentions
- * ("the PR merged yesterday") from triggering the credential preflight.
- */
-const PR_DELIVERABLE_TEXT_PATTERNS = [
-  /\bopen(?:s|ed|ing)?\s+(?:a\s+|the\s+|an?\s+draft\s+)?(?:pull\s+request|pr)\b/i,
-  /\b(?:create|creates|created|creating|raise|raises|raised|raising|submit|submits|submitted|submitting)\s+(?:a\s+|the\s+|an?\s+draft\s+)?(?:pull\s+request|pr)\b/i,
-  // "push back" (an objection or a date) is never a git push, and bare
-  // proximity to words like "upstream" over-matches ("push back on the
-  // upstream dependency change"); require the git object shape instead.
-  /\bpush(?:es|ed|ing)?\b(?!\s+back\b)[^.\n]{0,40}\bbranch(?:es)?\b/i,
-  /\bpush(?:es|ed|ing)?\s+(?:[^.\n]{0,30}\s)?to\s+(?:origin|remote|upstream|github)\b/i,
-];
-
-export function issueTextImpliesPrDeliverable(text: string | null | undefined): boolean {
-  if (!text) return false;
-  return PR_DELIVERABLE_TEXT_PATTERNS.some((pattern) => pattern.test(text));
-}
-
 export function requiresPushCapabilityPreflight(input: {
   adapterType: string;
   issueId: string | null | undefined;
   explicitRunScopedSkillKeys: string[];
-  /**
-   * Issue title + description. Routine-created issues and agent-to-agent
-   * handoffs rarely mention the GitHub PR workflow skill explicitly, yet
-   * state the PR deliverable in plain text — without this, the credential
-   * gap only surfaces after the implementation and review work is done.
-   */
-  issueText?: string | null;
 }) {
   return Boolean(input.issueId)
     && GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)
-    && (
-      hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys)
-      || issueTextImpliesPrDeliverable(input.issueText)
-    );
+    && hasGithubPrWorkflowSkill(input.explicitRunScopedSkillKeys);
 }
 
 const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
@@ -13487,8 +13458,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueContext.id), isNull(issues.responsibleUserId)));
       issueContext = { ...issueContext, responsibleUserId };
     }
+    const parsedProjectExecutionWorkspacePolicy = parseProjectExecutionWorkspacePolicy(
+      projectContext?.executionWorkspacePolicy,
+    );
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
-      parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
+      parsedProjectExecutionWorkspacePolicy,
       isolatedWorkspacesEnabled,
     );
     const trustPreset = resolveCoreTrustPreset({
@@ -13683,41 +13657,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
       requestedExecutionWorkspaceMode;
-    // Serialize shared-workspace execution: two runs mutating the same project
-    // working tree concurrently corrupt each other's uncommitted state, so a
-    // run whose issue targets a busy shared workspace is deferred (rescheduled
-    // retry) instead of dispatched, and keeps deferring until the workspace
-    // frees — an adapter never dispatches alongside a live holder. Deadlock
-    // safety comes from the holder query itself: a holder silent past
-    // WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS stops counting (recovery's
-    // silent-run escalation is already reaping it), so a zombie can only delay
-    // work, never park it forever. This covers non-assignee runs (comment and
-    // review wakes) too — their deferral records that the run never executed
-    // under assignee-ship, so the retry promotion gate does not cancel it as a
-    // reassignment.
-    if (issueRef?.projectWorkspaceId && effectiveExecutionWorkspaceMode === "shared_workspace") {
-      const workspaceHolder = await findSharedWorkspaceHolder({
-        companyId: agent.companyId,
-        projectWorkspaceId: issueRef.projectWorkspaceId,
-        excludeIssueId: issueRef.id,
-        excludeRunId: run.id,
-        honorIsolatedWorkspaceModes: isolatedWorkspacesEnabled,
-      });
-      if (workspaceHolder) {
-        throw new WorkspaceBusyDeferral({
-          holder: workspaceHolder,
-          projectWorkspaceId: issueRef.projectWorkspaceId,
-          deferralAttempt:
-            run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
-              ? (run.scheduledRetryAttempt ?? 0)
-              : 0,
-          wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
-        });
-      }
-    }
-    const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
+    const executionPolicy = { executionMode: resolvedInstanceSettings.general.executionMode };
+    const executionForcedToKubernetes = isExecutionForcedToKubernetes(executionPolicy);
     let selectedEnvironmentId = environmentResolution.environmentId;
-    if (isExecutionForcedToKubernetes(executionPolicy)) {
+    if (executionForcedToKubernetes) {
       let kubernetesEnvironment = await environmentsSvc.findKubernetesEnvironment(agent.companyId);
       if (!kubernetesEnvironment) {
         // Lazy recovery for companies created after the startup bootstrap ran
@@ -13781,6 +13724,79 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       selectedEnvironmentId = kubernetesEnvironment.id;
     }
+    const selectedEnvironmentForConfig = selectedEnvironmentId === localEnvironment.id
+      ? localEnvironment
+      : selectedEnvironmentId
+        ? await environmentsSvc.getById(selectedEnvironmentId)
+        : null;
+    const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+    });
+    // A live holder is always consulted for shared workspaces. Depending on policy and the final
+    // execution target it either remains the existing deferral gate or becomes dispatch context.
+    // Holder staleness and the workspace_busy retry ladder are intentionally unchanged for every
+    // path that serializes.
+    if (issueRef?.projectWorkspaceId && effectiveExecutionWorkspaceMode === "shared_workspace") {
+      const workspaceHolder = await findSharedWorkspaceHolder({
+        companyId: agent.companyId,
+        projectWorkspaceId: issueRef.projectWorkspaceId,
+        excludeIssueId: issueRef.id,
+        excludeRunId: run.id,
+        honorIsolatedWorkspaceModes: isolatedWorkspacesEnabled,
+      });
+      if (workspaceHolder) {
+        const environmentDriver = selectedEnvironmentForConfig?.driver ?? null;
+        const shouldSerialize = sharedWorkspaceConcurrency === "serialize"
+          || (
+            sharedWorkspaceConcurrency === "auto"
+            && (
+              executionForcedToKubernetes
+              || (environmentDriver !== "local" && environmentDriver !== "ssh")
+            )
+          );
+        if (shouldSerialize) {
+          throw new WorkspaceBusyDeferral({
+            holder: workspaceHolder,
+            projectWorkspaceId: issueRef.projectWorkspaceId,
+            deferralAttempt:
+              run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON
+                ? (run.scheduledRetryAttempt ?? 0)
+                : 0,
+            wasIssueAssignee: issueContext?.assigneeAgentId === agent.id,
+          });
+        }
+
+        const holderIssueLabel = workspaceHolder.issueIdentifier ?? workspaceHolder.issueId;
+        const concurrentWorkspaceNote =
+          `shared workspace is concurrently held by run ${workspaceHolder.runId} (issue ${holderIssueLabel}); `
+          + "expect concurrent mutations, coordinate via commits";
+        const appendConcurrentWorkspaceNote = (value: unknown) => {
+          const existing = typeof value === "string" ? value.trimEnd() : "";
+          return existing ? `${existing}\n${concurrentWorkspaceNote}` : concurrentWorkspaceNote;
+        };
+        context.paperclipTaskMarkdown = appendConcurrentWorkspaceNote(context.paperclipTaskMarkdown);
+        if (typeof context.paperclipTaskMarkdownCompact === "string") {
+          context.paperclipTaskMarkdownCompact = appendConcurrentWorkspaceNote(
+            context.paperclipTaskMarkdownCompact,
+          );
+        }
+        logger.info(
+          {
+            event: "shared_workspace_concurrent_dispatch",
+            runId: run.id,
+            issueId: issueRef.id,
+            projectWorkspaceId: issueRef.projectWorkspaceId,
+            holderRunId: workspaceHolder.runId,
+            holderIssueId: workspaceHolder.issueId,
+            sharedWorkspaceConcurrency,
+            environmentDriver,
+            executionForcedToKubernetes,
+          },
+          "Dispatching alongside a live shared-workspace holder",
+        );
+      }
+    }
     const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
       agentConfig: config,
       projectPolicy: projectExecutionWorkspacePolicy,
@@ -13826,11 +13842,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
-    const selectedEnvironmentForConfig = selectedEnvironmentId === localEnvironment.id
-      ? localEnvironment
-      : selectedEnvironmentId
-        ? await environmentsSvc.getById(selectedEnvironmentId)
-        : null;
     const runScopedMentionedSkillKeys = await resolveRunScopedMentionedSkillKeys({
       db,
       companyId: agent.companyId,
@@ -13840,7 +13851,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       adapterType: agent.adapterType,
       issueId,
       explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
-      issueText: issueRef ? `${issueRef.title ?? ""}\n${issueRef.description ?? ""}` : null,
     });
     const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,

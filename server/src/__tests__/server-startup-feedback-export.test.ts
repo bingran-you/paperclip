@@ -24,6 +24,8 @@ const {
   fakeServer,
   heartbeatServiceFactoryMock,
   heartbeatServiceMock,
+  issueThreadInteractionServiceFactoryMock,
+  issueThreadInteractionServiceMock,
   loadConfigMock,
   resolveHeartbeatSchedulingSuppressionMock,
   routineServiceFactoryMock,
@@ -69,6 +71,10 @@ const {
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
   };
   const heartbeatServiceFactoryMock = vi.fn(() => heartbeatServiceMock);
+  const issueThreadInteractionServiceMock = {
+    sweepSupersededPendingRequestConfirmations: vi.fn(async () => ({ expired: 0 })),
+  };
+  const issueThreadInteractionServiceFactoryMock = vi.fn(() => issueThreadInteractionServiceMock);
   const environmentCustomImagesServiceMock = {
     cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
   };
@@ -111,6 +117,8 @@ const {
     fakeServer,
     heartbeatServiceFactoryMock,
     heartbeatServiceMock,
+    issueThreadInteractionServiceFactoryMock,
+    issueThreadInteractionServiceMock,
     loadConfigMock,
     resolveHeartbeatSchedulingSuppressionMock,
     routineServiceFactoryMock,
@@ -235,6 +243,7 @@ vi.mock("../services/index.js", () => ({
   environmentCustomImageService: environmentCustomImagesServiceFactoryMock,
   externalObjectService: externalObjectsServiceFactoryMock,
   heartbeatService: heartbeatServiceFactoryMock,
+  issueThreadInteractionService: issueThreadInteractionServiceFactoryMock,
   issueService: vi.fn(() => ({ update: vi.fn(async () => null) })),
   instanceSettingsService: vi.fn(() => ({
     getExperimental: vi.fn(async () => ({
