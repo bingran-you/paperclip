@@ -52,8 +52,10 @@ import {
   BLOCKER_ATTENTION_MAX_NODES,
   issueService,
 } from "./issues.js";
+import { visibleIssueCondition } from "./issue-visibility.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isProspectiveBlockedTransition } from "./routable-blocked.js";
+import { evaluateAgentInvokability, type AgentOrgRow } from "./agent-invokability.js";
 import { decisionQueueService } from "./decision-queues.js";
 import {
   decisionRetentionService,
@@ -791,7 +793,7 @@ async function issueSummaryMap(db: Db, companyId: string, issueIds: Array<string
       eq(issues.projectWorkspaceId, projectWorkspaces.id),
       eq(projectWorkspaces.companyId, companyId),
     ))
-    .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids), isNull(issues.hiddenAt)));
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids), visibleIssueCondition()));
   return new Map(rows.map((row) => [row.id, {
     id: row.id,
     companyId: row.companyId,
@@ -1023,8 +1025,10 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       if (options.all && !options.queue && !options.allowUnscopedAll) {
         throw badRequest("all requires a queue filter");
       }
-      const prefix = await companyPrefix(db, companyId);
-      const dismissals = await dismissalByKey(db, companyId, options.userId);
+      const [prefix, dismissals] = await Promise.all([
+        companyPrefix(db, companyId),
+        dismissalByKey(db, companyId, options.userId),
+      ]);
       const includeDismissed = options.includeDismissed === true;
       const now = serviceOptions.now?.() ?? Date.now();
       const collected: AttentionItem[] = [];
@@ -1115,6 +1119,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           title: issueThreadInteractions.title,
           summary: issueThreadInteractions.summary,
           payload: issueThreadInteractions.payload,
+          addresseeAgentId: issueThreadInteractions.addresseeAgentId,
           createdByAgentId: issueThreadInteractions.createdByAgentId,
           createdAt: issueThreadInteractions.createdAt,
           updatedAt: issueThreadInteractions.updatedAt,
@@ -1125,10 +1130,29 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           inArray(issueThreadInteractions.status, [...PENDING_INTERACTION_STATUSES]),
         ))
         .orderBy(desc(issueThreadInteractions.updatedAt), desc(issueThreadInteractions.id));
-      const visibleInteractionRows = collapsePendingConfirmationsToNewest(interactionRows);
-      const interactionIssueMap = await issueSummaryMap(db, companyId, visibleInteractionRows.map((row) => row.issueId));
-      const interactionImageMap = await issueImageMap(db, companyId, visibleInteractionRows.map((row) => row.issueId));
-      const interactionPlanDocumentMap = await planDocumentMap(db, companyId, visibleInteractionRows.map((row) => row.issueId));
+      const companyAgentRows: AgentOrgRow[] = interactionRows.some((row) => row.addresseeAgentId !== null)
+        ? await db
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            name: agents.name,
+            reportsTo: agents.reportsTo,
+            status: agents.status,
+          })
+          .from(agents)
+          .where(eq(agents.companyId, companyId))
+        : [];
+      const companyAgentMap = new Map(companyAgentRows.map((agent) => [agent.id, agent]));
+      const boardInteractionRows = interactionRows.filter((row) =>
+        row.addresseeAgentId === null ||
+        !evaluateAgentInvokability(companyAgentMap.get(row.addresseeAgentId), companyAgentRows).invokable
+      );
+      const visibleInteractionRows = collapsePendingConfirmationsToNewest(boardInteractionRows);
+      const [interactionIssueMap, interactionImageMap, interactionPlanDocumentMap] = await Promise.all([
+        issueSummaryMap(db, companyId, visibleInteractionRows.map((row) => row.issueId)),
+        issueImageMap(db, companyId, visibleInteractionRows.map((row) => row.issueId)),
+        planDocumentMap(db, companyId, visibleInteractionRows.map((row) => row.issueId)),
+      ]);
 
       for (const interaction of visibleInteractionRows) {
         const issue = interactionIssueMap.get(interaction.issueId) ?? null;
@@ -1194,16 +1218,18 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const openDecisions = options.all
         ? await openDecisionQuery
         : await openDecisionQuery.limit(openDecisionLimit);
-      const decisionIssueMap = await issueSummaryMap(db, companyId, openDecisions.map((decision) => decision.originIssueId));
       // Bundle titles let the feed render a single "Agent proposed N decisions"
       // group header over sibling decisions (v1 still decides each independently).
       const bundleIds = [...new Set(openDecisions.map((decision) => decision.bundleId).filter((value): value is string => Boolean(value)))];
       const bundleTitleMap = new Map<string, string>();
-      if (bundleIds.length > 0) {
-        const bundleRows = await db.select({ id: decisionBundles.id, title: decisionBundles.title })
-          .from(decisionBundles).where(and(eq(decisionBundles.companyId, companyId), inArray(decisionBundles.id, bundleIds)));
-        for (const row of bundleRows) bundleTitleMap.set(row.id, row.title);
-      }
+      const [decisionIssueMap, bundleRows] = await Promise.all([
+        issueSummaryMap(db, companyId, openDecisions.map((decision) => decision.originIssueId)),
+        bundleIds.length > 0
+          ? db.select({ id: decisionBundles.id, title: decisionBundles.title })
+            .from(decisionBundles).where(and(eq(decisionBundles.companyId, companyId), inArray(decisionBundles.id, bundleIds)))
+          : Promise.resolve([]),
+      ]);
+      for (const row of bundleRows) bundleTitleMap.set(row.id, row.title);
       for (const decision of openDecisions) {
         const issue = decisionIssueMap.get(decision.originIssueId) ?? null;
         add(createItem({
@@ -1301,12 +1327,14 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
-      const recoveryIssueMap = await issueSummaryMap(
-        db,
-        companyId,
-        recoveryRows.flatMap((row) => [row.sourceIssueId, row.recoveryIssueId]),
-      );
-      const recoveryImageMap = await issueImageMap(db, companyId, recoveryRows.map((row) => row.sourceIssueId));
+      const [recoveryIssueMap, recoveryImageMap] = await Promise.all([
+        issueSummaryMap(
+          db,
+          companyId,
+          recoveryRows.flatMap((row) => [row.sourceIssueId, row.recoveryIssueId]),
+        ),
+        issueImageMap(db, companyId, recoveryRows.map((row) => row.sourceIssueId)),
+      ]);
 
       for (const recovery of recoveryRows) {
         const sourceIssue = recoveryIssueMap.get(recovery.sourceIssueId) ?? null;
@@ -1378,9 +1406,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           notInArray(issues.status, [...PRODUCTIVITY_REVIEW_TERMINAL_STATUSES]),
         ))
         .orderBy(desc(issues.updatedAt), desc(issues.id));
-      const productivitySourceMap = await issueSummaryMap(db, companyId, productivityRows.map((row) => row.originId));
-      const productivityReviewMap = await issueSummaryMap(db, companyId, productivityRows.map((row) => row.id));
-      const productivityImageMap = await issueImageMap(db, companyId, productivityRows.map((row) => row.id));
+      const [productivitySourceMap, productivityReviewMap, productivityImageMap] = await Promise.all([
+        issueSummaryMap(db, companyId, productivityRows.map((row) => row.originId)),
+        issueSummaryMap(db, companyId, productivityRows.map((row) => row.id)),
+        issueImageMap(db, companyId, productivityRows.map((row) => row.id)),
+      ]);
 
       for (const review of productivityRows) {
         const reviewIssue = productivityReviewMap.get(review.id);
@@ -1427,14 +1457,16 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       const terminalBlockerIssueIds = typedBlockedIssues
         .map((issue) => issue.blockerAttention?.terminalBlockerIssueId)
         .filter((issueId): issueId is string => Boolean(issueId));
-      const blockedIssueSummaries = await issueSummaryMap(db, companyId, blockedIssues.map((issue) => issue.id));
-      const terminalBlockerSummaries = await issueSummaryMap(db, companyId, terminalBlockerIssueIds);
-      const blockerImageMap = await issueImageMap(
-        db,
-        companyId,
-        [...blockedIssues.map((issue) => issue.id), ...terminalBlockerIssueIds],
-      );
-      const blockingIssues = await blockingIssueMap(db, companyId, blockedIssues.map((issue) => issue.id));
+      const [blockedIssueSummaries, terminalBlockerSummaries, blockerImageMap, blockingIssues] = await Promise.all([
+        issueSummaryMap(db, companyId, blockedIssues.map((issue) => issue.id)),
+        issueSummaryMap(db, companyId, terminalBlockerIssueIds),
+        issueImageMap(
+          db,
+          companyId,
+          [...blockedIssues.map((issue) => issue.id), ...terminalBlockerIssueIds],
+        ),
+        blockingIssueMap(db, companyId, blockedIssues.map((issue) => issue.id)),
+      ]);
       const terminalCandidates = new Map<string, {
         issue: BlockedAttentionIssue;
         issueSummary: IssueSummaryRow | null;
@@ -1544,7 +1576,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           updatedAt: issues.updatedAt,
         })
         .from(issues)
-        .where(and(eq(issues.companyId, companyId), eq(issues.status, "in_review"), isNull(issues.hiddenAt)))
+        .where(and(eq(issues.companyId, companyId), eq(issues.status, "in_review"), visibleIssueCondition()))
         .orderBy(desc(issues.updatedAt), desc(issues.id));
       const reviewIssueIds = reviewRows.map((row) => row.id);
       const pendingReviewApprovalRows = reviewIssueIds.length === 0
@@ -1560,36 +1592,57 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             eq(approvals.status, "pending"),
           ));
       const pendingApprovalByIssueId = new Map(pendingReviewApprovalRows.map((row) => [row.issueId, row.approvalId]));
-      const reviewIssueMap = await issueSummaryMap(db, companyId, reviewIssueIds);
-      const reviewImageMap = await issueImageMap(db, companyId, reviewIssueIds);
+      const [reviewAttentionByIssueId, reviewIssueMap, reviewImageMap] = await Promise.all([
+        issueService(db).listReviewAttention(companyId, reviewRows),
+        issueSummaryMap(db, companyId, reviewIssueIds),
+        issueImageMap(db, companyId, reviewIssueIds),
+      ]);
 
       for (const review of reviewRows) {
         const state = parseIssueExecutionState(review.executionState);
         const currentParticipant = state?.status === "pending" ? state.currentParticipant : null;
         const hasHumanParticipant = currentParticipant?.type === "user";
         const pendingApprovalId = pendingApprovalByIssueId.get(review.id) ?? null;
-        if (!hasHumanParticipant && !review.assigneeUserId && !pendingApprovalId) continue;
+        const reviewAttention = reviewAttentionByIssueId.get(review.id);
+        const stalled = reviewAttention?.state === "stalled";
+        if (!hasHumanParticipant && !review.assigneeUserId && !pendingApprovalId && !stalled) continue;
         const issue = reviewIssueMap.get(review.id);
         if (!issue) continue;
         const dedupKey = `review:${review.id}`;
+        // A stalled review carries no interaction/approval/monitor to open, so
+        // it is resolved in-row with the three review verbs (PAP-16080 §4.4).
+        // Covered reviews still deep-link — their real action lives elsewhere
+        // (the pending interaction/approval card, a monitor, a live run).
+        const reviewSubject = issueSubject(prefix, issue);
         add(createItem({
           companyId,
           sourceKind: "review",
-          subject: issueSubject(prefix, issue),
-          whyNow: pendingApprovalId
+          subject: stalled
+            ? { ...reviewSubject, metadata: { ...reviewSubject.metadata, reviewAttentionState: "stalled" } }
+            : reviewSubject,
+          whyNow: stalled
+            ? "Issue is in review without a maintained reviewer, interaction, approval, monitor, run, wake, or recovery path."
+            : pendingApprovalId
             ? "Issue is in review with a linked pending approval."
             : hasHumanParticipant
               ? "Issue is in review and the current execution participant is a user."
               : "Issue is in review and assigned to a user.",
-          decisionVerbs: decisionVerbs(
-            { id: "approve", label: "Approve", description: "Approve the review and advance the issue." },
-            { id: "request_changes", label: "Request changes", description: "Return the issue to the assignee with changes requested." },
-          ),
-          inlineResolvable: false,
-          entryRule: "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",
+          decisionVerbs: stalled
+            ? decisionVerbs(
+                { id: "choose_review_path", label: "Choose review path", description: "Add a reviewer or waiting path, return the issue to work, or accept it." },
+                { id: "request_changes", label: "Request changes", description: "Return the issue to the assignee with changes requested." },
+              )
+            : decisionVerbs(
+                { id: "approve", label: "Approve", description: "Approve the review and advance the issue." },
+                { id: "request_changes", label: "Request changes", description: "Return the issue to the assignee with changes requested." },
+              ),
+          inlineResolvable: stalled,
+          entryRule: stalled
+            ? "issues.status = 'in_review' and reviewAttention.state = 'stalled'."
+            : "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",
           exitRule: "Issue leaves in_review or the human review path resolves.",
           dedupKey,
-          severity: "medium",
+          severity: stalled ? "high" : "medium",
           activityAt: toIso(review.updatedAt),
           createdAt: toIso(review.createdAt),
           updatedAt: toIso(review.updatedAt),
@@ -1634,37 +1687,39 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       }
       const failedRows = [...latestExhaustedByRunId.values()];
       const failedIssueIds = failedRows.map((row) => readRunIssueId(row.contextSnapshot));
-      const failedIssueMap = await issueSummaryMap(
-        db,
-        companyId,
-        failedIssueIds,
-      );
-      const failedImageMap = await issueImageMap(db, companyId, failedIssueIds);
       const failedAgentIds = [...new Set(failedRows.map((row) => row.agentId))];
       const oldestFailedRunCreatedAt = failedRows.reduce<Date | null>((oldest, row) => {
         if (!oldest || row.createdAt < oldest) return row.createdAt;
         return oldest;
       }, null);
+      const [failedIssueMap, failedImageMap, newerRuns] = await Promise.all([
+        issueSummaryMap(
+          db,
+          companyId,
+          failedIssueIds,
+        ),
+        issueImageMap(db, companyId, failedIssueIds),
+        oldestFailedRunCreatedAt && failedAgentIds.length > 0
+          ? db
+            .select({
+              agentId: heartbeatRuns.agentId,
+              createdAt: heartbeatRuns.createdAt,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
+            })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.companyId, companyId),
+              inArray(heartbeatRuns.agentId, failedAgentIds),
+              gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
+            ))
+          : Promise.resolve([]),
+      ]);
       const latestRunCreatedAtByKey = new Map<string, Date>();
-      if (oldestFailedRunCreatedAt && failedAgentIds.length > 0) {
-        const newerRuns = await db
-          .select({
-            agentId: heartbeatRuns.agentId,
-            createdAt: heartbeatRuns.createdAt,
-            contextSnapshot: heartbeatRuns.contextSnapshot,
-          })
-          .from(heartbeatRuns)
-          .where(and(
-            eq(heartbeatRuns.companyId, companyId),
-            inArray(heartbeatRuns.agentId, failedAgentIds),
-            gt(heartbeatRuns.createdAt, oldestFailedRunCreatedAt),
-          ));
-        for (const newerRun of newerRuns) {
-          const newerRunKey = `${newerRun.agentId}:${readRunIssueId(newerRun.contextSnapshot) ?? ""}`;
-          const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
-          if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
-            latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
-          }
+      for (const newerRun of newerRuns) {
+        const newerRunKey = `${newerRun.agentId}:${readRunIssueId(newerRun.contextSnapshot) ?? ""}`;
+        const latestCreatedAt = latestRunCreatedAtByKey.get(newerRunKey);
+        if (!latestCreatedAt || newerRun.createdAt > latestCreatedAt) {
+          latestRunCreatedAtByKey.set(newerRunKey, newerRun.createdAt);
         }
       }
       for (const run of failedRows) {

@@ -82,6 +82,18 @@ export {
   type OriginatingActor,
 } from "./issue-attribution.js";
 export {
+  ISSUE_WRITE_DENIAL_CODES,
+  describeIssueWriteDenial,
+  isIssueWriteDenialCode,
+  issueWriteDenialApiMessage,
+  issueWriteDenialCodeForResponsibleUserDenial,
+  issueWriteDenialResponse,
+  type IssueWriteDenialCode,
+  type IssueWriteDenialContext,
+  type IssueWriteDenialCopy,
+  type IssueWriteDenialTone,
+} from "./issue-write-denial.js";
+export {
   RESPONSIBLE_USER_DENIAL_CODES,
   describeResponsibleUserDenial,
   isResponsibleUserDenialCode,
@@ -267,6 +279,7 @@ export {
   ISSUE_COMMENT_PRESENTATION_DENSITIES,
   clampIssueRequestDepth,
   ISSUE_THREAD_INTERACTION_KINDS,
+  ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
   ISSUE_THREAD_INTERACTION_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_ORIGIN_KINDS,
@@ -451,6 +464,7 @@ export {
   type IssueCommentPresentationTone,
   type IssueCommentPresentationDensity,
   type IssueThreadInteractionKind,
+  type IssueThreadInteractionResolverPolicy,
   type IssueThreadInteractionStatus,
   type IssueThreadInteractionContinuationPolicy,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
@@ -607,6 +621,8 @@ export {
 
 export type {
   Company,
+  InteractionResolverGovernance,
+  InteractionResolverKindGovernance,
   GenerateSummarySlotRequest,
   GenerateSummarySlotResponse,
   GetSummarySlotResponse,
@@ -914,6 +930,12 @@ export type {
   IssueBlockerAttention,
   IssueBlockerAttentionReason,
   IssueBlockerAttentionState,
+  IssueReviewAttention,
+  IssueReviewAttentionPath,
+  IssueReviewAttentionPathKind,
+  IssueReviewAttentionState,
+  StalledReviewDecisionAction,
+  StalledReviewDecisionResponse,
   IssueInboxAttentionKind,
   IssueBlockedInboxAction,
   IssueBlockedInboxAttention,
@@ -1521,6 +1543,7 @@ export {
 
 export {
   createCompanySchema,
+  interactionResolverGovernanceSchema,
   updateCompanySchema,
   updateCompanyBrandingSchema,
   feedbackTargetTypeSchema,
@@ -1649,6 +1672,7 @@ export {
   issueBlockedInboxSeveritySchema,
   issueBlockedInboxStateSchema,
   updateIssueSchema,
+  stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
@@ -1747,6 +1771,7 @@ export {
   type CreateAcceptedPlanDecomposition,
   type CreateIssueLabel,
   type UpdateIssue,
+  type StalledReviewDecision,
   type ResolveIssueRecoveryAction,
   type CheckoutIssue,
   type AddIssueComment,

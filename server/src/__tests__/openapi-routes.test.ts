@@ -21,6 +21,7 @@ const apiPrefixes: Record<string, string> = {
   "auth.ts": "/api/auth",
   "board-chat.ts": "/api",
   "built-in-agents.ts": "/api",
+  "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
   "company-skill-policy.ts": "/api",
@@ -188,6 +189,9 @@ describe("openapi routes", () => {
       },
     });
     expect(res.body.paths["/api/companies/{companyId}/folders"].post.responses["201"]).toBeDefined();
+    expect(
+      res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.summary,
+    ).toBe("Withdraw a pending issue thread interaction");
     expect(res.body.paths["/api/companies/{companyId}/folders/items/move"].post.summary).toBe(
       "Move an item into or out of a folder",
     );

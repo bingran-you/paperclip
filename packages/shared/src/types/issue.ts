@@ -25,6 +25,7 @@ import type {
   ModelProfileKey,
   IssueThreadInteractionContinuationPolicy,
   IssueThreadInteractionKind,
+  IssueThreadInteractionResolverPolicy,
   IssueThreadInteractionStatus,
   IssueStatus,
 } from "../constants.js";
@@ -409,6 +410,41 @@ export interface IssueBlockerAttention {
   terminalBlockerIssueId?: string | null;
 }
 
+export type IssueReviewAttentionState = "none" | "covered" | "stalled";
+
+export type IssueReviewAttentionPathKind =
+  | "execution_participant"
+  | "interaction"
+  | "approval"
+  | "monitor"
+  | "human_reviewer"
+  | "active_run"
+  | "queued_wake"
+  | "recovery";
+
+export interface IssueReviewAttentionPath {
+  kind: IssueReviewAttentionPathKind;
+  label: string;
+  responder: string | null;
+  since: string | null;
+  ref: string | null;
+}
+
+export interface IssueReviewAttention {
+  state: IssueReviewAttentionState;
+  paths: IssueReviewAttentionPath[];
+  reason: string | null;
+}
+
+export type StalledReviewDecisionAction = "approve" | "request_changes" | "send_back";
+
+export interface StalledReviewDecisionResponse {
+  issue: Issue;
+  action: StalledReviewDecisionAction;
+  comment: IssueComment | null;
+  wakeQueued: boolean;
+}
+
 export type IssueInboxAttentionKind = "blocked";
 
 export type IssueBlockedInboxState =
@@ -782,6 +818,7 @@ export interface Issue {
   blockedBy?: IssueRelationIssueSummary[];
   blocks?: IssueRelationIssueSummary[];
   blockerAttention?: IssueBlockerAttention;
+  reviewAttention?: IssueReviewAttention;
   blockedInboxAttention?: IssueBlockedInboxAttention | null;
   unblockDescriptor?: IssueUnblockDescriptor | null;
   blockedTransitionAt?: Date | null;
@@ -853,6 +890,7 @@ export type CompactIssue = Pick<
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
   blockerAttention?: IssueBlockerAttention;
+  reviewAttention?: IssueReviewAttention;
   blockedInboxAttention?: IssueBlockedInboxAttention | null;
   productivityReview?: IssueProductivityReview | null;
   scheduledRetry?: IssueScheduledRetry | null;
@@ -892,6 +930,8 @@ export interface IssueComment {
   authorType: IssueCommentAuthorType;
   authorAgentId: string | null;
   authorUserId: string | null;
+  /** Responsible user attribution. Legacy and plugin-provided comment values may omit it. */
+  onBehalfOfUserId?: string | null;
   createdByRunId?: string | null;
   derivedAuthorAgentId?: string | null;
   derivedCreatedByRunId?: string | null;
@@ -967,6 +1007,7 @@ export interface IssueCommentMetadataSection {
 export interface IssueCommentMetadata {
   version: 1;
   sourceRunId?: string | null;
+  authorizationReason?: string | null;
   sections: IssueCommentMetadataSection[];
 }
 
@@ -982,6 +1023,7 @@ export interface IssueThreadInteractionActorFields {
   createdByAgentId?: string | null;
   createdByUserId?: string | null;
   resolvedByAgentId?: string | null;
+  resolvedByRunId?: string | null;
   resolvedByUserId?: string | null;
 }
 
@@ -1019,7 +1061,7 @@ export interface SuggestTasksResultCreatedTask {
 
 export interface SuggestTasksResult {
   version: 1;
-  outcome?: "withdrawn" | "issue_closed";
+  outcome?: "withdrawn" | "issue_closed" | "addressee_deleted";
   reason?: string | null;
   createdTasks?: SuggestTasksResultCreatedTask[];
   skippedClientKeys?: string[];
@@ -1057,7 +1099,7 @@ export interface AskUserQuestionsAnswer {
 
 export interface AskUserQuestionsResult {
   version: 1;
-  outcome?: "withdrawn" | "issue_closed";
+  outcome?: "withdrawn" | "issue_closed" | "addressee_deleted";
   reason?: string | null;
   answers: AskUserQuestionsAnswer[];
   cancelled?: true;
@@ -1200,7 +1242,8 @@ export interface RequestConfirmationResult {
     | "superseded_by_newer_request"
     | "stale_target"
     | "withdrawn"
-    | "issue_closed";
+    | "issue_closed"
+    | "addressee_deleted";
   reason?: string | null;
   commentId?: string | null;
   supersededByInteractionId?: string | null;
@@ -1233,7 +1276,7 @@ export interface RequestItemVerdictsResultItem {
 
 export interface RequestItemVerdictsResult {
   version: 1;
-  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "withdrawn" | "issue_closed";
+  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "withdrawn" | "issue_closed" | "addressee_deleted";
   reason?: string | null;
   complete: boolean;
   items: RequestItemVerdictsResultItem[];
@@ -1249,10 +1292,14 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   idempotencyKey?: string | null;
   sourceCommentId?: string | null;
   sourceRunId?: string | null;
+  addresseeAgentId?: string | null;
   title?: string | null;
   summary?: string | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
+  resolverPolicy: IssueThreadInteractionResolverPolicy;
+  requestedResolverPolicy: IssueThreadInteractionResolverPolicy;
+  effectiveResolverPolicy: IssueThreadInteractionResolverPolicy;
   createdAt: Date | string;
   updatedAt: Date | string;
   resolvedAt?: Date | string | null;

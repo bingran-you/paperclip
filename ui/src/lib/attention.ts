@@ -14,15 +14,23 @@ export type AttentionListOptions = AttentionFeedQuery;
 
 /**
  * Source kinds the queue can fully resolve in-row. Everything else deep-links
- * to its native surface — reviews are *never* inline (converged PAP-12628),
- * and the remaining state-derived sources (recovery, failures, budget) expose
- * verbs too rich to safely inline here, so they open their surface.
+ * to its native surface — the state-derived sources (recovery, failures,
+ * budget) expose verbs too rich to safely inline here, so they open their
+ * surface.
+ *
+ * `review` is inline *only when stalled* (PAP-16080 §4.4): a stalled review has
+ * no interaction/approval/monitor to open, so the three review verbs
+ * (approve / request changes / send back) actuate in-row — the server flips
+ * `inlineResolvable` on for exactly those rows (`isInlineResolvable` still ANDs
+ * that flag). A *covered* review keeps deep-linking, since its real action
+ * lives on the issue (the pending card, a monitor, a live run).
  */
 export const INLINE_RESOLVABLE_SOURCE_KINDS: ReadonlySet<AttentionSourceKind> = new Set<AttentionSourceKind>([
   "approval",
   "decision",
   "issue_thread_interaction",
   "join_request",
+  "review",
 ]);
 
 export function isInlineResolvable(item: AttentionItem): boolean {

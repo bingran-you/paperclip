@@ -48,6 +48,7 @@ import {
 } from "./ui/dropdown-menu";
 import { AttentionInteractionResolver } from "./AttentionInteractionResolver";
 import { DecisionResolver } from "./DecisionResolver";
+import { StalledReviewActions } from "./StalledReviewActions";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -832,6 +833,18 @@ function InlineResolver({
 
   if (item.sourceKind === "join_request") {
     return <JoinRequestResolver item={item} companyId={companyId} toggle={toggle} />;
+  }
+
+  if (item.sourceKind === "review") {
+    // Inline only for stalled reviews (server sets inlineResolvable then); the
+    // subject IS the issue, so its id is the decision target.
+    return (
+      <StalledReviewActions
+        issueId={item.subject.id}
+        companyId={companyId}
+        footerSlot={toggle}
+      />
+    );
   }
 
   return null;

@@ -30,6 +30,7 @@ vi.mock("../api/issues", () => ({
   issuesApi: {
     acceptInteraction: vi.fn(),
     rejectInteraction: vi.fn(),
+    decideStalledReview: vi.fn(() => Promise.resolve({})),
   },
 }));
 
@@ -149,12 +150,42 @@ describe("AttentionQueueRow", () => {
     expect(el.textContent).not.toContain("Open");
   });
 
-  it("does not inline a review — it deep-links instead", () => {
+  it("inlines a stalled review with the three review verbs (PAP-16080 §4.4)", () => {
     const el = render(
       <AttentionQueueRow
         item={buildItem({
           sourceKind: "review" as AttentionSourceKind,
           inlineResolvable: true,
+          subject: {
+            kind: "issue",
+            id: "issue-1",
+            companyId: "c1",
+            title: "PR ready for review",
+            identifier: null,
+            status: "in_review",
+            href: "/PAP/issues/PAP-1",
+            metadata: { reviewAttentionState: "stalled" },
+          },
+        })}
+        companyId="c1"
+        expanded
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+    // Inline rows resolve in place, not via an "Open" deep-link.
+    expect(el.textContent).not.toContain("Open");
+    expect(el.textContent).toContain("Approve");
+    expect(el.textContent).toContain("Request changes");
+    expect(el.textContent).toContain("Send back to work");
+  });
+
+  it("deep-links a covered review instead of inlining", () => {
+    const el = render(
+      <AttentionQueueRow
+        item={buildItem({
+          sourceKind: "review" as AttentionSourceKind,
+          inlineResolvable: false,
           subject: {
             kind: "issue",
             id: "issue-1",
@@ -173,8 +204,7 @@ describe("AttentionQueueRow", () => {
       />,
     );
     expect(el.textContent).toContain("Open");
-    // No approval buttons should render for a review row.
-    expect(el.textContent).not.toContain("Request revision");
+    expect(el.textContent).not.toContain("Send back to work");
   });
 
   it("fires onDismiss from the row menu action", () => {

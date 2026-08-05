@@ -96,8 +96,12 @@ describe("isInlineResolvable", () => {
     expect(isInlineResolvable(buildItem({ sourceKind: "approval", inlineResolvable: false }))).toBe(false);
   });
 
-  it("is never inline for reviews even when flagged", () => {
-    expect(isInlineResolvable(buildItem({ sourceKind: "review", inlineResolvable: true }))).toBe(false);
+  it("inlines a stalled review the server flagged (PAP-16080 §4.4)", () => {
+    expect(isInlineResolvable(buildItem({ sourceKind: "review", inlineResolvable: true }))).toBe(true);
+  });
+
+  it("keeps a covered review deep-linking (server leaves inlineResolvable off)", () => {
+    expect(isInlineResolvable(buildItem({ sourceKind: "review", inlineResolvable: false }))).toBe(false);
   });
 
   it("deep-links recovery/failure/budget rows rather than inlining", () => {
