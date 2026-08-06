@@ -50,6 +50,7 @@ import {
   decisionService,
   decisionRetentionService,
   externalObjectService,
+  executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
   issueService,
@@ -62,6 +63,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
+import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -957,6 +959,7 @@ export async function startServer(): Promise<StartedServer> {
   };
 
   if (heartbeat) {
+    const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
@@ -969,6 +972,36 @@ export async function startServer(): Promise<StartedServer> {
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
+    const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
+      wakeup: heartbeat.wakeup,
+    });
+    const terminalWorkspaces = executionWorkspaceService(db as any);
+    const scheduleMergedPullRequestConfirmationSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(mergedPullRequestConfirmations
+        .sweepMergedPullRequestConfirmations()
+        .then((result) => {
+          if (result.accepted > 0) {
+            logger.info(result, "accepted merge confirmations for merged pull requests");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "merged pull-request confirmation sweep failed");
+        }));
+    };
+    const scheduleTerminalWorkspaceSweep = () => {
+      if (heartbeatSchedulerStopped) return;
+      trackHeartbeatSchedulerWork(terminalWorkspaces
+        .sweepTerminalWorkspaces()
+        .then((result) => {
+          if (result.archived > 0 || result.cleanupFailed > 0) {
+            logger.info(result, "terminal issue workspace reaper changed workspace state");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "terminal issue workspace reaper failed");
+        }));
+    };
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1155,6 +1188,10 @@ export async function startServer(): Promise<StartedServer> {
         scheduleExternalObjectRefreshSweep(new Date());
 
         if (heartbeatSchedulerStopped) return;
+        scheduleMergedPullRequestConfirmationSweep();
+        scheduleTerminalWorkspaceSweep();
+
+        if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
           .tickScheduledTriggers(new Date())
           .then((result) => {
@@ -1217,6 +1254,14 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic tool connection health sweep failed");
+          }));
+
+        trackHeartbeatSchedulerWork(secretProposals.sweepExpired()
+          .then((expired) => {
+            if (expired > 0) logger.warn({ expired }, "periodic secret proposal expiry scrubbed proposals");
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic secret proposal expiry sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;
