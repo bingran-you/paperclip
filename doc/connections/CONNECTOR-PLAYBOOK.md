@@ -199,10 +199,31 @@ most; the broker resolves endpoints at connect time:
    dynamic registration — `registration_endpoint`.
 
 The broker implements this in `discoverOAuthEndpoints`
-(`server/src/services/tool-access.ts`); connections with transport
-`mcp_remote` and `auth: "oauth"` prefer discovered endpoints over manifest
-hints. Keep manifest hints current anyway so reviewers can read the expected
-endpoints without running discovery.
+(`server/src/services/tool-access.ts`), but discovery is **not**
+unconditional. `oauthEndpointsForConnection` resolves endpoints in this
+order:
+
+1. If the manifest's method `defaults` ship a **complete** pair
+   (`authorizationEndpoint` **and** `tokenEndpoint`), those are used
+   unconditionally. `discoverOAuthEndpoints` never runs in this case, so
+   endpoints stored on the connection's own OAuth config and 401 challenge
+   hints are **not consulted at all**.
+2. Otherwise, for `mcp_remote` connections, the broker calls
+   `discoverOAuthEndpoints`, which first checks endpoints already stored on
+   the connection's own OAuth config (falling back field-by-field to the 401
+   challenge hints); a complete stored/hinted pair is used as-is — no
+   `.well-known` fetch.
+3. Only when neither of the above yields a complete pair does the broker run
+   the RFC 9728 → RFC 8414 discovery chain above.
+
+Consequence: complete manifest endpoint hints are **authoritative, not
+hints** — they override even endpoints that an earlier discovery persisted
+on the connection, and if they go stale the broker keeps using them. For
+discovery-capable vendors, ship only `serverUrl` in `defaults` (as
+`notion.json` does) so the broker discovers fresh endpoints at connect
+time; add explicit `authorizationEndpoint`/`tokenEndpoint` only for vendors
+that do not publish RFC 9728/8414 metadata, and then own keeping them
+current.
 
 ### Dynamic client registration (RFC 7591)
 
@@ -497,7 +518,10 @@ alone.
 - Transport: `mcp_remote`
 - Endpoint: `https://mcp.notion.com/mcp` (Streamable HTTP; `/sse` fallback exists)
 - Auth mode: OAuth, endpoints resolved by discovery (RFC 9728 → RFC 8414),
-  public client via RFC 7591 DCR with PKCE S256 mandatory.
+  public client via RFC 7591 DCR with PKCE S256 mandatory. Discovery runs
+  because `notion.json` deliberately ships only `serverUrl` — no
+  `authorizationEndpoint`/`tokenEndpoint` hints, which would otherwise take
+  precedence and be used verbatim (see "MCP-Direct Connections" above).
 - Ownership modes: `dcr` (default, zero setup) and `customer`
   (env-registered classic integration via
   `PAPERCLIP_TOOL_OAUTH_NOTION_CLIENT_ID/_SECRET`, which always wins when set).

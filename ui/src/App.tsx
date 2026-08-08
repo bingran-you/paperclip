@@ -122,14 +122,15 @@ function boardRoutes() {
       <Route path="tools" element={<LegacyToolsRedirect />} />
       <Route path="tools/:tab" element={<LegacyToolsRedirect />} />
       <Route element={<AppsExperimentalGate />}>
-        <Route path="apps" element={<Connections />} />
-        <Route path="apps/browse" element={<Browse />} />
+        <Route path="apps" element={<Browse />} />
+        <Route path="apps/browse" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/connections" element={<Connections />} />
         <Route path="apps/connect" element={<AppsConnectEntryRoute />} />
-        <Route path="apps/connect/:appKey" element={<Navigate to="/apps/browse" replace />} />
-        <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps/browse" replace />} />
+        <Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />
         <Route path="apps/review" element={<AppsReview />} />
         {/* Needs attention folded into Connections (PAP-13254); keep legacy links working. */}
-        <Route path="apps/attention" element={<Navigate to="/apps" replace />} />
+        <Route path="apps/attention" element={<Navigate to="/apps/connections" replace />} />
         <Route path="apps/gateways" element={<GatewaysList />} />
         <Route path="apps/gateways/:gatewayId" element={<Navigate to="overview" replace />} />
         <Route path="apps/gateways/:gatewayId/:tab" element={<GatewayDetail />} />
@@ -309,7 +310,7 @@ function boardRoutes() {
 function AppsConnectEntryRoute() {
   const location = useLocation();
   const searchParams = new URLSearchParams(location.search);
-  return canEnterAppsConnect(searchParams) ? <AppsConnect /> : <Navigate to="/apps/browse" replace />;
+  return canEnterAppsConnect(searchParams) ? <AppsConnect /> : <Navigate to="/apps" replace />;
 }
 
 function InboxRootRedirect() {
@@ -403,7 +404,7 @@ function LegacyToolsRedirect() {
 
 function legacyToolsRedirectTarget(tab?: string) {
   if (!tab) return "/apps/advanced/profiles";
-  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps";
+  if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps/connections";
   return `/apps/advanced/${tab}`;
 }
 
