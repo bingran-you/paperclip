@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdapterEnvironmentTestResult } from "@paperclipai/shared";
 import { useLocation, useNavigate, useParams } from "@/lib/router";
@@ -43,7 +43,10 @@ import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/a
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL, isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
-import { resolveRouteOnboardingOptions } from "../lib/onboarding-route";
+import {
+  companyPrefixFromOnboardingPath,
+  resolveRouteOnboardingOptions,
+} from "../lib/onboarding-route";
 import { AsciiArtAnimation } from "./AsciiArtAnimation";
 import { FrontDoor } from "./FrontDoor";
 import { AgentCapsule } from "./AgentCapsule";
@@ -134,7 +137,13 @@ export function OnboardingWizard() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
-  const { companyPrefix } = useParams<{ companyPrefix?: string }>();
+  const { companyPrefix: matchedCompanyPrefix } = useParams<{ companyPrefix?: string }>();
+  // This component renders beside `<Routes>`, not inside it (`App.tsx`), so it
+  // has no route match and `useParams()` gives nothing. Read the prefix from
+  // the pathname, which `useLocation()` supplies without a match. The param is
+  // kept first so a future move inside the route tree needs no change here.
+  const companyPrefix =
+    matchedCompanyPrefix ?? companyPrefixFromOnboardingPath(location.pathname);
 
   // Support opening the wizard from a route (e.g. /onboarding or an existing
   // company's "add agent" entry point) in addition to the dialog context.
@@ -221,6 +230,16 @@ export function OnboardingWizard() {
     (saved?.createdIssueRef as string) ?? null
   );
 
+  // The company the *route* last supplied, so a navigation that stops naming
+  // one can drop it without touching a company the wizard created itself.
+  const routeCompanyIdRef = useRef<string | null>(null);
+  // The current company, mirrored so the sync effect can read it without
+  // taking it as a dependency. Depending on it would re-run the effect on
+  // every company change, and the effect also calls setStep - it would drag
+  // the user back to the route's initial step mid-flow.
+  const createdCompanyIdRef = useRef<string | null>(null);
+  createdCompanyIdRef.current = createdCompanyId;
+
   // Reset the route-dismissed flag when navigating to a different path.
   useEffect(() => {
     setRouteDismissed(false);
@@ -234,9 +253,33 @@ export function OnboardingWizard() {
     if (effectiveOnboardingOptions.initialStep) {
       setStep(effectiveOnboardingOptions.initialStep);
     }
-    if (effectiveOnboardingOptions.companyId) {
-      setCreatedCompanyId(effectiveOnboardingOptions.companyId);
+    const routeCompanyId = effectiveOnboardingOptions.companyId ?? null;
+    if (routeCompanyId) {
+      // Claim ownership only when the route *introduces* a company. A route
+      // that merely names the one already in hand - the wizard created it,
+      // then the user navigated to that company's onboarding path - has not
+      // supplied anything, so it must not take ownership of it. Otherwise
+      // navigating on to `/onboarding` would clear work the wizard did.
+      if (routeCompanyId !== createdCompanyIdRef.current) {
+        setCreatedCompanyId(routeCompanyId);
+        setCreatedCompanyPrefix(null);
+        routeCompanyIdRef.current = routeCompanyId;
+      }
+      return;
+    }
+    if (routeCompanyIdRef.current) {
+      // The route named a company and now does not - the user navigated from
+      // an existing company's onboarding to `/onboarding`, or to a prefix that
+      // matches nothing. Drop it. Keeping it leaves the wizard showing step 1,
+      // "create a company", while still holding the previous one, so the next
+      // confirmation writes into that company instead of making a new one.
+      //
+      // Only a company this route supplied is cleared. One the wizard created
+      // itself, or restored from saved state, is left alone: the ref is null
+      // in those cases, and clearing them would discard real progress.
+      setCreatedCompanyId(null);
       setCreatedCompanyPrefix(null);
+      routeCompanyIdRef.current = null;
     }
   }, [
     effectiveOnboardingOpen,

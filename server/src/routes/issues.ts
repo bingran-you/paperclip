@@ -135,7 +135,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
-import { buildPlanReviewContext } from "../services/plan-review-context.js";
+import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   decideIssueReviewPathRecovery,
   ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
@@ -5982,6 +5982,12 @@ export function issueRoutes(
       issueWorkMode: issue.workMode,
       includeForIssueComment: wakeCommentId !== null,
     });
+    const documentReviewContext = await buildDocumentReviewContext({
+      db,
+      companyId: issue.companyId,
+      issueId: issue.id,
+      includeForIssueComment: wakeCommentId !== null,
+    });
 
     const response = {
       issue: {
@@ -6054,6 +6060,7 @@ export function issueRoutes(
           }
         : null,
       planReviewContext,
+      documentReviewContext,
       currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
     };
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, response));
@@ -9972,7 +9979,10 @@ export function issueRoutes(
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
+        // Re-derive closed-ness from the post-update issue so a status change
+        // like in_progress -> done with a closure comment does not enqueue a
+        // stale issue_commented wake for an already-completed issue.
+        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
