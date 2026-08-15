@@ -1910,6 +1910,111 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { action: "accept", body: {} },
+    { action: "reject", body: { reason: "Needs changes" } },
+  ])("rejects an agent $action verdict under human_only when a user review transition omitted the interaction binding", async ({ action, body }) => {
+    mockReviewTransition.value = {
+      actorType: "user",
+      actorId: "local-board",
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+    };
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "in_review",
+      reviewPolicy: "human_only",
+      createdByAgentId: null,
+      createdByUserId: "local-board",
+    }));
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-user-review-unbound",
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: null,
+      createdByUserId: "local-board",
+      sourceRunId: null,
+      requestedResolverPolicy: "board_or_agents",
+      effectiveResolverPolicy: "board_or_agents",
+      payload: { version: 1, prompt: "Approve this review?" },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-2",
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-user-review-unbound/${action}`)
+      .send(body);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({
+      details: {
+        code: "review_policy_denied",
+        policy: "human_only",
+      },
+    });
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
+  });
+
+  it("allows an unrelated agent-resolvable confirmation under a restrictive issue review policy", async () => {
+    mockReviewTransition.value = {
+      actorType: "user",
+      actorId: "local-board",
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+    };
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({
+      status: "in_review",
+      reviewPolicy: "human_only",
+      createdByAgentId: null,
+      createdByUserId: "local-board",
+    }));
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-unrelated",
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: UNRELATED_AGENT_ID,
+      createdByUserId: null,
+      sourceRunId: "run-1",
+      requestedResolverPolicy: "board_or_agents",
+      effectiveResolverPolicy: "board_or_agents",
+      payload: { version: 1, prompt: "Confirm an independent action?" },
+    });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-unrelated",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "none",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: "run-1",
+        payload: { version: 1, prompt: "Confirm an independent action?" },
+        result: { version: 1, outcome: "accepted" },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      },
+      createdIssues: [],
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-2",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-unrelated/accept")
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockInteractionService.acceptInteraction).toHaveBeenCalled();
+  });
+
   it("allows only the addressed agent or board to resolve an addressed interaction", async () => {
     const addressed = {
       id: "interaction-addressed",

@@ -41,6 +41,7 @@ import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
 import { useWindowAutoFollow } from "@/components/task-chat/useWindowAutoFollow";
 import { useSidebar } from "@/context/SidebarContext";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { useIssuePlanDocument } from "@/hooks/useIssuePlanDocument";
 import { latestSameRunHandoffTimestamp } from "@/lib/issue-chat-messages";
 import { isLiveIssueRun, isTerminalIssueStatus } from "@/lib/liveIssueIds";
@@ -123,6 +124,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     feedbackTermsUrl = null,
     onVote,
     draftKey,
+    onInterruptQueued,
+    interruptingQueuedRunId,
   } = props;
 
   const linkedRunMetaById = useMemo(() => {
@@ -522,6 +525,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [onVote, feedbackVoteByTargetId, feedbackDataSharingPreference, feedbackTermsUrl],
   );
 
+  const renderQueuedAction = useCallback(
+    (item: TaskChatMessageItem) => {
+      const runId = item.queueTargetRunId;
+      if (item.optimistic !== "queued" || !runId || !onInterruptQueued) return null;
+
+      const isInterrupting = interruptingQueuedRunId === runId;
+      return (
+        <Button
+          type="button"
+          variant="link"
+          className="h-auto p-0 text-(length:--text-micro)"
+          disabled={isInterrupting}
+          onClick={() => void onInterruptQueued(runId)}
+        >
+          {isInterrupting ? "Interrupting…" : "Interrupt"}
+        </Button>
+      );
+    },
+    [interruptingQueuedRunId, onInterruptQueued],
+  );
+
   const renderInteraction = useCallback(
     (item: TaskChatInteractionItem) => (
       <TaskChatInteractionCard
@@ -585,6 +609,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             renderInteraction={renderInteraction}
             renderBrief={issueBrief ? () => <TaskChatDescriptionBubble brief={issueBrief} /> : undefined}
             renderMessageActions={renderMessageActions}
+            renderQueuedAction={renderQueuedAction}
             tail={tailRunId ? (
               <div data-testid="task-chat-live-transcript">
                 <TaskChatLiveRunPill
@@ -610,6 +635,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       </div>
       {showComposer ? (
         <div
+          data-testid="task-chat-composer-dock"
           className={cn(
             "sticky",
             // Mobile mirrors the flag-off thread's dock: lifted above the
@@ -624,9 +650,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             isMobile
               ? "bottom-(--tc-composer-bottom) z-20 transition-[bottom] duration-200 ease-out"
               : "bottom-0 z-10",
-            // Keep the composer visibly narrower than the thread while its
-            // accessories and footer continue to share the same column.
-            "mx-auto flex w-(--pct-80) max-w-(--tc-shell-max-w) flex-col gap-2 bg-background/80 px-4 pb-2 pt-1 backdrop-blur supports-[backdrop-filter]:bg-background/60",
+            // Match the thread width on mobile. Keep the intentionally
+            // narrower composer on larger screens.
+            "mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-2 bg-background/80 px-4 pb-2 pt-1 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:w-(--pct-80)",
           )}
         >
           {composerAccessory}

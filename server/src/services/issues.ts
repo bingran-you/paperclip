@@ -5893,6 +5893,15 @@ export function issueService(db: Db) {
       return getIssueByUuid(id);
     },
 
+    getByIdForUpdate: async (id: string, dbOrTx: any) => {
+      return dbOrTx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, id))
+        .for("update")
+        .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+    },
+
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
     },

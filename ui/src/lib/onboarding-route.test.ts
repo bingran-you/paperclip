@@ -3,8 +3,12 @@ import {
   companyPrefixFromOnboardingPath,
   isOnboardingPath,
   isOnboardingWizardActive,
+  onboardingStepForCompany,
   resolveRouteOnboardingOptions,
   shouldRedirectCompanylessRouteToOnboarding,
+  shouldRouteAgentlessCompanyToOnboarding,
+  ONBOARDING_AGENT_STEP,
+  ONBOARDING_MISSION_STEP,
 } from "./onboarding-route";
 
 describe("isOnboardingPath", () => {
@@ -185,5 +189,124 @@ describe("navigating away from a company's onboarding route", () => {
         companies,
       }),
     ).toEqual({ initialStep: 1 });
+  });
+});
+
+describe("shouldRouteAgentlessCompanyToOnboarding", () => {
+  it("sends a company with no agents to onboarding", () => {
+    expect(
+      shouldRouteAgentlessCompanyToOnboarding({
+        pathname: "/PC1/dashboard",
+        agentsLoaded: true,
+        agentCount: 0,
+      }),
+    ).toBe(true);
+  });
+
+  it("leaves a company that has agents alone", () => {
+    expect(
+      shouldRouteAgentlessCompanyToOnboarding({
+        pathname: "/PC1/dashboard",
+        agentsLoaded: true,
+        agentCount: 1,
+      }),
+    ).toBe(false);
+  });
+
+  it("waits for the agent list before deciding", () => {
+    // In flight, the list is undefined and reads exactly like an empty one.
+    // Deciding here would bounce every user through onboarding on each cold
+    // load — the count is zero only because nothing has arrived yet.
+    expect(
+      shouldRouteAgentlessCompanyToOnboarding({
+        pathname: "/PC1/dashboard",
+        agentsLoaded: false,
+        agentCount: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not redirect onto onboarding from onboarding", () => {
+    // The loop: finish the wizard without creating an agent, and a redirect
+    // that ignored the current path would send you straight back in.
+    for (const pathname of ["/onboarding", "/PC1/onboarding"]) {
+      expect(
+        shouldRouteAgentlessCompanyToOnboarding({
+          pathname,
+          agentsLoaded: true,
+          agentCount: 0,
+        }),
+      ).toBe(false);
+    }
+  });
+});
+
+describe("resolveRouteOnboardingOptions — the agent step", () => {
+  const companies = [{ id: "c1", issuePrefix: "PC1" }];
+
+  it("opens a company that already has its mission on the agent step", () => {
+    // Cloud collected the mission at signup and the seed wrote it as a
+    // company-level goal. Re-asking it is the seam the seeded arc removes.
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/PC1/onboarding",
+        companyPrefix: "PC1",
+        companies,
+        companyHasMission: true,
+      }),
+    ).toEqual({ initialStep: ONBOARDING_AGENT_STEP, companyId: "c1" });
+  });
+
+  it("still asks for the mission when the company has none", () => {
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/PC1/onboarding",
+        companyPrefix: "PC1",
+        companies,
+        companyHasMission: false,
+      }),
+    ).toEqual({ initialStep: 2, companyId: "c1" });
+  });
+
+  it("treats an unknown mission as absent while the goal query is in flight", () => {
+    // Costing the mission step is recoverable; skipping a question that was
+    // never answered leaves the company without one.
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/PC1/onboarding",
+        companyPrefix: "PC1",
+        companies,
+        companyHasMission: undefined,
+      }),
+    ).toEqual({ initialStep: 2, companyId: "c1" });
+  });
+
+  it("keeps sending an unmatched prefix to company creation", () => {
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/NOPE/onboarding",
+        companyPrefix: "NOPE",
+        companies,
+        companyHasMission: true,
+      }),
+    ).toEqual({ initialStep: 1 });
+  });
+});
+
+describe("onboardingStepForCompany", () => {
+  it("skips the mission question for a company that has one", () => {
+    expect(onboardingStepForCompany(true)).toBe(ONBOARDING_AGENT_STEP);
+  });
+
+  it("asks for the mission when the company has none", () => {
+    expect(onboardingStepForCompany(false)).toBe(ONBOARDING_MISSION_STEP);
+  });
+
+  it("asks for the mission when the lookup has not answered", () => {
+    // Both an in-flight and a failed lookup arrive here as `undefined`.
+    // Costing the mission step is recoverable — the customer answers it. The
+    // opposite error skips a question nobody answered and leaves the company
+    // without a mission.
+    expect(onboardingStepForCompany(undefined)).toBe(ONBOARDING_MISSION_STEP);
   });
 });

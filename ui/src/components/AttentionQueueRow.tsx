@@ -47,6 +47,7 @@ import {
 import { AttentionInteractionResolver } from "./AttentionInteractionResolver";
 import { DecisionResolver } from "./DecisionResolver";
 import { StalledReviewActions } from "./StalledReviewActions";
+import { readIssueReviewPolicyMetadata } from "../lib/review-policy";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -787,6 +788,7 @@ function InlineResolver({
         issueId={item.subject.id}
         companyId={companyId}
         footerSlot={toggle}
+        reviewPolicy={readIssueReviewPolicyMetadata(item.subject.metadata)}
       />
     );
   }

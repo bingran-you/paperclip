@@ -1226,7 +1226,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       if (followUpCommentIds.has(comment.id)) {
         nextComment.followUpRequested = true;
       }
-      const queuedTargetRunId = locallyQueuedCommentRunIds.get(comment.id) ?? null;
+      const queuedTargetRunId =
+        locallyQueuedCommentRunIds.get(comment.id) ?? nextComment.queueTargetRunId ?? null;
       const locallyQueuedComment = applyLocalQueuedIssueCommentState(nextComment, {
         queuedTargetRunId,
         targetRunIsLive: queuedTargetRunId ? liveRunIds.has(queuedTargetRunId) : false,
@@ -1234,6 +1235,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       });
       if (locallyQueuedComment !== nextComment) {
         return locallyQueuedComment;
+      }
+      // A queued target is fixed when the message is submitted. If that run
+      // settles while the request is still in flight, do not rebind the
+      // message's Interrupt action to an unrelated run that became live later.
+      if (queuedTargetRunId) {
+        return nextComment;
       }
       if (
         isQueuedIssueComment({
@@ -1249,7 +1256,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         return {
           ...nextComment,
           queueState: "queued" as const,
-          queueTargetRunId: interruptibleIssueRun?.id ?? nextComment.queueTargetRunId ?? null,
+          queueTargetRunId: interruptibleIssueRun?.id ?? null,
           queueReason: queuedCommentReason,
         };
       }

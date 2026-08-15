@@ -54,6 +54,19 @@ function render(ui: ReactElement) {
 }
 
 describe("TaskChatThread draft pass-through", () => {
+  it("keeps the composer dock aligned with the thread's horizontal padding", () => {
+    render(
+      <TaskChatThread
+        comments={[]}
+        onAdd={async () => {}}
+      />,
+    );
+
+    const dock = container.querySelector('[data-testid="task-chat-composer-dock"]');
+    expect(dock?.classList).toContain("px-4");
+    expect(dock?.classList).not.toContain("px-1");
+  });
+
   it("forwards draftKey so the composer restores a task's saved draft", () => {
     localStorage.setItem("task-chat-draft:issue-1", "half-written thought");
 
@@ -71,15 +84,85 @@ describe("TaskChatThread draft pass-through", () => {
 });
 
 describe("TaskChatThread composer alignment (PAP-498)", () => {
-  it("keeps the composer dock at 80% of the thread width", () => {
+  it("matches the thread width on mobile and stays narrower on larger screens", () => {
     render(<TaskChatThread comments={[]} onAdd={async () => {}} />);
 
     const dock = container
       .querySelector('[data-testid="mock-editor"]')
       ?.closest("div.sticky") as HTMLElement | null;
 
-    expect(dock?.className).toContain("w-(--pct-80)");
-    expect(dock?.className).not.toContain("w-full");
+    expect(dock?.className).toContain("w-full");
+    expect(dock?.className).toContain("md:w-(--pct-80)");
+  });
+});
+
+describe("TaskChatThread queued message actions", () => {
+  it("interrupts the exact run that a persisted queued message is waiting behind", () => {
+    const onInterruptQueued = vi.fn(async () => {});
+    const queuedComment = {
+      id: "comment-queued",
+      companyId: "company-1",
+      issueId: "issue-1",
+      authorType: "user" as const,
+      authorAgentId: null,
+      authorUserId: "user-1",
+      body: "Use the latest requirements instead.",
+      presentation: null,
+      metadata: null,
+      queueState: "queued" as const,
+      queueTargetRunId: "run-active",
+      createdAt: new Date("2026-08-14T12:00:00.000Z"),
+      updatedAt: new Date("2026-08-14T12:00:00.000Z"),
+    };
+
+    render(
+      <TaskChatThread
+        comments={[queuedComment]}
+        onAdd={async () => {}}
+        onInterruptQueued={onInterruptQueued}
+      />,
+    );
+
+    const interrupt = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Interrupt",
+    );
+    expect(container.textContent).toContain("Queued");
+    expect(interrupt).not.toBeUndefined();
+
+    flushSync(() => interrupt!.click());
+    expect(onInterruptQueued).toHaveBeenCalledOnce();
+    expect(onInterruptQueued).toHaveBeenCalledWith("run-active");
+  });
+
+  it("disables the action while the queued run is being interrupted", () => {
+    render(
+      <TaskChatThread
+        comments={[{
+          id: "comment-queued",
+          companyId: "company-1",
+          issueId: "issue-1",
+          authorType: "user",
+          authorAgentId: null,
+          authorUserId: "user-1",
+          body: "Use the latest requirements instead.",
+          presentation: null,
+          metadata: null,
+          clientStatus: "queued",
+          queueTargetRunId: "run-active",
+          createdAt: new Date("2026-08-14T12:00:00.000Z"),
+          updatedAt: new Date("2026-08-14T12:00:00.000Z"),
+        }]}
+        onAdd={async () => {}}
+        onInterruptQueued={async () => {}}
+        interruptingQueuedRunId="run-active"
+      />,
+    );
+
+    const interrupting = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Interrupting…",
+    );
+    expect(interrupting).not.toBeUndefined();
+    expect(interrupting?.disabled).toBe(true);
   });
 });
 
