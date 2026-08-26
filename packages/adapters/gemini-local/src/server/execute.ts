@@ -16,7 +16,7 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
-  adapterExecutionTargetDuplexTelemetryRecorder,
+  adapterExecutionTargetDuplexObservabilityRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
   readAdapterExecutionTarget,
   readAdapterExecutionTargetHomeDir,
@@ -38,6 +38,7 @@ import {
   joinPromptSections,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
+  isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
@@ -199,6 +200,7 @@ async function buildGeminiSkillsDir(
   const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
+    if (isPaperclipSkillSourceMissing(entry)) continue;
     await fs.symlink(entry.source, path.join(target, entry.runtimeName));
   }
   return target;
@@ -258,7 +260,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const geminiSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredGeminiSkillNames = resolvePaperclipDesiredSkillNames(config, geminiSkillEntries);
   if (!executionTargetIsRemote) {
-    await ensureGeminiSkillsInjected(onLog, geminiSkillEntries, desiredGeminiSkillNames);
+    await ensureGeminiSkillsInjected(
+      onLog,
+      geminiSkillEntries.filter((entry) => !isPaperclipSkillSourceMissing(entry)),
+      desiredGeminiSkillNames,
+    );
   }
 
   const envConfig = parseObject(config.env);
@@ -462,7 +468,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       runId,
       target: runtimeExecutionTarget,
       enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
-      duplexTelemetryRecorder: adapterExecutionTargetDuplexTelemetryRecorder(runtimeExecutionTarget),
+      duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
       runtimeRootDir: remoteRuntimeRootDir,
       adapterKey: "gemini",
       timeoutSec,
