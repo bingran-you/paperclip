@@ -3,7 +3,9 @@ import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
+  DEFAULT_DATABASE_APPLICATION_NAME,
   applyPendingMigrations,
+  createDb,
   inspectMigrations,
   resetPostgresDatabase,
 } from "./client.js";
@@ -88,6 +90,48 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres migration tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describeEmbeddedPostgres("createDb pool defaults", () => {
+  it("names its backends and closes them once idle", async () => {
+    const url = await createTempDatabase();
+    const observer = postgres(url, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => {
+      await observer.end({ timeout: 1 });
+    });
+
+    const backendsNamed = async (name: string) => {
+      const rows = await observer`
+        select count(*)::int as count from pg_stat_activity where application_name = ${name}
+      `;
+      return rows[0]?.count ?? 0;
+    };
+
+    const db = createDb(url);
+    cleanups.push(async () => {
+      await db.$client.end({ timeout: 1 });
+    });
+    const [self] = await db.$client`select application_name from pg_stat_activity where pid = pg_backend_pid()`;
+    expect(self?.application_name).toBe(DEFAULT_DATABASE_APPLICATION_NAME);
+
+    const shortLived = createDb(url, { applicationName: "paperclip-idle-test", idleTimeoutSeconds: 1 });
+    cleanups.push(async () => {
+      await shortLived.$client.end({ timeout: 1 });
+    });
+    await shortLived.$client`select 1`;
+    expect(await backendsNamed("paperclip-idle-test")).toBe(1);
+
+    // The driver closes the idle connection after `idle_timeout`; without the
+    // option (the driver default) the backend would stay until the process
+    // exits. Wait past the timeout, then poll PostgreSQL's own view.
+    const deadline = Date.now() + 10_000;
+    let remaining = await backendsNamed("paperclip-idle-test");
+    while (remaining > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      remaining = await backendsNamed("paperclip-idle-test");
+    }
+    expect(remaining).toBe(0);
+  }, 30_000);
+});
 
 describeEmbeddedPostgres("resetPostgresDatabase", () => {
   it("recreates an existing database so stale tables are removed", async () => {
@@ -1413,6 +1457,9 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       await applyPendingMigrations(connectionString);
 
       const nativePersistenceHash = await migrationHash("0227_modern_pandemic.sql");
+      const eventSequenceUniquenessHash = await migrationHash(
+        "0235_heartbeat_run_event_sequence_uniqueness.sql",
+      );
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       const companyId = "10000000-0000-4000-8000-000000000227";
       const agentId = "20000000-0000-4000-8000-000000000227";
@@ -1440,6 +1487,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           DROP INDEX IF EXISTS issues_company_id_uq;
           DROP INDEX IF EXISTS heartbeat_run_events_run_source_event_uq;
           DROP INDEX IF EXISTS heartbeat_run_events_run_source_seq_uq;
+          DROP INDEX IF EXISTS heartbeat_run_events_run_seq_uq;
           ALTER TABLE heartbeat_run_events
             DROP COLUMN IF EXISTS source_instance_id,
             DROP COLUMN IF EXISTS source_event_id,
@@ -1468,6 +1516,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
             DROP COLUMN IF EXISTS last_status_decision_id;
         `);
         await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${nativePersistenceHash}`;
+        await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${eventSequenceUniquenessHash}`;
         await sql`
           INSERT INTO companies (id, name, issue_prefix)
           VALUES (${companyId}, 'Native persistence fixture', 'NPF')
@@ -1515,7 +1564,10 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           WHERE run_id = '${runId}'
           ORDER BY id
         `);
-        expect(events.map((event) => Number(event.seq))).toEqual([1, 5, 5, 9]);
+        // 0235 preserves every legacy event while moving only duplicate
+        // sequence values above the old run maximum before installing the
+        // durable (run_id, seq) uniqueness invariant.
+        expect(events.map((event) => Number(event.seq))).toEqual([1, 5, 10, 9]);
         expect(events.map(({ seq: _seq, ...event }) => ({
           ...event,
           created_at: event.created_at.toISOString(),
@@ -1562,7 +1614,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         expect(runs.map((run) => ({
           runtimeMode: run.runtime_mode,
           nextEventSeq: Number(run.next_event_seq),
-        }))).toEqual([{ runtimeMode: "legacy", nextEventSeq: 10 }]);
+        }))).toEqual([{ runtimeMode: "legacy", nextEventSeq: 11 }]);
 
         const nativeRowsBefore = await verifySql.unsafe<{ table_name: string; row_count: number }[]>(`
           SELECT 'completion_contracts' AS table_name, count(*)::int AS row_count FROM completion_contracts
@@ -1815,6 +1867,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
         }))).toEqual([{ status: "done", statusVersion: 1 }]);
 
         await verifySql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${nativePersistenceHash}`;
+        await verifySql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${eventSequenceUniquenessHash}`;
       } finally {
         await verifySql.end();
       }
@@ -1857,7 +1910,7 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
           finalizationCount: row.finalization_count,
         }))).toEqual([{
           statusVersion: 1,
-          nextEventSeq: 10,
+          nextEventSeq: 11,
           triggerCount: 1,
           finalizationCount: 1,
         }]);
@@ -1866,5 +1919,129 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
       }
     },
     60_000,
+  );
+
+  it(
+    "replays the idempotent provider trace migration",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const hash = await migrationHash(
+        "0234_provider_trace_records.sql",
+      );
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sql`
+          DELETE FROM "drizzle"."__drizzle_migrations"
+          WHERE "hash" = ${hash}
+        `;
+      } finally {
+        await sql.end();
+      }
+
+      await expect(
+        applyPendingMigrations(connectionString),
+      ).resolves.toBeUndefined();
+      await expect(inspectMigrations(connectionString)).resolves.toMatchObject({
+        status: "upToDate",
+      });
+    },
+    30_000,
+  );
+
+  it(
+    "removes retired model profiles from live records and configuration revisions",
+    async () => {
+      const connectionString = await createTempDatabase();
+      await applyPendingMigrations(connectionString);
+      const hash = await migrationHash("0236_remove_cheap_model_profiles.sql");
+      const companyId = "10000000-0000-4000-8000-000000000236";
+      const agentId = "20000000-0000-4000-8000-000000000236";
+      const issueId = "30000000-0000-4000-8000-000000000236";
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sql`
+          INSERT INTO companies (id, name, issue_prefix)
+          VALUES (${companyId}, 'Model profile migration fixture', 'MPF')
+        `;
+        await sql`
+          INSERT INTO agents (id, company_id, name, runtime_config)
+          VALUES (
+            ${agentId},
+            ${companyId},
+            'Legacy model profile agent',
+            '{"heartbeat":{"enabled":true},"modelProfiles":{"cheap":{"model":"legacy"}}}'::jsonb
+          )
+        `;
+        await sql`
+          INSERT INTO issues (id, company_id, title, assignee_adapter_overrides)
+          VALUES (
+            ${issueId},
+            ${companyId},
+            'Legacy model profile issue',
+            '{"modelProfile":"cheap","workingDirectory":"/workspace"}'::jsonb
+          )
+        `;
+        await sql`
+          INSERT INTO agent_config_revisions (
+            company_id,
+            agent_id,
+            changed_keys,
+            before_config,
+            after_config
+          )
+          VALUES (
+            ${companyId},
+            ${agentId},
+            '["runtimeConfig"]'::jsonb,
+            '{"name":"Legacy model profile agent","runtimeConfig":{"modelProfiles":{"cheap":{"model":"legacy-before"}},"heartbeat":{"enabled":true}}}'::jsonb,
+            '{"name":"Legacy model profile agent","runtimeConfig":{"modelProfiles":{"cheap":{"model":"legacy-after"}},"heartbeat":{"enabled":false}}}'::jsonb
+          )
+        `;
+        await sql`
+          DELETE FROM "drizzle"."__drizzle_migrations"
+          WHERE "hash" = ${hash}
+        `;
+      } finally {
+        await sql.end();
+      }
+
+      await applyPendingMigrations(connectionString);
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const [result] = await verifySql.unsafe<{
+          runtime_config: Record<string, unknown>;
+          assignee_adapter_overrides: Record<string, unknown> | null;
+          before_config: Record<string, unknown>;
+          after_config: Record<string, unknown>;
+        }[]>(`
+          SELECT
+            agent.runtime_config,
+            issue.assignee_adapter_overrides,
+            revision.before_config,
+            revision.after_config
+          FROM agents agent
+          JOIN issues issue ON issue.company_id = agent.company_id
+          JOIN agent_config_revisions revision ON revision.agent_id = agent.id
+          WHERE agent.id = '${agentId}' AND issue.id = '${issueId}'
+        `);
+
+        expect(result.runtime_config).toEqual({ heartbeat: { enabled: true } });
+        expect(result.assignee_adapter_overrides).toEqual({ workingDirectory: "/workspace" });
+        expect(result.before_config).toEqual({
+          name: "Legacy model profile agent",
+          runtimeConfig: { heartbeat: { enabled: true } },
+        });
+        expect(result.after_config).toEqual({
+          name: "Legacy model profile agent",
+          runtimeConfig: { heartbeat: { enabled: false } },
+        });
+      } finally {
+        await verifySql.end();
+      }
+    },
+    30_000,
   );
 });

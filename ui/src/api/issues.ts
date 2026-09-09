@@ -13,6 +13,7 @@ import type {
   IssueAttachment,
   IssueCostSummary,
   IssueComment,
+  IssueQueuedCommentQueue,
   IssueDocument,
   IssueLabel,
   IssueRecoveryAction,
@@ -24,6 +25,9 @@ import type {
   IssueTreeHold,
   IssueWatchdog,
   IssueWorkProduct,
+  RunnerGoalActionAccepted,
+  RunnerGoalActionRequest,
+  RunnerGoalProjection,
   PreviewIssueTreeControl,
   ReleaseIssueTreeHold,
   UpsertIssueWatchdog,
@@ -152,6 +156,12 @@ export const issuesApi = {
   get: (id: string, options?: RequestOptions) => options
     ? api.get<Issue>(`/issues/${id}`, options)
     : api.get<Issue>(`/issues/${id}`),
+  getRunnerGoal: (id: string, agentId?: string | null) => {
+    const query = agentId ? `?agentId=${encodeURIComponent(agentId)}` : "";
+    return api.get<RunnerGoalProjection>(`/issues/${id}/runner-goal${query}`);
+  },
+  actOnRunnerGoal: (id: string, request: RunnerGoalActionRequest) =>
+    api.post<RunnerGoalActionAccepted>(`/issues/${id}/runner-goal/actions`, request),
   getWatchdog: (id: string) => api.get<IssueWatchdog | null>(`/issues/${id}/watchdog`),
   upsertWatchdog: (id: string, data: UpsertIssueWatchdog) =>
     api.put<IssueWatchdog>(`/issues/${id}/watchdog`, data),
@@ -237,6 +247,39 @@ export const issuesApi = {
     const qs = params.toString();
     return api.get<IssueComment[]>(`/issues/${id}/comments${qs ? `?${qs}` : ""}`);
   },
+  getQueuedComments: (id: string) =>
+    api.get<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments`),
+  editQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { body: string; queueId: string; revision: string },
+  ) =>
+    api.patch<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}`,
+      data,
+    ),
+  reorderQueuedComments: (
+    id: string,
+    data: { orderedCommentIds: string[]; queueId: string; revision: string },
+  ) => api.put<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/order`, data),
+  steerQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { queueId: string; targetRunId: string; revision: string },
+  ) =>
+    api.post<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}/steer`,
+      data,
+    ),
+  discardQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { queueId: string; revision: string },
+  ) =>
+    api.delete<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}`,
+      data,
+    ),
   listInteractions: (id: string) =>
     api.get<IssueThreadInteraction[]>(`/issues/${id}/interactions`),
   listAcceptedPlanDecompositions: (id: string) =>
@@ -246,13 +289,15 @@ export const issuesApi = {
   acceptInteraction: (
     id: string,
     interactionId: string,
-    data?: { selectedClientKeys?: string[]; selectedOptionIds?: string[] },
+    data?: { selectedClientKeys?: string[]; selectedOptionIds?: string[]; rememberAction?: boolean },
   ) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/accept`, data ?? {}),
   rejectInteraction: (id: string, interactionId: string, reason?: string) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/reject`, reason ? { reason } : {}),
   cancelInteraction: (id: string, interactionId: string, reason?: string) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/cancel`, reason ? { reason } : {}),
+  skipInteraction: (id: string, interactionId: string, reason?: string) =>
+    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/skip`, reason ? { reason } : {}),
   respondToInteraction: (
     id: string,
     interactionId: string,
@@ -341,7 +386,10 @@ export const issuesApi = {
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
   unlinkApproval: (id: string, approvalId: string) =>
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
-  listWorkProducts: (id: string) => api.get<IssueWorkProduct[]>(`/issues/${id}/work-products`),
+  listWorkProducts: (id: string, options?: { refreshPullRequests?: boolean }) =>
+    api.get<IssueWorkProduct[]>(
+      `/issues/${id}/work-products${options?.refreshPullRequests ? "?refreshPullRequests=true" : ""}`,
+    ),
   ensureWorkProductReviewDocument: (id: string, workProductId: string) =>
     api.post<IssueDocument>(`/issues/${id}/work-products/${workProductId}/review-document`, {}),
   createWorkProduct: (id: string, data: Record<string, unknown>) =>

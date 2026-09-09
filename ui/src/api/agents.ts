@@ -8,6 +8,7 @@ import type {
   AgentInstructionsFileDetail,
   AgentSkillSnapshot,
   AdapterEnvironmentTestResult,
+  AdapterAuthSignalResponse,
   AdapterAuthSessionResponse,
   AdapterAuthSessionOwnerResponse,
   ClaudeSetupTokenSessionResponse,
@@ -27,10 +28,6 @@ import type {
   ClearAgentErrorResponse,
   AgentApiKeyScope,
 } from "@paperclipai/shared";
-import type {
-  AdapterModelProfileDefinition,
-  AdapterModelProfileKey,
-} from "@paperclipai/adapter-utils";
 import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
 import { ApiError, api } from "./client";
 
@@ -46,9 +43,6 @@ export interface AdapterModel {
   id: string;
   label: string;
 }
-
-export type { AdapterModelProfileKey };
-export type AdapterModelProfile = AdapterModelProfileDefinition;
 
 export interface DetectedAdapterModel {
   model: string;
@@ -94,6 +88,7 @@ export interface AgentWakeRequest {
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
   forceFreshSession?: boolean;
+  debug?: { providerTrace: "raw" };
 }
 
 function withCompanyScope(path: string, companyId?: string) {
@@ -207,10 +202,11 @@ export const agentsApi = {
   adapterModels: (
     companyId: string,
     type: string,
-    options?: { refresh?: boolean; environmentId?: string | null },
+    options?: { refresh?: boolean; environmentId?: string | null; provider?: string },
   ) => {
     const params = new URLSearchParams();
     if (options?.refresh) params.set("refresh", "1");
+    if (options?.provider) params.set("provider", options.provider);
     if (options?.environmentId) params.set("environmentId", options.environmentId);
     const query = params.size > 0 ? `?${params.toString()}` : "";
     return api.get<AdapterModel[]>(
@@ -221,15 +217,12 @@ export const agentsApi = {
     api.get<DetectedAdapterModel | null>(
       `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/detect-model`,
     ),
-  adapterModelProfiles: (companyId: string, type: string) =>
-    api.get<AdapterModelProfile[]>(
-      `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/model-profiles`,
-    ),
   testEnvironment: (
     companyId: string,
     type: string,
     data: {
       adapterConfig: Record<string, unknown>;
+      testCredentials?: Record<string, string>;
       environmentId?: string | null;
     },
   ) =>
@@ -237,6 +230,12 @@ export const agentsApi = {
       `/companies/${companyId}/adapters/${type}/test-environment`,
       data,
     ),
+  getAdapterAuthSignal: (companyId: string, type: string, environmentId?: string | null) => {
+    const query = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
+    return api.get<AdapterAuthSignalResponse>(
+      `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/auth-signal${query}`,
+    );
+  },
   invoke: (id: string, companyId?: string, data: AgentWakeRequest = {}) =>
     api.post<HeartbeatRun>(agentPath(id, companyId, "/heartbeat/invoke"), data),
   wakeup: (
@@ -255,9 +254,21 @@ export const agentsApi = {
       `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/login-sessions`,
       data,
     ),
+  // The owner response repeats the live prompt on every read while the
+  // session holds an active public status, so this polling call carries the
+  // same no-store request option as the active-session read below.
   getAdapterAuthLoginStatus: (companyId: string, type: string, sessionId: string) =>
     api.get<AdapterAuthSessionOwnerResponse>(
       `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/login-sessions/${encodeURIComponent(sessionId)}`,
+      { cache: "no-store" },
+    ),
+  // Reads the caller's active login session for one company and adapter, with
+  // no session id, so the browser rediscovers its own session after a reload
+  // with no local state. A 404 means no active session for the caller.
+  getActiveAdapterAuthLoginSession: (companyId: string, type: string) =>
+    api.get<AdapterAuthSessionOwnerResponse>(
+      `/companies/${encodeURIComponent(companyId)}/adapters/${encodeURIComponent(type)}/login-sessions/active`,
+      { cache: "no-store" },
     ),
   cancelAdapterAuthLogin: (companyId: string, type: string, sessionId: string) =>
     api.post<AdapterAuthSessionOwnerResponse>(
@@ -289,6 +300,14 @@ export const agentsApi = {
   getClaudeSetupTokenLoginStatus: (companyId: string, sessionId: string) =>
     api.get<ClaudeSetupTokenSessionResponse>(
       `/companies/${encodeURIComponent(companyId)}/setup-token-login-sessions/${encodeURIComponent(sessionId)}`,
+    ),
+  // Reads the caller's active Claude setup-token login session, with no
+  // session id, so the browser rediscovers its own session after a reload with
+  // no local state. A 404 means no active session for the caller.
+  getActiveClaudeSetupTokenLoginSession: (companyId: string) =>
+    api.get<ClaudeSetupTokenSessionOwnerResponse>(
+      `/companies/${encodeURIComponent(companyId)}/setup-token-login-sessions/active`,
+      { cache: "no-store" },
     ),
   getClaudeSetupTokenLoginPrompt: (companyId: string, sessionId: string) =>
     api.get<ClaudeSetupTokenSessionPrompt>(

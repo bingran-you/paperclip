@@ -91,6 +91,10 @@ const mockExternalObjectService = vi.hoisted(() => ({
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceLimitError = vi.hoisted(() => vi.fn());
 const mockCrossIssueInfluenceRunContextError = vi.hoisted(() => vi.fn());
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
 
 vi.mock("@paperclipai/shared/telemetry", () => ({
   trackAgentTaskCompleted: vi.fn(),
@@ -133,9 +137,15 @@ vi.mock("../services/routines.js", () => ({
   routineService: () => mockRoutineService,
 }));
 
+vi.mock("../services/runner-goals.js", () => ({
+  runnerGoalService: () => mockRunnerGoalService,
+  RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+  RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+}));
+
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
-    getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+    getById: vi.fn(async () => ({ id: "company-1" })),
   }),
   accessService: () => mockAccessService,
   agentService: () => mockAgentService,
@@ -2450,6 +2460,7 @@ describe.sequential("issue comment reopen routes", () => {
       }),
       mockTx,
       expect.any(Array),
+      expect.any(Array),
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
     const decisionId = updatePatch.executionState.lastDecisionId;
@@ -2545,6 +2556,8 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
       mockTx,
+      undefined,
+      expect.any(Array),
     );
   });
 
@@ -2630,6 +2643,8 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
       mockTx,
+      undefined,
+      expect.any(Array),
     );
   });
 
@@ -3239,6 +3254,8 @@ describe.sequential("issue comment reopen routes", () => {
         "11111111-1111-4111-8111-111111111111",
         expect.objectContaining({ status: "done" }),
         mockTx,
+        undefined,
+        expect.any(Array),
       );
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),

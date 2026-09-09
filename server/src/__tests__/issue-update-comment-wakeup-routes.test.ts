@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const SOURCE_RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -31,10 +32,26 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
 }));
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
+
+vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
+  deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
+  nativeQuestionRunToCancel: vi.fn(async () => null),
+  validateNativeQuestionResponseInput: vi.fn(),
+}));
+
+vi.mock("../services/runner-goals.js", () => ({
+  runnerGoalService: () => mockRunnerGoalService,
+  RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+  RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+}));
 
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
-    getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+    getById: vi.fn(async () => ({ id: "company-1" })),
   }),
   accessService: () => ({
     canUser: vi.fn(async () => true),
@@ -97,6 +114,9 @@ vi.mock("../services/index.js", () => ({
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   logActivity: vi.fn(async () => undefined),
   projectService: () => ({}),
+  questionResponseDeliveryService: () => ({
+    deliver: vi.fn(async () => undefined),
+  }),
   routineService: () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
   }),
@@ -106,7 +126,7 @@ vi.mock("../services/index.js", () => ({
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+      getById: vi.fn(async () => ({ id: "company-1" })),
     }),
     accessService: () => ({
       canUser: vi.fn(async () => true),
@@ -169,6 +189,9 @@ function registerModuleMocks() {
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: vi.fn(async () => undefined),
     projectService: () => ({}),
+    questionResponseDeliveryService: () => ({
+      deliver: vi.fn(async () => undefined),
+    }),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
@@ -189,6 +212,7 @@ async function createApp() {
       userId: "local-board",
       companyIds: ["company-1"],
       source: "local_implicit",
+      runId: req.header("x-paperclip-run-id") ?? null,
       isInstanceAdmin: false,
     };
     next();
@@ -438,6 +462,29 @@ describe("issue update comment wakeups", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("defers the assignment wake when a structured goal owns the next run", async () => {
+    const existing = makeIssue({ assigneeAgentId: null, assigneeUserId: null, status: "todo" });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, status: "todo" }));
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, deferWakeForGoal: true,
+    });
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not allow goal wake deferral to suppress an unrelated status change", async () => {
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, status: "todo" });
+    mockIssueService.getById.mockResolvedValue(existing);
+    const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
+      assigneeAgentId: ASSIGNEE_AGENT_ID, status: "in_progress", deferWakeForGoal: true,
+    });
+    expect(res.status).toBe(400);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("wakes the assignee on comment-only issue updates", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -484,41 +531,6 @@ describe("issue update comment wakeups", () => {
     );
   });
 
-  it("does not wake the assignee when a closure comment marks the issue done", async () => {
-    const existing = makeIssue({
-      assigneeAgentId: ASSIGNEE_AGENT_ID,
-      assigneeUserId: null,
-      status: "in_progress",
-    });
-    const updated = {
-      ...existing,
-      status: "done",
-      completedAt: new Date("2026-06-26T16:30:00.000Z"),
-    };
-    mockIssueService.getById.mockResolvedValue(existing);
-    mockIssueService.update.mockResolvedValue(updated);
-    mockIssueService.addComment.mockResolvedValue({
-      id: "comment-close-1",
-      issueId: existing.id,
-      companyId: existing.companyId,
-      body: "Closing this out.",
-    });
-
-    const res = await request(await createApp())
-      .patch(`/api/issues/${existing.id}`)
-      .send({
-        status: "done",
-        comment: "Closing this out.",
-      });
-
-    expect(res.status).toBe(200);
-    await new Promise((resolve) => setImmediate(resolve));
-    const issueCommentedWakeCalls = mockHeartbeatService.wakeup.mock.calls.filter(
-      ([, wakeup]: [string, { reason?: string }]) => wakeup?.reason === "issue_commented",
-    );
-    expect(issueCommentedWakeCalls).toEqual([]);
-  });
-
   it("wakes the assignee on top-level board issue comments", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -558,6 +570,119 @@ describe("issue update comment wakeups", () => {
           wakeCommentId: "comment-3",
           wakeReason: "issue_commented",
           source: "issue.comment",
+        }),
+      }),
+    );
+  });
+
+  it("does not wake the assignee for its own run-authenticated top-level comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-top-level",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Plan ready for review.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({ body: "Plan ready for review." });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still wakes a different mentioned agent from a run-authenticated comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-cross-mention",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please verify.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([
+      MENTIONED_AGENT_ID,
+    ]);
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({
+        body: "[@QA](/agents/33333333-3333-4333-8333-333333333333) please verify.",
+      });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      MENTIONED_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_comment_mentioned",
+      }),
+    );
+  });
+
+  it("preserves an explicit resume on a run-authenticated top-level comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-resume",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Resume intentionally.",
+      createdByRunId: SOURCE_RUN_ID,
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: SOURCE_RUN_ID,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status: "succeeded",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", SOURCE_RUN_ID)
+      .send({ body: "Resume intentionally.", resume: true });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        contextSnapshot: expect.objectContaining({
+          resumeIntent: true,
         }),
       }),
     );

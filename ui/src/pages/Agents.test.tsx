@@ -242,14 +242,11 @@ function makeInstanceSettings({
       enableIsolatedWorkspaces: true,
       enableStreamlinedLeftNavigation: false,
       enableConferenceRoomChat: false,
-      enableTaskWatchdogs: true,
       enableIssuePlanDecompositions: true,
       enableExperimentalFileViewer: false,
       enableExternalObjects: false,
       enableBuiltInAgents,
       autoRestartDevServerWhenIdle: false,
-      enableIssueGraphLivenessAutoRecovery: false,
-      issueGraphLivenessAutoRecoveryLookbackHours: 24,
     },
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -384,6 +381,54 @@ describe("Agents", () => {
     expect(heartbeatCell?.textContent).not.toContain("\n");
   });
 
+  it("switches between the preserved list and the interactive org chart with icon buttons", async () => {
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <Agents />
+          </ToastProvider>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    const listToggle = container.querySelector<HTMLButtonElement>('button[aria-label="List view"]');
+    const orgToggle = container.querySelector<HTMLButtonElement>('button[aria-label="Org chart view"]');
+    expect(listToggle?.getAttribute("aria-pressed")).toBe("true");
+    expect(orgToggle?.getAttribute("aria-pressed")).toBe("false");
+    expect(orgToggle?.querySelector(".lucide-network")).not.toBeNull();
+    expect(orgToggle?.querySelector(".lucide-git-branch")).toBeNull();
+    expect(container.querySelector('[data-testid="org-chart-viewport"]')).toBeNull();
+
+    await act(async () => {
+      orgToggle?.click();
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(mockAgentsApi.org).toHaveBeenCalledWith("company-1");
+    expect(orgToggle?.getAttribute("aria-pressed")).toBe("true");
+    const orgViewport = container.querySelector('[data-testid="org-chart-viewport"]');
+    expect(orgViewport).not.toBeNull();
+    expect(orgViewport?.parentElement?.classList.contains("flex-1")).toBe(true);
+    expect(orgViewport?.parentElement?.classList.contains("md:min-h-0")).toBe(true);
+    expect(orgViewport?.parentElement?.classList.contains("h-(--sz-calc-38)")).toBe(false);
+    expect(orgViewport?.parentElement?.parentElement?.classList.contains("h-full")).toBe(true);
+    expect(orgViewport?.parentElement?.parentElement?.classList.contains("min-h-0")).toBe(true);
+    expect(container.querySelector('[aria-label="Zoom in"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Zoom out"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="Fit chart to screen"]')).not.toBeNull();
+
+    await act(async () => {
+      listToggle?.click();
+    });
+    await flushReact();
+    expect(container.querySelector('[data-testid="org-chart-viewport"]')).toBeNull();
+    expect(container.textContent).toContain("gpt-5.4");
+  });
+
   it("gives mobile agent names the full row width after the leading status indicator", async () => {
     mockSidebarState.isMobile = true;
     mockResourceMembershipsApi.listMine.mockResolvedValue({
@@ -423,24 +468,26 @@ describe("Agents", () => {
     expect(row).not.toBeNull();
     expect(row?.querySelector(".sm\\:hidden")).toBeNull();
     expect(row?.querySelector(".hidden.sm\\:flex")).not.toBeNull();
-    expect(row?.querySelector(".flex-1.hidden.xl\\:block")).not.toBeNull();
+    expect(row?.querySelector(".flex-1.hidden.\\@5xl\\:block")).not.toBeNull();
     expect(row?.classList.contains("text-foreground/55")).toBe(false);
     expect(row?.classList.contains("sm:text-foreground/55")).toBe(true);
     const name = row?.querySelector("span[title='Paperclip Engineer With A Much Longer Display Name']");
     const subtitle = Array.from(row?.querySelectorAll("p") ?? []).find((node) =>
       node.textContent?.includes("Software Engineer With A Much Longer Specialty Title"),
     );
-    expect(name?.classList.contains("whitespace-normal")).toBe(true);
-    expect(name?.classList.contains("break-words")).toBe(true);
-    expect(name?.classList.contains("xl:truncate")).toBe(true);
-    expect(name?.classList.contains("xl:whitespace-nowrap")).toBe(true);
-    expect(name?.classList.contains("truncate")).toBe(false);
+    expect(name?.classList.contains("truncate")).toBe(true);
     expect(subtitle).toBeDefined();
-    expect(subtitle?.classList.contains("whitespace-normal")).toBe(true);
-    expect(subtitle?.classList.contains("break-words")).toBe(true);
-    expect(subtitle?.classList.contains("xl:truncate")).toBe(true);
-    expect(subtitle?.classList.contains("xl:whitespace-nowrap")).toBe(true);
-    expect(subtitle?.classList.contains("truncate")).toBe(false);
+    expect(subtitle?.classList.contains("truncate")).toBe(true);
+    const actions = row?.querySelector('button[aria-label="Open actions for Paperclip Engineer With A Much Longer Display Name"]');
+    expect(actions).not.toBeNull();
+    // Neither the action button nor its ancestors may hide the mobile menu.
+    for (let node = actions; node && node !== row; node = node.parentElement) {
+      expect(node.classList.contains("hidden")).toBe(false);
+    }
+    await act(async () => { (actions as HTMLButtonElement).click(); });
+    await flushReact();
+    expect(document.body.textContent).toContain("Duplicate");
+    expect(document.body.textContent).toContain("Terminate");
   });
 
   it("uses the built-in agents route segment as the built-in filter", async () => {
@@ -904,7 +951,7 @@ describe("Agents", () => {
     await flushReact();
     await flushReact();
 
-    // Switch from the default org view to the list view.
+    // Keep the list view selected before checking its aligned metadata columns.
     const listToggle = Array.from(container.querySelectorAll("button")).find(
       (btn) => btn.querySelector("svg.lucide-list"),
     );
@@ -914,13 +961,13 @@ describe("Agents", () => {
     });
     await flushReact();
 
-    // The title cell carries a constant width at xl (`xl:w-56`), not a
+    // The title cell carries a constant width in a wide container, not a
     // content-sized `min-w-(--sz-7rem)`, so the `meta` group starts at the same
     // x on every row and the model + timestamp columns line up vertically.
-    // Below xl the meta columns are hidden and the title flexes (`flex-1`)
+    // In narrower containers metadata is hidden and the title flexes (`flex-1`)
     // instead, so the shrink-0 trailing actions can't squeeze the agent name
     // to zero width on mobile.
-    const titleCell = container.querySelector(".xl\\:w-56");
+    const titleCell = container.querySelector(".\\@5xl\\:w-56");
     expect(titleCell).not.toBeNull();
     expect(titleCell?.textContent).toContain("Alpha");
     expect(titleCell?.classList.contains("flex-1")).toBe(true);
@@ -941,7 +988,7 @@ describe("Agents", () => {
     await flushReact();
     await flushReact();
 
-    // Org view (default).
+    // List view (default).
     const orgAction = container.querySelector('[aria-label="Leave Alpha"]');
     const orgStar = container.querySelector('[aria-label="Star Alpha"]');
     expect(orgAction).not.toBeNull();
@@ -949,7 +996,7 @@ describe("Agents", () => {
     expect(orgAction?.closest(".hidden")).toBeNull();
     expect(orgStar?.closest(".hidden")).not.toBeNull();
 
-    // List view.
+    // List view remains stable after explicitly selecting it.
     const listToggle = Array.from(container.querySelectorAll("button")).find(
       (btn) => btn.querySelector("svg.lucide-list"),
     );
