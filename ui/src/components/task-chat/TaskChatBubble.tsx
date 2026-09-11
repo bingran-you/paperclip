@@ -1,4 +1,4 @@
-import { useContext, useState, type ReactNode } from "react";
+import { useCallback, useContext, useState, type ReactNode } from "react";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { IssueGalleryContext } from "@/context/IssueGalleryContext";
 import { cn } from "@/lib/utils";
@@ -28,6 +28,7 @@ import {
   hydrateAttachmentRefs,
   isImageAttachment,
   stripStandaloneImageEmbeds,
+  type AttachmentRef,
 } from "./task-chat-attachments";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
@@ -129,6 +130,16 @@ function galleryItemForImage(
   };
 }
 
+function uniqueAttachmentRefs(refs: AttachmentRef[]): AttachmentRef[] {
+  return refs.filter(
+    (ref, index) =>
+      refs.findIndex(
+        (candidate) =>
+          (ref.id && candidate.id === ref.id) || candidate.url === ref.url,
+      ) === index,
+  );
+}
+
 export function TaskChatBubble({
   item,
   animateEntry = true,
@@ -145,9 +156,11 @@ export function TaskChatBubble({
   // Task attachments share the page gallery; standalone images retain the bubble viewer.
   const openIssueGallery = useContext(IssueGalleryContext);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
-  const openImage = (src: string) => {
+  // Keep MarkdownBody's memo boundary intact when only the live tail changes.
+  // A fresh callback here reparses every historical response on every update.
+  const openImage = useCallback((src: string) => {
     if (!openIssueGallery?.(src)) setLightboxSrc(src);
-  };
+  }, [openIssueGallery]);
   if (item.interstitial) {
     // Interstitial updates are ephemeral (PAP-361): while streaming the text
     // lives on the live parent row's line (TaskChatStatusItem.selfTalk), and
@@ -179,15 +192,26 @@ export function TaskChatBubble({
     embeddedImageRefs,
     attachments,
   );
-  const imageRefs = [
+  const boundAttachmentRefs: AttachmentRef[] = attachments
+    .filter((attachment) => attachment.issueCommentId === item.id)
+    .map((attachment) => ({
+      id: attachment.id,
+      name: attachment.originalFilename?.trim() || "attachment",
+      url: attachment.contentPath,
+      contentType: attachment.contentType,
+      byteSize: attachment.byteSize,
+      openPath: attachment.openPath,
+      downloadPath: attachment.downloadPath,
+    }));
+  const imageRefs = uniqueAttachmentRefs([
     ...hydratedEmbeddedRefs,
     ...hydratedLinkedRefs.filter(isImageAttachment),
-  ].filter((ref, index, refs) =>
-    refs.findIndex((candidate) => candidate.url === ref.url) === index,
-  );
-  const attachmentRefs = hydratedLinkedRefs.filter(
-    (ref) => !isImageAttachment(ref),
-  );
+    ...boundAttachmentRefs.filter(isImageAttachment),
+  ]);
+  const attachmentRefs = uniqueAttachmentRefs([
+    ...hydratedLinkedRefs.filter((ref) => !isImageAttachment(ref)),
+    ...boundAttachmentRefs.filter((ref) => !isImageAttachment(ref)),
+  ]);
   const galleryItems: GalleryMediaItem[] =
     lightboxSrc !== null && !imageRefs.some((ref) => ref.url === lightboxSrc)
       ? // A clicked image the extractor missed (e.g. inline HTML) still gets a
@@ -251,7 +275,7 @@ export function TaskChatBubble({
           data-testid="task-chat-bubble-media"
         >
           <span className="text-xs text-muted-foreground">
-            Screenshots · {imageRefs.length}
+            Images · {imageRefs.length}
           </span>
           <div className="grid grid-cols-4 gap-2">
             {imageRefs

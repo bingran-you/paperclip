@@ -110,6 +110,70 @@ workflow manually, to produce downloadable Playwright report/test-result
 artifacts. Normal PR visual runs use read-only repository permissions and do not
 upload or mutate baseline objects.
 
+### Publish a branch Storybook
+
+CODEOWNERS can publish a repository branch through **Actions → Storybook Deploy →
+Run workflow**. Keep the workflow branch on `master` and enter the source branch
+in `branch`. The source branch does not need to contain the workflow. Leaving
+`branch` empty publishes the selected workflow branch's dispatched commit.
+
+```sh
+gh workflow run storybook-deploy.yml --ref master -f branch=your-branch
+```
+
+The existing **Storybook Visual** workflow also offers a `deploy_preview` checkbox,
+which publishes through the same workflow instead of running visual tests:
+
+```sh
+gh workflow run storybook-visual.yml --ref master -f deploy_preview=true -f branch=your-branch
+```
+
+Approve the `storybook-deploy` environment as a CODEOWNER. The workflow summary
+links the **stable branch URL** and **this build**. The run also uploads a
+`storybook-deployment-<run-id>-<attempt>` artifact containing
+`storybook-deployment.md` with both links and the source commit. Different branches have
+different URLs; publishing one never replaces another. Redeploying the same
+branch updates its stable URL only after all files for the new build are uploaded.
+Previous build links keep working. The branch entry preserves Storybook query
+parameters and fragments when redirecting to the completed build.
+
+Bookmark URLs use `storybook/branches/<branch>/`, for example
+`https://d1p6rlowie26tp.cloudfront.net/storybook/branches/master/`.
+Copy the **stable branch URL** from the run summary when saving a bookmark;
+opening it redirects to the latest published build. Branch names preserve case.
+Characters other than letters, digits, `_`, and `-` use `~HH` UTF-8 escapes, so
+`feature/foo` becomes `feature~2Ffoo` and stays distinct from `feature-foo`.
+Names ending in a hyphen and 16 lowercase hex digits escape that hyphen to
+reserve the existing build directories. Very long names use a hash suffix.
+Existing hashed branch URLs keep updating and remain valid. Build files remain
+under `storybook/branches/<readable-branch>-<hash>/builds/<run-id>-<attempt>/`.
+`deployment.json` in each build records its branch, source commit and URLs.
+Builds run independently; publication is serialized per branch. Retained builds
+are not automatically deleted and will accumulate until an operator prunes them.
+
+Publishing requires both the original actor and the current rerunner to be
+individual GitHub accounts named in `.github/CODEOWNERS` on the current default
+branch. Comments, teams and email entries do not grant access. Authorization runs
+before the build and again before deployment, including deployment-only reruns.
+GitHub also requires a CODEOWNER environment approval, so editing authorization
+code on a branch cannot grant AWS access without an authorized reviewer.
+
+The build downloads the public source archive with no GitHub token permissions,
+AWS credentials or repository secrets. Dependency caching and install lifecycle
+scripts are disabled. The separate publisher uses GitHub OIDC to assume a role limited to
+`storybook/branches/*`. It treats the build artifact as static files and runs only
+the publisher from the workflow checkout. It cannot delete objects, change AWS
+settings, or overwrite the runner dashboard. The Storybook site itself is public.
+Pushes and PR events never publish it.
+
+The existing S3 bucket and CloudFront distribution also serve runner reports in
+separate prefixes. GitHub Pages and its dashboard workflow are independent.
+See [Storybook deployment setup](STORYBOOK-DEPLOYMENT.md) for the environment,
+repository variables, AWS policies and one-time operator setup.
+
+GitHub requires a new dispatch workflow to exist on the default branch before
+it becomes a manual entry point.
+
 ## UI Fonts And Screenshots
 
 The board UI ships its own sans-serif webfont assets in `ui/public/fonts/`.
@@ -130,6 +194,13 @@ pnpm dev:stop
 ```
 
 `pnpm dev:once` now tracks backend-relevant file changes and pending migrations. When the current boot is stale, the board UI shows a `Restart required` banner. You can also enable guarded auto-restart in `Instance Settings > Experimental`, which waits for queued/running local agent runs to finish before restarting the dev server.
+
+Worktree dependency provisioning records its fingerprint only after a successful
+install. Frozen installs with outdated lockfiles or patched-dependency hash
+mismatches retry once without `--frozen-lockfile`; other failures retain their
+exit status. Patch contents are part of the install fingerprint. Generated
+lockfile changes remain local to the worktree; the repository's lockfile bot
+owns committed updates.
 
 ## Hot-Restart Deploys
 
@@ -1301,3 +1372,35 @@ Networking behavior for this smoke script:
 ### GitHub identity for shared agents
 
 See [execution GitHub identity](execution-github-identity.md) for the operation-time credential contract, continuation rules, runtime rollout, and acceptance-test requirements.
+
+
+### Investigating polling load
+
+The company heartbeat-run and live-run lists load secret registries in one
+company-scoped query per response. Registry reads project only
+`paperclipSecretRedactions` from the run context. They do not load the full
+prompt/context JSON. Decrypted values live only for that request and each run
+uses its own registry.
+
+Hidden browser tabs suspend the company live-events connection and transcript
+log reads. Returning to a visible tab refreshes active queries once and resumes
+transcript reads from their retained offsets. A queued live-event invalidation
+that flushes after the tab hides marks data stale without starting a refetch.
+The developer-server health poll also stops in hidden tabs.
+
+Workspace detail responses share concurrent Git inspections and reuse their
+results for up to five seconds after completion. The cache holds at most 256
+entries. Close-readiness checks, the terminal-workspace reaper, and the final
+cleanup validation still inspect Git afresh. A display result never authorizes
+worktree removal.
+
+The connection-health sweep selects only due IDs in SQL before applying its
+limit. Legacy `paperclip_plugin` placeholder connections are excluded: their
+tools run in plugin workers and do not have remote MCP endpoints. These rows
+remain available; the sweep does not disable or delete plugin connections.
+
+When investigating an overloaded instance, distinguish request amplification
+from stored configuration problems. Verify connection transport and endpoint
+fields before disabling a connection. Verify workspace ownership, active runs,
+Git state, and runtime-service readiness before closing a workspace. A missing
+URL or old workspace timestamp alone does not prove that a row is disposable.

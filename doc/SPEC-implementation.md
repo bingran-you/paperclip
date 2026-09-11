@@ -21,6 +21,9 @@ Paperclip V1 must provide a full control-plane loop for autonomous agents:
 4. All work is tracked through tasks/comments with audit visibility.
 5. Token/cost usage is reported and budget limits can stop work.
 6. The board can intervene anywhere (pause agents/tasks, override decisions).
+   An effective task or ancestor pause replaces the message composer with an
+   amber Resume takeover. New board messages, including updates with comments,
+   are rejected until the hold is released. Drafts survive pause and resume.
 
 Success means one operator can run a small AI-native company end-to-end with clear visibility and control.
 
@@ -1175,6 +1178,17 @@ interface AgentAdapter {
   cancel(run: HeartbeatRun): Promise<void>;
 }
 ```
+
+### Local adapter engine availability
+
+For the legacy Codex, Claude, Gemini, and Kimi local adapters, an omitted engine
+or legacy `auto` value selects ACP deterministically. Missing prerequisites or
+ACP execution failures fail the run; they must not launch a different engine
+with different session, permission, or sandbox semantics. CLI execution requires
+explicit selection. Environment tests report the same engine availability error
+as execution. Codex CLI defaults permit workspace writes and network access for
+Paperclip coordination without disabling its sandbox; explicit operator
+restrictions and execution-target network denials remain effective.
 
 ## 11.2 Process Adapter
 
