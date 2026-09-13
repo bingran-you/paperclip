@@ -1,3 +1,4 @@
+import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -45,6 +46,7 @@ import {
 } from "../workspace-restore-merge.js";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
   asNumber,
   asString,
@@ -1967,6 +1969,17 @@ async function buildRuntime(input: {
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
+  // codex-acp supports both key names, but ACP clients must select its
+  // api-key authentication method during session creation. Without this
+  // request, the server advertises authentication and rejects session/new even
+  // though the credential is present in the launched process environment.
+  if (
+    acpxAgent === "codex" &&
+    (env.OPENAI_API_KEY || env.CODEX_API_KEY) &&
+    !env.DEFAULT_AUTH_REQUEST
+  ) {
+    env.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
+  }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
@@ -2058,7 +2071,7 @@ async function buildRuntime(input: {
     // device login wrote. This never touches `prepareCodexSkillRuntime` above
     // — that function stays Codex-only — and every other custom ACPX agent
     // (for example `kimi`) falls through this branch unaffected.
-    if (acpxAgent === "grok") {
+    if (acpxAgent === "grok" && !config.managedAiConnection) {
       env.GROK_HOME = resolveManagedGrokHomeDir(agent.companyId);
     }
     const desired = resolveLegacyPaperclipDesiredSkillNames(
@@ -2473,7 +2486,12 @@ async function buildRuntime(input: {
     await emitRunPhaseTiming(input.ctx, "start_transport", nowMs() - startTransportStart, "failed");
     throw err;
   }
-  const overrideCommand = processSessionBridge?.agentCommand ?? agentCommand;
+  // The relay runs on the host with the sanitized remote launch environment.
+  // Its /usr/bin/env node shebang cannot rely on that environment's PATH.
+  const overrideCommand = processSessionBridge?.agentCommand
+    ? [process.execPath, processSessionBridge.agentCommand]
+      .map((part) => JSON.stringify(part.replaceAll("\\", "/"))).join(" ")
+    : agentCommand;
   const overrides = overrideCommand ? { [acpxAgent]: overrideCommand } : undefined;
   const agentRegistry = createAgentRegistry({ overrides });
   const loggedEnv = buildInvocationEnvForLogs(env, {
@@ -2912,7 +2930,9 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const hasCustomPromptTemplate = configuredPromptTemplate.trim().length > 0;
   const promptTemplate = hasCustomPromptTemplate
     ? configuredPromptTemplate
-    : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
+    : context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
@@ -2956,6 +2976,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const externalChatTurn = isPaperclipExternalChatTurn(context.paperclipWake);
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
     resumedSession,
+    conversationMode: context.conversationMode === true,
     // The task-context markdown is the authoritative brief on this lane; keep
     // the wake prompt's description copy out so the prompt carries it once.
     suppressIssueDescription: taskContextNote.length > 0,
@@ -3910,6 +3931,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let forcedStop = false;
     let runtimeStopConfirmed = false;
     let safeInterruptedSession = false;
+    let preserveInterruptedSession = false;
     const interruptionTools = new Map<string, { kind?: string; status?: string }>();
     let incompleteToolInventory = false;
     try {
@@ -4094,23 +4116,28 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // run inside this wrap and overrides the store, so an in-step exec still
         // parents to its step span. On a local or SSH target
         // `spanParent.parentContext` is a no-op token, so the wrap is inert.
-        prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
-          buildRuntime({
-            ctx,
-            engine,
-            deps,
-            ledger: runResourceLedger,
-            stagedIdleMs: warmIdleMs,
-            spanParent,
-            getRuntimeParentContext,
-            runtimeSpan: runRuntimeSpan,
-            stageRuntimeSpan: runStageSpan,
-          }),
-        );
-        buildRuntimeSettled = true;
-        // Capture the run's staging lease release now that the runtime built. The
-        // run root `finally` releases it as the final settlement act.
-        releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        const startupCancellation = cancellableSandboxStartup(ctx);
+        try {
+          prepared = await runWithRuntimeParent(spanParent.parentContext, () =>
+            buildRuntime({
+              ctx: startupCancellation.context,
+              engine,
+              deps,
+              ledger: runResourceLedger,
+              stagedIdleMs: warmIdleMs,
+              spanParent,
+              getRuntimeParentContext,
+              runtimeSpan: runRuntimeSpan,
+              stageRuntimeSpan: runStageSpan,
+            }),
+          );
+          buildRuntimeSettled = true;
+          // Capture acquired resources before the cancellation boundary so the
+          // normal settlement path also releases a just-completed build.
+          releaseStagingLease = prepared.sessionStagingLeaseRelease;
+        } finally {
+          await startupCancellation.finish();
+        }
         // Per-project staging outcomes for the referenced (mentioned) projects, surfaced back to the
         // server on the run result. A referenced project that failed to stage into the sandbox is a
         // first-class, counted failure in the requested-vs-synced observability, not only a warning. The
@@ -4144,9 +4171,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
 
         const previousParams = parseObject(ctx.runtime.sessionParams);
         const canResume = isCompatibleSession(previousParams, prepared);
-        if (previousParams.interruptedCheckpoint === true && !canResume) {
-          throw new Error("The interrupted session is no longer compatible. Its action history must be checked before starting a new session.");
-        }
         const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
         // Borrow the warm entry without removing it, so an overlapping run of the
         // same session still sees it. The borrow clears the entry's idle timer, so
@@ -4347,7 +4371,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 }),
               });
             } catch (err) {
-              if (!resumeSessionId || !isResumeFailure(err) || previousParams.interruptedCheckpoint === true) throw err;
+              if (!resumeSessionId || !isResumeFailure(err)) throw err;
               clearSession = true;
               resumedSession = false;
               await ctx.onLog(
@@ -4394,10 +4418,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               parentContext: prepared.stepMetrics.parentContext,
             });
           }
-          // A compatible warm handle reuses the already-running ACP agent and does
-          if (previousParams.interruptedCheckpoint === true && handle?.backendSessionId !== resumeSessionId) {
-            throw new Error("The provider did not restore the interrupted session; refusing a fresh-session fallback.");
+          if (resumeSessionId && handle?.backendSessionId !== resumeSessionId) {
+            resumedSession = false;
+            clearSession = true;
           }
+          // A compatible warm handle reuses the already-running ACP agent and does
           // not emit another spawn event. Persist its known identity on this run
           // before the next prompt starts so every running heartbeat is adoptable.
           if (handle && cached && processIdentitySink.latest && ctx.onSpawn) {
@@ -4883,13 +4908,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           eventCostUsd,
         });
         const failedTurn = terminal.status === "failed" || terminal.status === "cancelled" || timedOut;
-        // A provider-native command/write has no reliable external outcome
-        // receipt. Only settled reads (or a turn with no tools) can establish
-        // automatic interrupted-session continuity here.
-        safeInterruptedSession = ctx.signal?.aborted === true && !forcedStop && !timedOut && !channelLost
+        // ACPX can defer session/load until runTurn. Forget an unavailable
+        // session so the next bounded turn receives the full task conversation.
+        const sessionUnavailable = terminal.status === "failed" &&
+          terminal.error.detailCode === "SESSION_RESUME_REQUIRED";
+        if (sessionUnavailable) clearSession = true;
+        // Saving a conversation is independent from certifying tool outcomes.
+        // Its next turn receives history, not a replay of pending tool calls.
+        preserveInterruptedSession = ctx.signal?.aborted === true && !forcedStop && !timedOut && !channelLost
           && (terminal.status === "cancelled" || terminal.status === "completed")
           && prepared.mode === "persistent" && !prepared.processSessionBridge
-          && Boolean(sessionHandle.backendSessionId)
+          && Boolean(sessionHandle.backendSessionId);
+        safeInterruptedSession = preserveInterruptedSession
           && !incompleteToolInventory
           && [...interruptionTools.values()].every((tool) => tool.kind === "read" && tool.status === "completed");
         // Record how the settlement `endSession` step closes the runtime for this
@@ -4911,7 +4941,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               : failedTurn
                 ? `paperclip turn ${terminal.status}`
                 : "paperclip completed turn cleanup",
-          discardPersistentState: (terminal.status === "cancelled" && !safeInterruptedSession) || timedOut || channelLost,
+          discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
           dropWarmEntry: false,
           recordCloseError: false,
           cancelTurnReason: null,
