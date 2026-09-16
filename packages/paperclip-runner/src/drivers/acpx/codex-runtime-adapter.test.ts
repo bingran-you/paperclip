@@ -28,6 +28,46 @@ const HANDLE: AcpRuntimeHandle = {
 };
 
 describe("Codex ACPX runtime adapter", () => {
+  it("stops a turn with an actionable error when approval has no handler", async () => {
+    const runtime = fakeRuntime();
+    let runtimeOptions: AcpRuntimeOptions | undefined;
+    let signal: AbortSignal | undefined;
+    let settle!: () => void;
+    const finished = new Promise<void>((resolve) => { settle = resolve; });
+    vi.mocked(runtime.startTurn).mockImplementation((input) => {
+      signal = input.signal;
+      signal?.addEventListener("abort", settle, { once: true });
+      return {
+        requestId: "permission-test",
+        promptStarted: Promise.resolve(),
+        events: (async function* () { await finished; })(),
+        result: finished.then(() => ({ status: "cancelled" as const })),
+        cancel: async () => settle(),
+        closeStream: async () => settle(),
+      } as ReturnType<AcpRuntime["startTurn"]>;
+    });
+    const options = openOptions(fakeCommand());
+    options.permissionMode = "approve-reads";
+    const port = await openCodexAcpxRuntime(options, {
+      createRegistry: () => registry(),
+      createStore: () => store(),
+      createRuntime: (created) => { runtimeOptions = created; return runtime; },
+    });
+    const turn = port.startTurn({ text: "Attempt a write.", requestId: "permission-test" });
+    try {
+      await runtimeOptions!.onPermissionRequest!({
+        sessionId: "backend-1", inferredKind: "write", raw: {},
+      }, { signal: new AbortController().signal });
+      expect(signal?.aborted).toBe(true);
+      await expect(turn.result).rejects.toThrow("Approval required");
+      await expect((async () => { for await (const _event of turn.events) { /* drain */ } })())
+        .rejects.toThrow("Approval required");
+    } finally {
+      settle();
+      await port.close({ reason: "permission failure verified" });
+    }
+  });
+
   it("rejects a pre-aborted admission before constructing or spawning ACPX", async () => {
     const cancellation = new Error("runtime admission cancelled");
     const controller = new AbortController();
@@ -1334,7 +1374,7 @@ describe("Codex ACPX runtime adapter", () => {
       text: "Complete the task.",
       mode: "prompt",
       requestId: "turn-1",
-      signal,
+      signal: expect.any(AbortSignal),
       onElicitation,
     });
   });
@@ -1564,7 +1604,7 @@ describe("Codex ACPX runtime adapter", () => {
     await port.close({ reason: "complete" });
   });
 
-  it("delegates permissions that require an unavailable coordinator", async () => {
+  it("rejects permissions that require an unavailable coordinator", async () => {
     const runtime = fakeRuntime();
     let runtimeOptions: AcpRuntimeOptions | undefined;
     const port = await openCodexAcpxRuntime(openOptions(fakeCommand()), {
@@ -1585,16 +1625,16 @@ describe("Codex ACPX runtime adapter", () => {
         },
         { signal: new AbortController().signal },
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ outcome: "reject_once" });
     await port.close({ reason: "complete" });
   });
 
   it.each([
     ["codex", "gpt-5.6-sol", "approve-all", { outcome: "allow_once" }],
-    ["codex", "gpt-5.6-sol", "approve-reads", undefined],
+    ["codex", "gpt-5.6-sol", "approve-reads", { outcome: "reject_once" }],
     ["codex", "gpt-5.6-sol", "deny-all", { outcome: "reject_once" }],
     ["claude", "claude-sonnet-5", "approve-all", { outcome: "allow_once" }],
-    ["claude", "claude-sonnet-5", "approve-reads", undefined],
+    ["claude", "claude-sonnet-5", "approve-reads", { outcome: "reject_once" }],
     ["claude", "claude-sonnet-5", "deny-all", { outcome: "reject_once" }],
   ] as const)(
     "applies the %s/%s ACPX profile's %s mode without an implicit prompt bridge",

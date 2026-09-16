@@ -6468,6 +6468,21 @@ describe("native session bounded recovery", () => {
     ).toBe("native_current_wake_comments_changed_after_read");
   });
 
+  it("requires operator action without retrying an approval-required terminal", () => {
+    const code = nativeSessionFailureSourceCode(
+      new NativeProviderTerminalFailure("approval_required", false, "Approval required"),
+    );
+    expect(code).toBe("native_provider_approval_required");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_provider_approval_required",
+      nextAttemptAt: null,
+    });
+    expect(nativeSessionRecoveryProjection({
+      phase: "terminal_failure", failureCode: code, agentId: "agent-1",
+    })).toMatchObject({ issueStatus: "blocked", recoveryOwner: { kind: "board" } });
+  });
+
   it("retries the same run twice and stops at the third failed attempt", () => {
     const now = new Date("2026-08-09T00:00:00.000Z");
     expect(

@@ -1,9 +1,10 @@
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
-import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest } from "./ai-connections.js";
+import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
+import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest, validateAiApiKey } from "./ai-connections.js";
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -102,7 +103,7 @@ import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-loc
 import type { AdapterAuthSignal, AdapterAuthSignalResponse, CodexAccountBindingClaim } from "@paperclipai/shared";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
-import { secretService } from "../services/secrets.js";
+import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
@@ -2412,6 +2413,22 @@ export function agentRoutes(
     return normalizedRuntimeConfig;
   }
 
+  async function normalizeCreatedAgentRuntimeConfig(
+    req: Request,
+    companyId: string,
+    adapterType: string,
+    adapterConfig: Record<string, unknown>,
+    runtimeConfig: unknown,
+  ) {
+    const normalized = normalizeNewAgentRuntimeConfig(runtimeConfig);
+    if (req.actor.type !== "agent" || normalized.aiConnection) return normalized;
+    const manager = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+    if (!manager || manager.companyId !== companyId) throw forbidden("Hiring agent is unavailable");
+    const binding = defaultAiConnectionForHire(adapterType, adapterConfig, manager.runtimeConfig?.aiConnection);
+    if (binding) normalized.aiConnection = binding;
+    return normalized;
+  }
+
   async function normalizeMediatedAdapterConfigForPersistence(input: {
     companyId: string;
     adapterType: string | null | undefined;
@@ -2490,6 +2507,84 @@ export function agentRoutes(
     return {
       ...adapterConfig,
       env: { ...existingEnv, CODEX_HOME: codexLocalAgentHome(companyId, agentId) },
+    };
+  }
+
+  // The provider credential environment keys a hired agent can inherit from the
+  // hiring agent, by adapter type. Each key holds a credential. A configuration
+  // key such as CODEX_HOME or GROK_HOME is a path, not a credential, and stays
+  // out of this list.
+  const INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS: Record<string, readonly string[]> = {
+    claude_local: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+    codex_local: ["OPENAI_API_KEY", "CODEX_API_KEY"],
+    grok_local: ["XAI_API_KEY"],
+  };
+
+  function isInheritableCredentialReference(value: unknown): value is Record<string, unknown> {
+    const record = asRecord(value);
+    return record !== null && (record.type === "secret_ref" || record.type === "user_secret_ref");
+  }
+
+  // A hired agent inherits the provider credential references the hiring
+  // agent already holds for the same adapter type, so a freshly hired agent
+  // can run without a separate credential setup step. The merge copies each
+  // reference object whole, so the child keeps the parent's pinned version
+  // and its other fields. A key the hire request already supplies always
+  // wins, and the merge never inherits a plain environment value.
+  //
+  // A claude_local hire request that already supplies any Claude credential
+  // key inherits no Claude credential key at all. That keeps child-wins
+  // precedence and rules out the forbidden pairing of the fixed OAuth binding
+  // with an ANTHROPIC_API_KEY.
+  //
+  // The hiring agent must belong to the target company. Without that check, an
+  // agent that can create agents in another company could copy its own
+  // company's credential reference into that other company.
+  async function applyHiringAgentAuthInheritance(
+    req: Request,
+    companyId: string,
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown>,
+    runtimeConfig: unknown,
+  ): Promise<{ adapterConfig: Record<string, unknown>; inheritedFixedClaudeOAuthBinding: boolean }> {
+    const noInheritance = { adapterConfig, inheritedFixedClaudeOAuthBinding: false };
+    if (asRecord(runtimeConfig)?.aiConnection) return noInheritance;
+    if (req.actor.type !== "agent" || !req.actor.agentId) return noInheritance;
+    const credentialKeys = adapterType ? INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS[adapterType] : undefined;
+    if (!credentialKeys) return noInheritance;
+
+    const parent = await svc.getById(req.actor.agentId);
+    if (!parent || parent.companyId !== companyId || parent.adapterType !== adapterType) return noInheritance;
+    // Managed parents must not pass stale legacy credential references to hires.
+    if (aiConnectionBindingSchema.safeParse(parent.runtimeConfig.aiConnection).success) return noInheritance;
+    const parentEnv = asRecord(asRecord(parent.adapterConfig)?.env);
+    if (!parentEnv) return noInheritance;
+
+    const existingEnv = asRecord(adapterConfig.env);
+    const claudeCredentialKeys = INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS.claude_local;
+    const childHasClaudeCredential =
+      adapterType === "claude_local" &&
+      existingEnv !== null &&
+      claudeCredentialKeys.some((key) => existingEnv[key] !== undefined);
+    if (childHasClaudeCredential) return noInheritance;
+
+    const nextEnv: Record<string, unknown> = { ...(existingEnv ?? {}) };
+    let inheritedFixedClaudeOAuthBinding = false;
+    let changed = false;
+    for (const key of credentialKeys) {
+      if (existingEnv && existingEnv[key] !== undefined) continue;
+      const parentValue = parentEnv[key];
+      if (!isInheritableCredentialReference(parentValue)) continue;
+      nextEnv[key] = { ...parentValue };
+      changed = true;
+      if (key === "CLAUDE_CODE_OAUTH_TOKEN" && isFixedClaudeOAuthBinding(parentValue)) {
+        inheritedFixedClaudeOAuthBinding = true;
+      }
+    }
+    if (!changed) return noInheritance;
+    return {
+      adapterConfig: { ...adapterConfig, env: nextEnv },
+      inheritedFixedClaudeOAuthBinding,
     };
   }
 
@@ -3178,6 +3273,35 @@ export function agentRoutes(
     await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
     const result = await requireServerAdapter(adapterType).testEnvironment(context);
     if (result.status === "fail") return result;
+    // The resolved method, not binding.method — on a responsible_user binding
+    // that field is wire-compat only and the default connection decides.
+    const resolvedMethod = (context.config as { managedAiConnection?: { method?: string } }).managedAiConnection?.method;
+    // An api_key account does not take the CLI hello probe below: a key
+    // travels as an env var any engine understands, and the engine's own test
+    // above judged whether this runtime can execute with it — the ACP lane
+    // deliberately runs no hello probe when a key is configured. Demanding one
+    // anyway forced the CLI lane, whose probe needs a provider CLI on PATH,
+    // and a clean install has none: that walled off onboarding's API-key path
+    // on exactly the machines the release smoke exists to guard. The account
+    // is still verified live here — the same provider-endpoint check the save
+    // performed — so a key revoked since its save fails adoption rather than
+    // producing an agent that cannot authenticate at runtime. The hello-probe
+    // requirement stays for subscriptions: a stored login is a file layout
+    // only a provider CLI reads, so proving the runtime lane can consume it
+    // takes a real hello turn.
+    if (resolvedMethod === "api_key") {
+      const envKey = AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
+      const key = envKey ? parseObject(context.config.env)[envKey] : undefined;
+      try {
+        if (typeof key !== "string" || !key) throw unprocessable("The selected account's API key was not available to verify.");
+        await validateAiApiKey(binding.provider, key);
+        result.checks.push({ code: "ai_connection_api_key_reverified", level: "info", message: "The provider verified this API key for adoption." });
+      } catch (error) {
+        result.status = "fail";
+        result.checks.push({ code: "ai_connection_api_key_rejected", level: "error", message: error instanceof HttpError ? error.message : "Could not verify the account. Try again." });
+      }
+      return result;
+    }
     if (!result.checks.some(check => check.code.includes("hello_probe"))) {
       const providerAdapter = { anthropic: "claude_local", openai: "codex_local", openrouter: "opencode_local", xai: "grok_local" }[binding.provider];
       const probe = await requireServerAdapter(providerAdapter).testEnvironment({ ...context, adapterType: providerAdapter, config: { ...context.config, engine: "cli" } });
@@ -3194,7 +3318,17 @@ export function agentRoutes(
   async function validateManagedAgentBinding(req: Request, companyId: string, agentId: string, adapterType: string, config: Record<string, unknown>, binding: AiConnectionBinding, environmentId: string | null | undefined, test: boolean, newAgent = false) {
     const userId = responsibleUserForAiRequest(req);
     const allowUninstalledShared = newAgent && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, binding);
-    const selection = await aiConnectionService(db).select({ companyId, agentId, userId, adapterType, model: config.model, runnerProvider: config.provider, acpxAgent: config.acpxAgent, binding, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: test });
+    const selection = await aiConnectionService(db).select({ companyId, agentId, userId, adapterType, model: config.model, runnerProvider: config.provider, acpxAgent: config.acpxAgent, binding, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: test }).catch((error: unknown) => {
+      // Hiring is allowed before the responsible user has connected this
+      // provider. Execution still resolves credentials and creates the normal
+      // task connection request; compatibility and access denials stay errors.
+      if (newAgent && !test && binding.mode === "responsible_user" && error instanceof HttpError
+        && ["ai_connection_default_missing", "ai_connection_missing", "ai_connection_unavailable", "ai_connection_responsible_user_missing"].includes(String(asRecord(error.details)?.code))) {
+        return null;
+      }
+      throw error;
+    });
+    if (!selection) return undefined;
     if (test) {
       if (environmentId) await assertAdapterTestEnvironmentForCompany(companyId, environmentId);
       const target = await resolveAdapterTestExecutionContext({ companyId, adapterType, environmentId: environmentId ?? null });
@@ -4288,14 +4422,21 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
     const hiredAgentId = randomUUID();
-    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+    const authInheritance = await applyHiringAgentAuthInheritance(
+      req,
       companyId,
-      hiredAgentId,
       hireInput.adapterType,
       applyCreateDefaultsByAdapterType(
         hireInput.adapterType,
         rawHireAdapterConfig,
       ),
+      hireInput.runtimeConfig,
+    );
+    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+      companyId,
+      hiredAgentId,
+      hireInput.adapterType,
+      authInheritance.adapterConfig,
     );
     assertExternalInstructionsAdmin(req, {
       id: hiredAgentId,
@@ -4322,7 +4463,7 @@ export function agentRoutes(
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = normalizeNewAgentRuntimeConfig(hireInput.runtimeConfig);
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
     const normalizedHireInput = {
       ...hireInput,
       adapterConfig: normalizedAdapterConfig,
@@ -4396,6 +4537,15 @@ export function agentRoutes(
             // from the actor, so an agent actor never reaches the no-claim bind.
             applyExistingWithoutClaim:
               req.actor.type !== "agent" && hireApplyStoredClaudeLogin === true,
+            // Set only when an agent actor hired this child and the merge above
+            // inherited the parent's fixed Claude OAuth reference. The service
+            // re-reads this named parent inside the write transaction before it
+            // permits the bind, so this identifier is a claim to verify, not a
+            // trusted value.
+            inheritedFromAgentId:
+              req.actor.type === "agent" && authInheritance.inheritedFixedClaudeOAuthBinding
+                ? req.actor.agentId
+                : null,
           },
         },
       );
@@ -4608,7 +4758,7 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = normalizeNewAgentRuntimeConfig(createInput.runtimeConfig);
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
       allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),

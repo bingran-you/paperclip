@@ -248,6 +248,7 @@ impl AcpxProviderDescriptor {
             permission_mode: self.permission_mode,
             permission_mode_pinned: self.permission_mode_pinned,
             system_instructions: self.instructions.clone(),
+            runtime_context: self.runtime_context.clone(),
             tool_set,
             expected_identity,
         })

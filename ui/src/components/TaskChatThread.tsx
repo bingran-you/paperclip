@@ -1558,7 +1558,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
         const label =
-          code === "native_provider_usage_limit" && source.status === "failed"
+          code === "native_provider_approval_required" && source.status === "failed"
+            ? "Approval required"
+            : code === "native_provider_usage_limit" && source.status === "failed"
             ? "Usage limit reached"
             : source.status === "cancelled"
               ? "Run cancelled"
@@ -1575,7 +1577,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? `The run was cancelled ${responseBoundary}.`
             : source.status === "interrupted"
               ? `The run was interrupted ${responseBoundary}.`
-              : code === "native_provider_model_rejected"
+              : code === "native_provider_approval_required"
+                ? "This operation requires approval, but this runner has no interactive approval handler. Review the operation and update the agent's permission setting before retrying."
+                : code === "native_provider_model_rejected"
                 ? "The provider rejected the selected model. Check the model ID and your account's access, save the agent configuration, then retry. View the run for the provider's full error."
                 : code === "native_provider_usage_limit" &&
                     source.status === "failed"
@@ -1684,6 +1688,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 : "Execution was stopped before returning an answer."
               : code === "provider_frame_too_large"
               ? `Provider output exceeded the safe limit. ${retryDetail}`
+              : code.startsWith("workspace_git_scan_")
+              ? `Workspace setup failed before the agent started. ${retryDetail}`
               : `The runner stopped before returning an answer (${code}). ${retryDetail}`;
           const id = `${source.id}:failure`;
           entriesWithFailures.push({
@@ -2886,7 +2892,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                             ? liveRun.currentStatusMessage
                                             : null) ||
                                           (tailStatus === "failed"
-                                            ? "This run stopped before a response was available. Review the task’s connection or recovery action below."
+                                            ? linkedRunMetaById.get(tailRunId ?? "")?.errorCode?.startsWith("workspace_git_scan_")
+                                              ? "Workspace setup failed before the agent started."
+                                              : "This run stopped before a response was available. Review the task’s connection or recovery action below."
                                             : "Waiting for transcript...")
                                     }
                                   />

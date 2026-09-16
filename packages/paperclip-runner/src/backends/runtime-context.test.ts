@@ -60,7 +60,7 @@ describe("native runtime context files", () => {
     ).join("\n");
 
     expect(constraints).toContain(
-      "Invoke paperclip_finish or paperclip_block exactly once before writing",
+      "Obtain one accepted result from paperclip_finish or paperclip_block before writing",
     );
     expect(constraints).toContain("do not call another tool");
     expect(constraints).not.toContain(

@@ -10,6 +10,7 @@ export type RunnerGeneration = "legacy" | "native";
 export type RunnerEnvironmentId = "local" | "daytona";
 export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
+  | "everyday_workflow"
   | "agent_chat"
   | "governed_tool_review"
   | "single_turn"
@@ -123,8 +124,8 @@ export interface RunnerTaskFixture {
   expectedRunCount: number;
   attemptTimeoutMs: Readonly<Record<RunnerEnvironmentId, number>>;
   expectedTerminalState: {
-    issue: "done" | "in_review";
-    run: "succeeded";
+    issue: "done" | "in_review" | "blocked";
+    run: "succeeded" | "failed";
   };
   buildTitle(nonce: string): string;
   buildPrompt(nonce: string): string;
@@ -168,6 +169,8 @@ export interface RunnerSuiteFixture {
   excludedExecutionIds?: readonly string[];
   expectedMatrixSize: number;
   definitionMetadata?: Readonly<Record<string, unknown>>;
+  /** Requires an explicit suite or execution ID; excluded from scheduled --all. */
+  manualOnly?: boolean;
 }
 
 export interface MatrixJob {
@@ -296,6 +299,8 @@ export interface RunnerE2EResult {
     label: string;
     file: string;
     publication?: "public-runner-fixture";
+    /** Absent in historical results; new captures bind the exact PNG bytes. */
+    sha256?: string;
   }>;
   cleanup: "not_started" | "passed" | "failed";
 }

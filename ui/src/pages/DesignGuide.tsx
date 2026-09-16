@@ -1,4 +1,7 @@
+import { AgentChatPicker } from "@/components/AgentChatPicker";
 import { TaskChatProjectCreatedCard } from "@/components/task-chat/TaskChatProjectCreatedCard";
+import { AnnouncementCard } from "@/components/AnnouncementCard";
+import { announcementPreview, announcementAnimationPreview, announcementAnimationPreviewSrc } from "@/lib/announcement-preview";
 import { TaskDetailTasksPanel } from "@/components/task-detail/TaskDetailTasksPanel";
 import { AiConnectionDesignExamples } from "@/components/ai-connections/AiConnectionDesignExamples";
 import { SavedProviderKeySelect } from "../components/onboarding/SavedProviderKeySelect";
@@ -478,6 +481,17 @@ function TaskExecutionControlsExample() {
   </div>;
 }
 
+function AgentChatPickerExample() {
+  const [state, setState] = useState<"closed" | "empty" | "loading" | "error">("closed");
+  return <div className="flex flex-wrap gap-2">
+    <Button variant="outline" onClick={() => setState("empty")}>Empty picker</Button>
+    <Button variant="outline" onClick={() => setState("loading")}>Loading picker</Button>
+    <Button variant="outline" onClick={() => setState("error")}>Failed picker</Button>
+    <AgentChatPicker agents={[]} open={state !== "closed"} onOpenChange={(open) => { if (!open) setState("closed"); }} onSelect={() => {}}
+      loading={state === "loading"} error={state === "error" ? new Error("Unavailable") : null} onRetry={() => setState("empty")} />
+  </div>;
+}
+
 export function DesignGuide() {
   const [status, setStatus] = useState("todo");
   const [priority, setPriority] = useState("medium");
@@ -546,6 +560,14 @@ export function DesignGuide() {
               ))}
             </div>
           </SubSection>
+        </div>
+      </Section>
+
+      <Section title="Announcements">
+        <div className="grid gap-4 md:grid-cols-2">
+          <AnnouncementCard announcement={announcementAnimationPreview} imageSrc="/announcement-preview.svg" animationSrc={announcementAnimationPreviewSrc} onDismiss={() => {}} />
+          <AnnouncementCard announcement={announcementPreview} imageSrc="/announcement-preview.svg" onDismiss={() => {}} />
+          <AnnouncementCard announcement={{ ...announcementPreview, image: undefined, secondaryLink: undefined }} onDismiss={() => {}} />
         </div>
       </Section>
 
@@ -1656,11 +1678,14 @@ export function DesignGuide() {
       {/*  NAVIGATION PATTERNS                                          */}
       {/* ============================================================ */}
       <Section title="Navigation Patterns">
+        <SubSection title="Agent chat picker">
+          <AgentChatPickerExample />
+        </SubSection>
         <SubSection title="Sidebar nav items">
           <p className="text-sm text-muted-foreground">
             Layout accepts sidebarSections to compose additional SidebarSection groups inside the shared sidebar.
             Use SidebarNavItem for each row, with sibling action buttons for starring or menus.
-            Starred agent conversations precede recent conversations without a divider. Stars appear on hover or keyboard focus. Task breadcrumbs support leading identity and trailing actions beside the label, including single-item task headers; see the Agent chat Storybook.
+            The Chats section shows starred agents, the earliest-created agent when unstarred, then four recent agents without duplicates. Compose and star controls share a vertical column. Compose appears on hover or keyboard focus and remains visible on touch; starred icons remain visible. The picker searches all company agents by name or role without a subtitle, count, continuation labels, or footer. Task breadcrumbs support leading identity and trailing actions beside the label, including single-item task headers; see the Agent chat Storybook.
           </p>
           <Card className="block w-60 p-3 space-y-0.5">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-accent-foreground">

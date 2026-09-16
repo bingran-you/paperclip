@@ -479,3 +479,33 @@ See [FIXTURES.md](./FIXTURES.md) before adding or changing a profile,
 environment, task, matcher, or future Paperclip object fixture.
 See [SECURITY.md](./SECURITY.md) before enabling paid dispatch, the runner
 group, or permanent public history in this public repository.
+
+## Everyday user-story evals
+
+See [EVERYDAY-WORKFLOWS.md](EVERYDAY-WORKFLOWS.md) for the explicit-only native-runner stories and their canonical Evalbook importer. These cells do not expand scheduled `--all` runs.
+
+### Everyday hiring prerequisites and timeout evidence
+
+The manual `everyday-workflows` / `hire-reuse` story enables native API tools in
+its isolated harness and creates a personal managed AI account through the public
+API. The lead uses the responsible user's default account, without adapter env
+credential overrides. The hire must inherit that binding and finish a real run
+attributed to the same account. The evidence records this fixture configuration.
+Other suites retain their existing API-tool defaults.
+
+A polling deadline after successful state reads is a candidate workflow failure,
+not a reason to retry as infrastructure. State snapshots remain in the evidence;
+the timeout message does not serialize task data into the failure classifier.
+Explicit server-health waits and failed network reads retain infrastructure
+classification.
+
+The product execution prompt v3 tells agents to record child dependencies and
+end the parent turn when no independent work remains. The user-story prompts
+stay unchanged, so live retests measure the product guidance itself.
+
+Delegated ZIP delivery can appear on the user-facing parent or its child task.
+The grader selects the newest ZIP only within that task family; a reuse request
+requires a new attachment after the request. The hired-agent execution/account
+checks and independent downloaded-code checks remain mandatory.
+
+Revision delivery checks exclude preserved originals by their content hash, even when the agent republishes an original after the revised ZIP. The browser downloads the exact selected attachment ID; its bytes still pass through the independent artifact checker.

@@ -56,6 +56,35 @@ stdin/stdout bridge admits the pinned Claude and Codex ACPX profiles. It
 validates the exact model, session identity, tool catalog, structured input,
 and terminal settlement at the process boundary. Pi remains unavailable.
 
+Native Claude skill assignments travel in the runtime-context snapshot through
+runnerd to the ACPX sidecar. After acquiring the provider lifetime lease, the
+host materializes the assigned bundles under the isolated Claude home's
+`skills/` directory before launch. Reopening a provider refreshes that snapshot;
+project and ambient host settings remain excluded. This path is separate from
+the legacy `claude_local` adapter's remote skill staging.
+
+The isolated Claude settings pin both `model` and `availableModels` to the
+user's requested ID. This keeps ACP from replacing an exact ID with a picker
+alias during selection and verification. Users can keep selecting models from
+the normal Claude catalog or entering custom IDs; unavailable models still fail
+at the provider rather than silently falling back.
+
+For ACPX Claude, `approve-reads` is shown as **Allow Paperclip reads**. The host
+intersects the run's public tools with the implementation catalog's read effects
+and writes exact MCP permission rules into the isolated Claude settings. The
+`paperclip` connection is always the runner's authenticated tool bridge; ambient
+MCP configuration is excluded. Tool hints and provider permission metadata cannot
+grant access. Unassigned tools, writes, external tools, and provider-native
+operations do not receive automatic read permission. Protocol completion and
+task-delivery controls keep their existing separate allowance.
+
+This runtime has no interactive permission handler. An operation that still
+requires approval stops the turn with `approval_required`. The server marks the
+task blocked, exposes the permission action to the operator, and disables
+automatic retry. The operator must review the operation and the agent's
+permission setting before retrying. Company access checks still run when each
+Paperclip tool executes.
+
 Runnerd selects only qualified provider profiles. Claude Managed and AWS
 AgentCore receive immutable company-profile snapshots with explicit retention,
 spend, and invocation limits. No provider process receives a Paperclip API

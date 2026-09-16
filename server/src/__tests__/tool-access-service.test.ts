@@ -3242,6 +3242,36 @@ describeEmbeddedPostgres("tool access service", () => {
     });
   });
 
+  it.each(["local_implicit", "session"] as const)("excludes unassignable agents from tests even for a %s instance admin", async (source) => {
+    const company = await createCompany(db);
+    const userId = `admin-tool-tester-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use"]);
+    const active = await createAgent(db, company.id);
+    const terminated = await createAgent(db, company.id, "terminated");
+    const pending = await createAgent(db, company.id, "pending_approval");
+    const otherCompany = await createCompany(db);
+    const foreign = await createAgent(db, otherCompany.id);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const gateway = createToolGatewayService(db, { toolActionSigningSecret: "test-secret" });
+    const execute = vi.spyOn(gateway, "executeTestCall");
+    const summarize = vi.spyOn(gateway, "summarizeConnectionAccessForAgent");
+    const app = createRouteApp(db, {
+      ...boardSessionActor(company.id, "operator", userId),
+      isInstanceAdmin: true, source,
+    }, gateway);
+
+    const res = await request(app).get(`/api/tool-connections/${connection.id}/test-agents`).expect(200);
+    expect(res.body.agents.map((agent: { id: string }) => agent.id)).toEqual([active.id]);
+    // A stale picker or a direct request must not bypass the same lifecycle guard.
+    for (const agent of [terminated, pending, foreign]) {
+      await request(app).get(`/api/tool-connections/${connection.id}/test-agents/${agent.id}/access`).expect(403);
+      await request(app).post(`/api/tool-connections/${connection.id}/test-calls`)
+        .send({ agentId: agent.id, toolName: "send_email", parameters: { to: "fixture@example.com" } }).expect(403);
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(summarize).not.toHaveBeenCalled();
+  });
+
   it("lists only writable agents and ranks the highest accessible agent first", async () => {
     const company = await createCompany(db);
     const userId = `scoped-tool-tester-${randomUUID()}`;
@@ -13152,6 +13182,39 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
     await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
     await expect(db.select().from(toolCatalogEntries)).resolves.toHaveLength(0);
+  });
+
+  it("keeps missing personal authorization as a client-actionable health failure", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    await db
+      .delete(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id));
+    await db
+      .update(toolConnections)
+      .set({
+        credentialPolicy: "per_user",
+        createdByUserId: "board",
+      })
+      .where(eq(toolConnections.id, connection.id));
+
+    await expect(
+      service.checkHealth(connection.id, {
+        actorType: "user",
+        actorId: "board",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        code: "user_authorization_required",
+      }),
+    });
+
+    await expect(service.getConnection(connection.id)).resolves.toMatchObject({
+      healthStatus: "error",
+      healthMessage: "This connection needs the current user's authorization",
+    });
   });
 
   it("reuses and revives an existing application when connecting with applicationId", async () => {

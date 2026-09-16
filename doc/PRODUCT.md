@@ -192,3 +192,20 @@ Chat instructions require selecting a suitable project, reusing an existing one 
 The `create_project` runtime tool uses the normal project API with durable idempotency. `list_projects` and `list_project_repositories` support selection. Multiple `repositoryIds` select authorized catalog entries; multiple HTTPS GitHub `repositoryUrls` register existing repositories absent from the catalog. IDs and URLs may be combined, but cannot accompany an explicit `workspace`. URLs do not create repositories on GitHub or grant credentials. Execution uses normal repository access rules. Repository IDs are revalidated against the authenticated run's responsible user and connection grants. Agents should consider proper available repositories, clarify material ambiguity, and use repository-free projects when appropriate for non-code work.
 
 Confirmed project creation appears as a durable card in the shared task transcript, including selected repository links. Tasks are linked inline. Failed creation never produces a success card. Tool evals cover planning/handoff, project/repository selection, retries, permission and mode denials, and ordinary delegation regressions using the production chat directive.
+
+### In-app announcements
+
+An optional announcement card shares product news with board users on opening
+or returning to Paperclip. Dismissals persist per user across companies and
+browsers within an instance. Operators can disable fetching independently of
+telemetry. See [Announcements](ANNOUNCEMENTS.md).
+
+### Agent chat discovery
+
+With Agent Chat enabled, the Chats sidebar always includes the company's
+earliest-created agent, plus personal starred agents and up to four other recent
+conversations. First use has the same compact rows as returning use. The compose
+icon shares a column with stars and appears on hover or keyboard focus (always on
+touch). It opens a company-wide name/role search, independent of sidebar membership.
+Selecting an agent opens their persistent conversation; it does not reset history
+or create a task until the existing first-write flow requires one.

@@ -1,3 +1,4 @@
+import { hasLiveLegacyController } from "../legacy-controller-lease.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -488,6 +489,13 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // process starts. Known transient preflight failures use dedicated bounded
   // retry paths instead of generic issue continuation recovery.
   "setup_failed",
+  // Setup owns the shared durable retry budget for temporary Git scans.
+  // Generic continuation must not retry permanent failures or reset that budget.
+  "workspace_git_scan_timeout",
+  "workspace_git_scan_saturated",
+  "workspace_git_scan_cancelled",
+  "workspace_git_scan_output_limit",
+  "workspace_git_scan_failed",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -2828,7 +2836,8 @@ export function recoveryService(
       );
   }
 
-  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect) {
+  async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
+    if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
       .select()
       .from(issues)
@@ -2836,6 +2845,7 @@ export function recoveryService(
         and(
           eq(issues.companyId, issue.companyId),
           eq(issues.parentId, issue.id),
+          ...(sameWorkspaceOnly ? [eq(issues.projectWorkspaceId, issue.projectWorkspaceId!)] : []),
           visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
@@ -2847,7 +2857,7 @@ export function recoveryService(
       });
       if (
         childState.hasActiveExecutionPath ||
-        childState.hasDurableWaitingPath
+        (!sameWorkspaceOnly && childState.hasDurableWaitingPath)
       ) {
         openChildren.push({ id: child.id, identifier: child.identifier });
       }
@@ -4995,6 +5005,17 @@ export function recoveryService(
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
 
+        // A child with a live or durable waiting path must get a chance to use
+        // the shared workspace. Repeated automatic parent continuations can
+        // otherwise reacquire it before the child's resource retry is due.
+        // This only gates recovery; explicit messages still follow admission.
+        const workspace = parseObject(parseObject(successfulRun.contextSnapshot).paperclipWorkspace);
+        if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
+          result.productiveContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
           result.skipped += 1;
@@ -5474,7 +5495,9 @@ export function recoveryService(
   // state is auditable. It never overwrites a status that another path already
   // made terminal.
   //
-  // Two independent authorities terminalize the run. Either one is enough:
+  // A live controller lease owns execution and finalization across server
+  // processes. Only after that ownership ends can either authority below
+  // terminalize the run:
   //
   // - Issue-terminal authority: the run's issue already reached a terminal
   //   status (done or cancelled), but the run row is still "running". A healthy
@@ -5511,6 +5534,12 @@ export function recoveryService(
     // Authentication failure does not prove the retained provider stopped.
     // PID observations and task status edits cannot resolve its ownership.
     if (isNativeRunnerOwnershipHeld(run))
+      return { terminalized: false, status: run.status };
+
+    // Another controller may own a sandbox run whose PID has no meaning on
+    // this host. Its live lease owns both execution and finalization, even if
+    // the issue is already terminal or this process has no in-memory handle.
+    if (await hasLiveLegacyController(db, run))
       return { terminalized: false, status: run.status };
 
     const pid = run.processPid ?? null;
@@ -5624,7 +5653,22 @@ export function recoveryService(
         and(
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.runtimeMode, run.runtimeMode),
           nativeRunnerOwnershipNotHeldCondition(),
+          // Recheck ownership in the write: a controller can renew or claim
+          // the run after the liveness read. An old snapshot cannot end a new
+          // controller's run, even if that controller's lease later expires.
+          run.runtimeMode === "legacy"
+            ? and(
+                run.controllerBootId
+                  ? eq(heartbeatRuns.controllerBootId, run.controllerBootId)
+                  : isNull(heartbeatRuns.controllerBootId),
+                or(
+                  isNull(heartbeatRuns.controllerBootId),
+                  sql`${heartbeatRuns.controllerLeaseExpiresAt} <= clock_timestamp()`,
+                ),
+              )
+            : undefined,
         ),
       )
       .returning()
