@@ -205,6 +205,9 @@ import {
 } from "./remote-url-credentials.js";
 import { secretService } from "./secrets.js";
 import { agentmailApi } from "./agentmail-api.js";
+import type { ConfigureRailwaySsh, RailwaySshSetup } from "@paperclipai/shared";
+import { generateRailwaySshKey, RAILWAY_SSH_SECRET_PATH, validateRailwayKnownHosts } from "./railway-ssh.js";
+import { createRailwayClient, discoverRailwayWorkspace, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_TOOLS, RAILWAY_TOOL_PREFIX, railwayRisk, RailwayError } from "./railway.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import {
   readSignedToolArgumentsPayload,
@@ -1185,14 +1188,23 @@ export function projectedConnectionHeaders(
   const app = sourceTemplateKey
     ? getConnectableAppDefinition(sourceTemplateKey)
     : null;
-  if (!app) return {};
-  const method = connectionMethodForConnection(app, connection);
-  return (
-    normalizeConnectionMethodConfig(
+  const headers: Record<string, string> = {};
+  if (app) {
+    const method = connectionMethodForConnection(app, connection);
+    Object.assign(headers, normalizeConnectionMethodConfig(
       method,
       asRecord(connection.config.methodConfig),
-    ).headers ?? {}
-  );
+    ).headers);
+  }
+  if (
+    connection.transport === "mcp_remote" &&
+    (sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github")
+  ) {
+    // GitHub excludes Actions from its default catalog. Project this on every
+    // discovery and invocation so existing connections gain the toolset too.
+    headers["X-MCP-Toolsets"] = "default,actions";
+  }
+  return headers;
 }
 
 function mergeManagedToolArguments(
@@ -2312,6 +2324,10 @@ export function classifyRisk(
   if (annotations.destructiveHint === true || annotations.destructive === true)
     return "destructive";
   const normalizedToolName = normalizedProviderToolName(tool.name);
+  if (sourceTemplateKey === "railway") {
+    const reviewed = railwayRisk(normalizedToolName);
+    return reviewed === "read" && (annotations.readOnlyHint === false || annotations.writeHint === true) ? "write" : reviewed;
+  }
   if (sourceTemplateKey === "posthog" && normalizedToolName === "exec")
     return "destructive";
   if (
@@ -5453,7 +5469,9 @@ export function toolAccessService(
       const [updated] = await dbClient
         .update(connectionGrants)
         .set({
-          credentialSecretRefs: connection.credentialSecretRefs,
+          credentialSecretRefs: isRailwayConnection(connection)
+            ? [...connection.credentialSecretRefs, ...existing.credentialSecretRefs.filter((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH && !connection.credentialSecretRefs.some((candidate) => candidate.configPath === ref.configPath))]
+            : connection.credentialSecretRefs,
           status: "active",
           revokedAt: null,
           revokedByAgentId: null,
@@ -6947,9 +6965,34 @@ export function toolAccessService(
       : Array.isArray(payloadTools)
         ? payloadTools
         : [];
-    return tools
+    const descriptors = tools
       .map((tool) => normalizeToolDescriptor(tool))
       .filter((tool): tool is McpToolDescriptor => Boolean(tool));
+    if (!isRailwayConnection(connection)) return descriptors;
+    if (descriptors.some((tool) => normalizeRailwayToolName(tool.name).startsWith(RAILWAY_TOOL_PREFIX))) {
+      throw unprocessable("Railway advertised a reserved Paperclip action name. Refresh is blocked pending review.", { code: "railway_tool_name_collision" });
+    }
+    let apiStatus = "available";
+    let apiMessage = "Direct Railway service, log, and deployment tools are available.";
+    try {
+      const railwayOptions = {
+        authorization: headers.Authorization ?? "",
+        request: (url: string, init: RequestInit) => requestRemoteHttpEndpoint(new URL(url), init),
+        signal: AbortSignal.timeout(15_000),
+      };
+      const workspaceId = await discoverRailwayWorkspace(railwayOptions);
+      await createRailwayClient(railwayOptions).probe(workspaceId);
+    } catch (error) {
+      apiStatus = "unavailable";
+      apiMessage = error instanceof RailwayError ? error.message : "Railway API access could not be verified. Refresh actions or reconnect Railway.";
+    }
+    // API interoperability is verified with the actual credential; the presence
+    // of an OAuth token alone never enables the additional capability surface.
+    const nextConfig = { ...connection.config, railwayApiStatus: apiStatus, railwayApiMessage: apiMessage };
+    await db.update(toolConnections).set({ config: nextConfig, transportConfig: nextConfig, updatedAt: now() }).where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)));
+    connection.config = nextConfig;
+    connection.transportConfig = nextConfig;
+    return apiStatus === "available" ? [...descriptors, ...RAILWAY_TOOLS] : descriptors;
   }
 
   async function localTools(
@@ -7729,6 +7772,15 @@ export function toolAccessService(
     const existingByName = new Map(
       existingRows.map((entry) => [entry.toolName, entry]),
     );
+    // Retired native actions are absent from discovery, but old catalog rows
+    // still need to show as disabled. Gateway denial also applies before refresh.
+    const blockedRailwayEntryIds = isRailwayEndpoint(connection.config.url)
+      ? existingRows.filter((entry) => isRailwayToolBlocked(entry.toolName)).map((entry) => entry.id)
+      : [];
+    if (blockedRailwayEntryIds.length > 0) {
+      await db.update(toolCatalogEntries).set({ status: "disabled", updatedAt: refreshedAt })
+        .where(and(eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, blockedRailwayEntryIds)));
+    }
     const updatedEntries: ToolCatalogEntry[] = [];
     let quarantinedCount = 0;
     const sourceTemplateKey =
@@ -7755,14 +7807,15 @@ export function toolAccessService(
         ? googleProfileValue
         : null;
     const quarantineOnRefresh =
-      !refreshOptions.enableAllByDefault &&
+      (!refreshOptions.enableAllByDefault || (isRailwayEndpoint(connection.config.url) && existingRows.length > 0)) &&
       shouldQuarantineNewEntries(connection) &&
       (connection.status === "active" ||
+        (isRailwayEndpoint(connection.config.url) && existingRows.length > 0) ||
         sourceTemplateKey === "posthog" ||
         refreshOptions.quarantineManagedOAuthDraft === true);
     const safeDefault = asRecord(connection.config).safeDefault === true;
     for (const descriptor of descriptors) {
-      const riskLevel = classifyRisk(descriptor, sourceTemplateKey);
+      const riskLevel = classifyRisk(descriptor, isRailwayEndpoint(connection.config.url) ? "railway" : sourceTemplateKey);
       const hash = descriptorHash(descriptor, riskLevel);
       const schemaHash = stableHash(descriptor.inputSchema ?? {});
       const existing = existingByName.get(descriptor.name);
@@ -7774,11 +7827,11 @@ export function toolAccessService(
         (!existing || changed) &&
         existing?.status !== "disabled" &&
         (!safeDefault || riskLevel !== "read");
-      const googlePermanentlyBlocked = Boolean(
+      const providerPermanentlyBlocked = Boolean(
         googleProfile &&
         !isGoogleWorkspaceToolAllowed(googleProfile, descriptor),
-      );
-      const status = googlePermanentlyBlocked
+      ) || (isRailwayEndpoint(connection.config.url) && isRailwayToolBlocked(descriptor.name));
+      const status = providerPermanentlyBlocked
         ? "disabled"
         : shouldQuarantine
           ? "quarantined"
@@ -7787,7 +7840,7 @@ export function toolAccessService(
             : quarantineOnRefresh && existing?.status === "quarantined"
               ? "quarantined"
               : "active";
-      if (shouldQuarantine && !googlePermanentlyBlocked) quarantinedCount += 1;
+      if (shouldQuarantine && !providerPermanentlyBlocked) quarantinedCount += 1;
 
       if (existing) {
         const [updated] = await db
@@ -7853,10 +7906,14 @@ export function toolAccessService(
       }
     }
 
-    const normalizedConfig = refreshOptions.enableAllByDefault
+    const normalizedConfig = isRailwayEndpoint(connection.config.url)
+      ? { ...connection.config, quarantineNewEntries: true }
+      : refreshOptions.enableAllByDefault
       ? { ...connection.config, quarantineNewEntries: false }
       : connection.config;
-    const normalizedTransportConfig = refreshOptions.enableAllByDefault
+    const normalizedTransportConfig = isRailwayEndpoint(connection.config.url)
+      ? { ...connection.transportConfig, quarantineNewEntries: true }
+      : refreshOptions.enableAllByDefault
       ? { ...connection.transportConfig, quarantineNewEntries: false }
       : connection.transportConfig;
     const [updatedConnection] = await db
@@ -9032,7 +9089,7 @@ export function toolAccessService(
   function oauthSecretRef(
     connection: typeof toolConnections.$inferSelect,
     configPath:
-      "oauth.access_token" | "oauth.refresh_token" | "oauth.client_secret",
+      "oauth.access_token" | "oauth.refresh_token" | "oauth.client_secret" | "railway.ssh_private_key",
   ) {
     return (
       connection.credentialSecretRefs.find(
@@ -9471,7 +9528,7 @@ export function toolAccessService(
       companyId: string;
       connection: typeof toolConnections.$inferSelect;
       configPath:
-        "oauth.access_token" | "oauth.refresh_token" | "oauth.client_secret";
+        "oauth.access_token" | "oauth.refresh_token" | "oauth.client_secret" | "railway.ssh_private_key";
       label: string;
       value: string;
       actor?: ActorInfo;
@@ -12658,7 +12715,7 @@ export function toolAccessService(
           // Grant-backed setup keeps the full discovered catalog selectable;
           // the wizard projects the app's action defaults into policies at
           // finish time instead of using catalog quarantine as access state.
-          quarantineNewEntries: false,
+          quarantineNewEntries: galleryEntry.slug === "railway",
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
@@ -18563,6 +18620,42 @@ export function toolAccessService(
     checkHealth: checkConnectionHealth,
 
     refreshCatalog,
+
+    configureRailwaySsh: async (connectionId: string, companyId: string, input: ConfigureRailwaySsh, actor: ActorInfo): Promise<RailwaySshSetup | null> => {
+      const knownHosts = input.action === "enable" ? validateRailwayKnownHosts(input.knownHosts) : "";
+      const setup = await db.transaction(async (tx) => {
+        const [connection] = await tx.select().from(toolConnections).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId))).for("update");
+        if (!connection || !isRailwayConnection(connection) || (connection.status !== "active" && input.action !== "remove")) throw unprocessable("Connect Railway before configuring container access.");
+        const [grant] = await tx.select().from(connectionGrants).where(and(eq(connectionGrants.id, input.grantId), eq(connectionGrants.connectionId, connectionId), eq(connectionGrants.companyId, companyId))).for("update");
+        if (!grant || (grant.status !== "active" && input.action !== "remove")) throw unprocessable("Select an active Railway authorization.");
+        if (grant.kind === "user" && (actor.actorType !== "user" || actor.actorId !== grant.subjectUserId)) throw forbidden("Only this authorization's owner can configure its SSH key.");
+        const existing = asRecord(connection.config.railwaySsh);
+        if (existing.grantId && existing.grantId !== grant.id) throw conflict("Remove the existing container key before choosing another authorization.");
+        const currentRef = grant.credentialSecretRefs.find((ref) => ref.configPath === RAILWAY_SSH_SECRET_PATH);
+        let next: RailwaySshSetup | null = null;
+        let refs = grant.credentialSecretRefs;
+        if (input.action === "remove") {
+          if (currentRef) await secretService(tx).remove(currentRef.secretId);
+          refs = refs.filter((ref) => ref.configPath !== RAILWAY_SSH_SECRET_PATH);
+        } else if (input.action === "prepare") {
+          if (currentRef && typeof existing.publicKey === "string") return existing as unknown as RailwaySshSetup;
+          const key = await generateRailwaySshKey();
+          const ref = await createOrRotateOAuthSecret({ companyId, connection, configPath: RAILWAY_SSH_SECRET_PATH, label: "Railway container SSH key", value: key.privateKey, existingRefs: [], ownerUserId: grant.kind === "user" ? grant.subjectUserId ?? undefined : undefined, actor }, { dbClient: tx, secretClient: secretService(tx) });
+          refs = [...refs.filter((ref) => ref.configPath !== RAILWAY_SSH_SECRET_PATH), ref];
+          next = { grantId: grant.id, publicKey: key.publicKey, knownHosts: "", enabled: false };
+        } else {
+          if (!currentRef || typeof existing.publicKey !== "string") throw unprocessable("Generate and register a container key first.");
+          next = { grantId: grant.id, publicKey: existing.publicKey, knownHosts, enabled: true };
+        }
+        await tx.update(connectionGrants).set({ credentialSecretRefs: refs, updatedAt: now() }).where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.companyId, companyId)));
+        const config = { ...connection.config, railwaySsh: next };
+        const [updated] = await tx.update(toolConnections).set({ config, transportConfig: config, updatedAt: now() }).where(and(eq(toolConnections.id, connectionId), eq(toolConnections.companyId, companyId))).returning();
+        await syncCredentialBindings(updated, [], tx);
+        return next;
+      });
+      await audit({ companyId, connectionId, action: "tool_connection.railway_ssh_updated", outcome: "success", actor, details: { action: input.action, grantId: input.grantId, enabled: setup?.enabled ?? false } });
+      return setup;
+    },
 
     listAppsNeedingAttention,
 

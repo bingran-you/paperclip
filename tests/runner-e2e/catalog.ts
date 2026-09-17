@@ -1,4 +1,6 @@
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
+
+import { firstTaskTasks } from "./first-task-cases.js";
 import { chatTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
@@ -33,6 +35,7 @@ const SELECTABLE_GROUPS = [
   "core",
   "breadth",
   "chat",
+  "onboarding",
 ] as const;
 const SAMPLE_UUID = "11111111-1111-4111-8111-111111111111";
 
@@ -893,11 +896,19 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     id: "everyday-workflows", label: "Everyday Paperclip Work", manualOnly: true,
     description: "Real user requests, useful downloaded work, and durable continuation using production instructions.",
     groups: ["native"], profiles: everydayProfiles, environments: [localEnvironment, daytonaWarmEnvironment],
-    tasks: everydayTasks, expectedMatrixSize: 30,
+    tasks: everydayTasks, expectedMatrixSize: 35,
     excludedExecutionIds: [...everydayProfiles.flatMap(profile => everydayTasks
-      .filter(task => !["build-revise", "delegate-feedback", "recover-controller"].includes(task.id))
+      .filter(task => !["build-revise", "delegate-feedback", "recover-controller", "create-skill-studio"].includes(task.id))
       .map(task => `everyday-workflows.${profile.id}.daytona.${task.id}`))],
     definitionMetadata: { version: 3, instructions: "production", grading: "outcome-and-invariants", scheduling: "explicit-only" },
+  },
+  {
+    id: "first-task", label: "First-task onboarding",
+    description: "Production onboarding, first replies, approval, and durable task execution.",
+    groups: ["onboarding"],
+    profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)),
+    environments: [localEnvironment], tasks: firstTaskTasks, expectedMatrixSize: 52,
+    definitionMetadata: { version: 3, credentialPersistenceCheck: false, questionChoiceMinimum: 2, nativeSetup: "post-onboarding-runtime-switch", productionInstructions: true, qualityGrading: "informational" },
   },
   {
     id: "agent-chat", label: "Persistent Agent Chat",

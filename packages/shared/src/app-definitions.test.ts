@@ -9,6 +9,7 @@ import {
   CONNECTABLE_APP_DEFINITIONS,
   appSupportsCatalogSetup,
   getAvailableConnectionMethod,
+  getAppDefinitionForUrl,
   getRecommendedConnectionMethod,
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
@@ -686,7 +687,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(46);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(47);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -972,5 +973,17 @@ describe("AppDefinition catalog", () => {
           if (field.required && field.type !== "checkbox")
             expect(field.placeholder).toBeTruthy();
       }
+  });
+});
+
+
+describe("Railway provider", () => {
+  it("matches only the hosted endpoint and exposes one vault-backed OAuth method", () => {
+    const app = APP_STORE_DEFINITIONS.find((entry) => entry.slug === "railway")!;
+    expect(getAppDefinitionForUrl("https://mcp.railway.com")?.slug).toBe("railway");
+    for (const url of ["https://mcp.railway.com/path", "https://mcp.railway.com.evil.test", "http://mcp.railway.com"]) expect(getAppDefinitionForUrl(url)?.slug).not.toBe("railway");
+    expect(app.methods).toHaveLength(1);
+    expect(app.methods[0]).toMatchObject({ key: "mcp-oauth", auth: "oauth", transport: "mcp_remote", ownershipModes: ["dcr", "customer"], riskTier: "S4", defaults: { serverUrl: "https://mcp.railway.com", scopesHint: ["openid", "offline_access", "workspace:member"], oauthAuthorizationParams: { prompt: "consent" } } });
+    expect(JSON.stringify(app.methods)).toContain("Live Railway qualification is pending");
   });
 });
