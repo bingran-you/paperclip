@@ -791,7 +791,7 @@ for (const execution of executions) {
 
       if (execution.task.flow === "continuation") {
         const continuation = await runContinuationFlow({
-          page, api, fixtures, execution, nonce, workspacePath, deadlineAt: startedAtMs + deadlineMs - 60_000,
+          page, api, fixtures, execution, nonce, secrets, workspacePath, deadlineAt: startedAtMs + deadlineMs - 60_000,
           restart: () => restartIsolatedPaperclipServer({ api, requestId: `continuation-${nonce}`, deadlineAt: startedAtMs + deadlineMs }),
           observe: (currentIssue, currentRuns, checks) => {
             issue = currentIssue; selectedRuns = currentRuns;
@@ -814,7 +814,7 @@ for (const execution of executions) {
         matcherResults = story.evidence.checks.map(check => ({ matcher: { kind: "json_path" as const, path: check.id, expected: true }, passed: check.passed, detail: check.detail }));
       } else if (execution.task.flow === "agent_chat") {
         const chat = await runChatFlow({
-          page, api, fixtures, execution, nonce,
+          page, api, fixtures, execution, nonce, workspacePath,
           restart: () => restartIsolatedPaperclipServer({ api, requestId: `chat-${nonce}`, deadlineAt: startedAtMs + deadlineMs }),
           observe: (chatIssue, chatRuns) => { issue = chatIssue; selectedRuns = chatRuns; },
           capture: captureScreenshot,

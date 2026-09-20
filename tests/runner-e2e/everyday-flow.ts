@@ -18,10 +18,13 @@ import {
   StoryDecisionError,
   type StoryInteraction,
 } from "./everyday-decisions.js";
-import { LATE_REQUIREMENT, SLUGIFY_REVISION } from "./everyday-cases.js";
+import { LATE_REQUIREMENT, SLUGIFY_REVISION, requiresEverydayArtifactOracle } from "./everyday-cases.js";
 import {
   isActiveStoryRun,
   isStoryWorkspaceDeferral,
+  isExpectedStoryInterruption,
+  storyUnexpectedRunFailure,
+  storyUnexercisedReviewBoundary,
   storyLifecycleChecks,
   storyRepliesConsumed,
   storyHasAgentReply,
@@ -304,11 +307,7 @@ export async function runEverydayFlow(input: Input) {
           )),
       reject: (state) => {
         if (state.runs.length > 12) return "bounded execution count exceeded";
-        const bad = state.runs.find(
-          (r) =>
-            ["failed", "timed_out"].includes(r.status) &&
-            !ev.allowedInterruptedRuns.includes(r.id),
-        );
+        const bad = storyUnexpectedRunFailure(state.runs, ev.allowedInterruptedRuns);
         if (bad)
           return `native execution failed ${bad.errorCode ?? ""}: ${bad.error ?? bad.status}`;
         if (
@@ -502,11 +501,8 @@ export async function runEverydayFlow(input: Input) {
     await mkdir(path.join(input.privateDir, "snapshots"), { recursive: true });
     const revision = await runCommand("git", ["rev-parse", "HEAD"]);
     if (revision.code === 0) ev.sourceRevision = revision.stdout.trim();
-    const version = await runCommand(
-      execution.profile.provider === "acpx" ? "claude" : "codex",
-      ["--version"],
-    );
-    if (version.code === 0) ev.providerVersion = version.stdout.trim();
+    // Native providers run the packaged runtime (possibly remotely). A host
+    // `claude`/`codex` binary is neither required nor its observed version.
     const harnessFiles = [
       "everyday-flow.ts",
       "everyday-cases.ts",
@@ -536,7 +532,7 @@ export async function runEverydayFlow(input: Input) {
           .join("\n"),
       )
       .digest("hex");
-    if (!caseId.startsWith("service-") && !decliningConnection) {
+    if (requiresEverydayArtifactOracle(caseId)) {
       try {
         const sandbox = await runCommand(process.env.PYTHON ?? "python3", [
           path.join(import.meta.dirname, "everyday-artifact.py"), "--preflight",
@@ -698,7 +694,7 @@ export async function runEverydayFlow(input: Input) {
           );
           return failed
             ? `Review handoff prerequisite failed: ${failed.errorCode}: ${failed.error}`
-            : undefined;
+            : storyUnexercisedReviewBoundary(state.issues, state.runs, parent!.id, fixtures.agent.id);
         },
       });
       const child = boundary.issues.find((issue) => issue.parentId === parent!.id)!;
@@ -1390,7 +1386,7 @@ export async function runEverydayFlow(input: Input) {
         .filter(
           (r) =>
             !isStoryWorkspaceDeferral(r) &&
-            !ev.allowedInterruptedRuns.includes(r.id),
+            !isExpectedStoryInterruption(r, ev.allowedInterruptedRuns),
         )
         .every(
           (r) =>

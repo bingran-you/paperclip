@@ -1,14 +1,15 @@
+import { publicChatTaskUrl } from "./chat-task-url.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -3649,6 +3650,7 @@ interface WakeupOptions {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -6462,6 +6464,7 @@ function buildSessionConfigCategoryValues(input: {
 export async function buildEffectiveRunSessionConfigMetadata(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
+  managedAiHome?: string;
   agentRuntimeConfig: unknown;
   issueOverrides: unknown;
   workspaceConfig: unknown;
@@ -6479,7 +6482,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   );
   const categoryValues = buildSessionConfigCategoryValues({
     adapterType: input.adapterType,
-    effectiveAdapterConfig: input.effectiveAdapterConfig,
+    effectiveAdapterConfig: managedAiSessionFingerprintConfig(input.effectiveAdapterConfig, input.managedAiHome),
     agentRuntimeConfig: input.agentRuntimeConfig,
     instructions,
     issueOverrides: input.issueOverrides,
@@ -8582,6 +8585,21 @@ export function buildPaperclipTaskMarkdown(input: {
     (count, comment) => count + (comment.attachments?.length ?? 0),
     0,
   );
+  if (input.externalChatProvider && issue) {
+    const taskUrl = publicChatTaskUrl(issue.id);
+    lines.push(
+      "",
+      "Paperclip task link (server-provided):",
+      ...(taskUrl
+        ? [
+            `- Public task URL: ${taskUrl}`,
+            "When asked for this task's link, use this exact URL. Do not construct a URL from task IDs, localhost, an API address, or a sandbox address. Opening it still requires Paperclip access.",
+          ]
+        : [
+            "No public task URL is configured. If asked for a link, explain that a public Paperclip URL must be configured; do not invent a URL or expose an internal API or sandbox address.",
+          ]),
+    );
+  }
   if (input.externalChatProvider && input.nativeRunner) {
     lines.push(
       "",
@@ -8735,7 +8753,7 @@ export function buildPaperclipTaskMarkdown(input: {
     lines.push(
       "",
       "Follow-up directive:",
-      "The latest wake comment is the immediate request for this run. Address it directly. Do not repeat an earlier requested output from the issue description unless the latest comment asks you to.",
+      "Apply the latest wake comment to the current task. Later direction replaces conflicting scope; preserve other requirements and approval gates. Clarification is not approval. Reuse completed work rather than repeating it.",
       "",
       "Latest wake comment:",
       fenceTaskText(effectiveWakeComments[0]!.body),
@@ -8745,7 +8763,7 @@ export function buildPaperclipTaskMarkdown(input: {
     lines.push(
       "",
       "Follow-up directive:",
-      "The pending wake comments below are the immediate requests for this run. Address every comment in order. You may answer them together, but do not silently omit any comment.",
+      "Apply the pending wake comments in order to the current task. Later direction replaces conflicting scope; preserve other requirements and approval gates. Clarification is not approval. Address every comment without repeating completed work.",
       "",
       "Pending wake comments (oldest to newest):",
     );
@@ -12848,7 +12866,7 @@ export function heartbeatService(
 
     // Teardown can beat the cancellation finalizer. Preserve the acknowledged
     // user intent instead of reporting an infrastructure interruption.
-    if (hasAcknowledgedNativeStopIntent(run)) terminalStatus = "cancelled";
+    if (hasAcknowledgedNativeStopIntent(run) || hasAcknowledgedNativeReassignmentStopIntent(run)) terminalStatus = "cancelled";
 
     const message = `run terminalized on environment lease release: heartbeat_runs.status was still ${run.status} at teardown`;
     // Match both "running" and "queued". A queued run has released its lease but
@@ -14839,6 +14857,7 @@ export function heartbeatService(
     const claims = dispositions.filter(
       (disposition): disposition is NativeRestartRecoveryClaim =>
         disposition.kind === "reattach_existing_runner" ||
+        disposition.kind === "reattach_remote_runner" ||
         disposition.kind === "resume_dead_runner" ||
         disposition.kind === "bootstrap_incomplete",
     );
@@ -14847,6 +14866,7 @@ export function heartbeatService(
       if (run) {
         const isClaim =
           disposition.kind === "reattach_existing_runner" ||
+          disposition.kind === "reattach_remote_runner" ||
           disposition.kind === "resume_dead_runner" ||
           disposition.kind === "bootstrap_incomplete";
         await appendRunEvent(run, {
@@ -14854,7 +14874,8 @@ export function heartbeatService(
           stream: "system",
           level: disposition.kind === "blocked" ? "warn" : "info",
           message:
-            disposition.kind === "reattach_existing_runner"
+            disposition.kind === "reattach_existing_runner" ||
+            disposition.kind === "reattach_remote_runner"
               ? "Recovering the existing native runner process after server restart"
               : disposition.kind === "resume_dead_runner"
                 ? "Resuming the durable native provider session after runner process loss"
@@ -17129,6 +17150,23 @@ export function heartbeatService(
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    if (issueId && activeRunExecutions.size > 0) {
+      // Native finalization publishes success before workspace synchronization,
+      // provider suspension, and lease release finish. A queued comment must
+      // not acquire a fresh sandbox while its predecessor still owns that work.
+      // The executor's finally block retries this agent after removing its owner.
+      const [settlingOwner] = await db.select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.runtimeMode, "native"),
+          inArray(heartbeatRuns.id, [...activeRunExecutions]),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        ))
+        .limit(1);
+      if (settlingOwner) return null;
+    }
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         run.companyId,
@@ -19903,7 +19941,8 @@ export function heartbeatService(
     if (
       runOptions.nativeLeaseOwner &&
       run.runtimeMode === "native" &&
-      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner"
+      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner" &&
+      runOptions.nativeRestartRecovery?.kind !== "reattach_remote_runner"
     ) {
       // A numeric PID or process-group ID is a liveness signal, never an
       // ownership capability: the OS may have recycled it after the service
@@ -20302,6 +20341,14 @@ export function heartbeatService(
             .select({
               id: projects.id,
               executionWorkspacePolicy: projects.executionWorkspacePolicy,
+              hasWorkspace: exists(
+                db.select({ id: projectWorkspaces.id })
+                  .from(projectWorkspaces)
+                  .where(and(
+                    eq(projectWorkspaces.projectId, projects.id),
+                    eq(projectWorkspaces.companyId, agent.companyId),
+                  )),
+              ).mapWith(Boolean),
               env: projects.env,
               updatedAt: projects.updatedAt,
             })
@@ -20433,10 +20480,9 @@ export function heartbeatService(
             isolatedWorkspacesEnabled,
           ),
           defaultIsolatedWorkspacesEnabled,
-          // A resolved project row, not the issue's raw `projectId`: the
-          // substituted policy must only reach a task whose repository the
-          // worktree can actually be cut from.
-          hasProject: Boolean(projectContext),
+          // Projects without workspace configuration get a plain managed
+          // directory. The operator default cannot turn it into a worktree.
+          hasProjectWorkspace: projectContext?.hasWorkspace ?? false,
         });
       const retainedTrust = await resolveAndRetainRunTrustPreset(db, {
         companyId: agent.companyId,
@@ -21204,6 +21250,7 @@ export function heartbeatService(
         await buildEffectiveRunSessionConfigMetadata({
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
+          managedAiHome: managedAiRuntime?.home,
           agentRuntimeConfig: agent.runtimeConfig,
           issueOverrides: issueAssigneeOverrides,
           workspaceConfig: {
@@ -21635,6 +21682,11 @@ export function heartbeatService(
         selectedEnvironmentForConfig?.driver === "sandbox" &&
         selectedEnvironmentConfigForFingerprint.reuseLease === true &&
         selectedEnvironmentConfigForFingerprint.runnerLifecycleMode === "warm";
+      // Native provider checkpoints bind to the workspace row, including ordinary
+      // local shared workspaces. Persist that binding independently of the opt-in
+      // isolated-workspace UI, just as warm sandbox continuity already does.
+      const nativeSharedWorkspace = agent.adapterType === "paperclip_runner" &&
+        requestedExecutionWorkspaceMode === "shared_workspace";
       const bindIssueToPersistedExecutionWorkspace = async (
         workspace: ExecutionWorkspace | null,
       ) => {
@@ -21648,7 +21700,7 @@ export function heartbeatService(
           issueRef?.executionWorkspacePreference === "reuse_existing" ||
           requestedExecutionWorkspaceMode === "isolated_workspace" ||
           requestedExecutionWorkspaceMode === "operator_branch" ||
-          warmReusableExecutionWorkspace;
+          warmReusableExecutionWorkspace || nativeSharedWorkspace;
         const nextIssuePatch: Record<string, unknown> = {};
         if (issueExecutionWorkspaceIdForRun !== workspace.id) {
           nextIssuePatch.executionWorkspaceId = workspace.id;
@@ -21677,7 +21729,7 @@ export function heartbeatService(
             db,
             undefined,
             undefined,
-            { bindRuntimeSharedWorkspace: warmReusableExecutionWorkspace && workspace.mode === "shared_workspace" },
+            { bindRuntimeSharedWorkspace: (warmReusableExecutionWorkspace || nativeSharedWorkspace) && workspace.mode === "shared_workspace" },
           );
           issueExecutionWorkspaceIdForRun = workspace.id;
           issueProjectWorkspaceIdForRun =
@@ -22900,6 +22952,13 @@ export function heartbeatService(
                 .limit(1)
                 .then((rows) => rows[0] ?? null)
             : null;
+          // Only a server-verified human resolution may supply a current answer
+          // reference. Tool/agent results and generated summaries stay evidence.
+          const currentHumanResponseId = !nativeReviewRequest
+            ? executionContinuation?.humanResponses?.find(
+                (response) => response.id === executionContinuation.trigger.interactionId,
+              )?.id
+            : undefined;
           // Rebuilding a default contract is not a change in user direction.
           // In particular, an upgraded checkpoint may have an intentionally
           // authored contract and no continuation envelope yet.
@@ -22915,9 +22974,10 @@ export function heartbeatService(
                   issue: issueRef,
                   actorId: agent.id,
                   immediateRequest:
-                    nativeReviewRequest ?? executionContinuation?.objective ??
-                    safeWakeCommentContext?.body ??
-                    null,
+                    nativeReviewRequest ?? (currentHumanResponseId
+                      ? null
+                      : executionContinuation?.objective ?? safeWakeCommentContext?.body ?? null),
+                  humanResponseId: currentHumanResponseId,
                   immediateRequests: (() => {
                     if (nativeReviewRequest) return [nativeReviewRequest];
                     const requests = nativeCompletionRequestsForComments(
@@ -23279,7 +23339,7 @@ export function heartbeatService(
                     taskPrompt: [
                       nativeReviewRequest ?? readNonEmptyString(
                         selectPaperclipTaskMarkdown(context, {
-                          resumedSession,
+                          resumedSession: false,
                         }),
                       ) ??
                       `# ${issueRef.identifier ?? issueRef.id}: ${issueRef.title}`,
@@ -23289,6 +23349,18 @@ export function heartbeatService(
                     ].filter(Boolean).join("\n\n"),
                     wakePayload: context.paperclipWake,
                     resumedSession,
+                    previousTurn: (() => {
+                      if (!previousNativeRun || nativeReviewRequest) return null;
+                      try {
+                        return {
+                          runId: previousNativeRun.id,
+                          task: parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput).task,
+                        };
+                      } catch {
+                        // An invalid prior snapshot must use the fresh bootstrap.
+                        return null;
+                      }
+                    })(),
                     conversationMode: context.conversationMode === true,
                     agentId: agent.id,
                     workspace: {
@@ -24040,6 +24112,21 @@ export function heartbeatService(
                       runnerRemoteProviderPackPath:
                         runtimeEnv.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim() ||
                         null,
+                      stopTaskForReassignment: async (target) => {
+                        await settleLiveRunnerGoalBeforeInterrupt(db, target);
+                        if (!target.runId) return;
+                        const prior = await getRun(target.runId);
+                        if (!prior || prior.companyId !== target.companyId || prior.agentId !== target.agentId) {
+                          throw conflict("Reassignment run binding changed");
+                        }
+                        const stopped = await cancelRunInternal(target.runId, "Cancelled for task reassignment", {
+                          errorCode: "issue_reassigned", suppressImmediateRecovery: true,
+                          resultJson: { reassignmentStopConfirmed: true },
+                        });
+                        if (stopped && ["running", "queued", "scheduled_retry"].includes(stopped.status)) {
+                          throw conflict("The previous run did not stop; reassignment was not applied");
+                        }
+                      },
                       enqueueWakeup,
                       onSpawn: async (meta) => {
                         markDispatchStarted();
@@ -26685,6 +26772,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              statusVersion: issues.statusVersion,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -26910,7 +26998,8 @@ export function heartbeatService(
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
@@ -28565,7 +28654,11 @@ export function heartbeatService(
     // additional durable fence before its existing cancellation path.
     if (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control)) {
       const [fenced] = await db.update(heartbeatRuns).set({
+        // Record handoff intent before native cancellation can finalize and release
+        // the run. Only its audited stop acknowledgement suppresses recovery.
         resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+          ${JSON.stringify(options.errorCode === "issue_reassigned" && options.resultJson?.reassignmentStopConfirmed === true
+            ? { reassignmentStopRequested: true } : {})}::jsonb ||
           jsonb_build_object('startupCancellation', jsonb_build_object(
             'requestedAt', ${new Date().toISOString()}::text,
             'beforeNativeSelection', ${heartbeatRuns.runtimeMode} = 'legacy'
