@@ -43,6 +43,7 @@ import {
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
+  isTaskSessionCredentialCompatible,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
   buildAnchorFallbackWorkspaceNotes,
@@ -2082,7 +2083,7 @@ describe("shouldResetTaskSessionForModelChange", () => {
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: {
           sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
+        __paperclipConfiguredModel: "gpt-5.4-mini",
         },
       }),
     ).toBe(false);
@@ -2619,6 +2620,7 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       stripPaperclipSessionMetadataFromSessionParams({
         sessionId: "thread-1",
         cwd: "/tmp/project",
+        paperclipAiCredentialIdentity: "grant:user:generation",
         __paperclipConfiguredModel: "gpt-5.4-mini",
         __paperclipConfigFingerprint: "v1:sha256:abc",
         __paperclipConfigFingerprintVersion: 1,
@@ -2629,6 +2631,30 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       sessionId: "thread-1",
       cwd: "/tmp/project",
     });
+  });
+});
+
+describe("isTaskSessionCredentialCompatible", () => {
+  it("retains the server-owned identity even when the Codex codec drops it", () => {
+    const saved = { sessionId: "thread-1", paperclipAiCredentialIdentity: "grant:user:generation" };
+    const decoded = codexSessionCodec.deserialize(saved);
+    expect(decoded).toEqual({ sessionId: "thread-1" });
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { paperclipAiCredentialIdentity: "other-grant:user:generation" },
+    { paperclipAiCredentialIdentity: "grant:other-user:generation" },
+    { paperclipAiCredentialIdentity: "grant:user:new-generation" },
+  ])("requires the same saved grant, responsible user, and credential generation: %j", (saved) => {
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(false);
+  });
+
+  it("preserves unmanaged session behavior", () => {
+    expect(isTaskSessionCredentialCompatible({ sessionId: "thread-1" }, undefined)).toBe(true);
   });
 });
 

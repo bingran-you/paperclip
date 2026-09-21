@@ -1,3 +1,4 @@
+import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
@@ -368,6 +369,7 @@ function clearNativeRuntimeRequestResolutions(runId: string): void {
 }
 
 type WarmNativeSession = {
+  managedAiCredentialIdentity?: string;
   credentialRunId?: string;
   githubAuthenticationMode?: string;
   networkAccess: boolean;
@@ -6933,6 +6935,7 @@ export async function executePaperclipNativeSession(input: {
   runnerEnvironment?: NodeJS.ProcessEnv;
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
+  managedAiCredentialIdentity?: string;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */
   runnerIngressAuthorized?: boolean;
@@ -7771,6 +7774,7 @@ async function executePaperclipNativeSessionWithinScope(
     `native-warm-session:${input.execution.binding.runId}`,
   );
   let existingWarmSession: NativeSession | undefined;
+  let managedCredentialSession: NativeSession | undefined;
   let persistedWarmSession: PersistedNativeSession | null | undefined;
   if (warmSessionId !== null && warmConfigDigest !== null) {
     const entry = warmNativeSessions.get(warmSessionId);
@@ -7786,6 +7790,7 @@ async function executePaperclipNativeSessionWithinScope(
           entry.credentialRunId !== input.execution.binding.runId);
       if (
         entry.configDigest !== warmConfigDigest ||
+        entry.managedAiCredentialIdentity !== input.managedAiCredentialIdentity ||
         credentialRunChanged ||
         entry.githubAuthenticationMode !==
           input.runnerEnvironment?.PAPERCLIP_GITHUB_AUTH_MODE ||
@@ -8087,6 +8092,9 @@ async function executePaperclipNativeSessionWithinScope(
               );
             },
             onSession: async (session) => {
+              if (session && input.managedAiCredentialHome) {
+                managedCredentialSession = runnerdBackend?.bindManagedSession(session) ?? session;
+              }
               releaseRegisteredGoalController();
               liveQuestions.close();
               if (session?.goal) {
@@ -8117,6 +8125,7 @@ async function executePaperclipNativeSessionWithinScope(
                   existing.session = session;
                 } else
                   warmNativeSessions.set(warmSessionId, {
+                    managedAiCredentialIdentity: input.managedAiCredentialIdentity,
                     githubAuthenticationMode:
                       input.runnerEnvironment?.PAPERCLIP_GITHUB_AUTH_MODE,
                     networkAccess:
@@ -8175,6 +8184,16 @@ async function executePaperclipNativeSessionWithinScope(
       },
       { parentName: "task.run" },
     );
+    try {
+      await completeManagedNativeCredentialTurn(managedCredentialSession);
+    } catch {
+      // A durable result remains successful if optional credential refresh
+      // fails. Retire this owner so it cannot keep stale auth on a warm turn.
+      if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+        await releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken, lifecyclePolicy.idleTimeoutMs, true);
+      }
+      await input.onLog?.("stderr", "[paperclip-runner] managed credential refresh failed; provider session retired.\n");
+    }
     if (native.terminal.runTerminalState === "succeeded") {
       // A truncated, verified external-chat wake cannot settle from the
       // provider's partial inline prompt. The run-scoped reader records a
@@ -10132,7 +10151,7 @@ export async function createRunnerdBackend(input: {
       contextSnapshot: Record<string, unknown>;
     },
   ) => Promise<unknown>;
-}): Promise<NativeSessionBackend> {
+}): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {
@@ -10181,7 +10200,7 @@ async function createRunnerdBackendWithinSessionClaim(
   input: Parameters<typeof createRunnerdBackend>[0],
   sessionScopeId: string,
   retainedTransition?: VerifiedWarmTransitionBinding,
-): Promise<NativeSessionBackend> {
+): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
   let recoveryPending = retainedTransition !== undefined;
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
   const remoteTarget = target.kind === "remote" ? target : null;
@@ -10594,9 +10613,47 @@ async function createRunnerdBackendWithinSessionClaim(
       remotePrepared = true;
       return;
     }
-    let usedPreinstalledRunner = false;
+    // A resumed sandbox may already contain the exact controller-owned binary.
+    // Do not upload it every turn, but never treat compatible metadata alone as
+    // proof of artifact identity (especially for an explicit operator override).
+    let runnerArtifactPrepared = false;
+    if (
+      sandboxLeaseAcquisition?.outcome === "resumed" &&
+      existsSync(controllerRunnerBinary)
+    ) {
+      runnerArtifactPrepared = await measureNativeRunnerSpan(
+        input.trace,
+        "runner.artifact.verify_retained",
+        async () => {
+          const expected = createHash("sha256")
+            .update(readFileSync(controllerRunnerBinary))
+            .digest("hex");
+          try {
+            const probe = await remoteCommandRunner.execute({
+              command: "sh",
+              args: [
+                "-c",
+                'test -x "$1" || exit 1; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi',
+                "paperclip-runner-artifact",
+                remoteBinary,
+              ],
+              cwd: remoteTarget.remoteCwd,
+              bypassSession: true,
+              timeoutMs: 10_000,
+            });
+            return probe.exitCode === 0 && !probe.timedOut &&
+              /^[a-f0-9]{64}\s/.test(probe.stdout) &&
+              probe.stdout.trim().split(/\s+/)[0] === expected;
+          } catch {
+            // Missing binaries, checksum tools, or a failed probe use the
+            // ordinary verified staging path; none authorizes cached execution.
+            return false;
+          }
+        },
+      );
+    }
     const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
-    if (mayUsePreinstalledRunnerArtifact(explicitRemoteBinary)) {
+    if (!runnerArtifactPrepared && mayUsePreinstalledRunnerArtifact(explicitRemoteBinary)) {
       const preinstalledRunner = await measureNativeRunnerSpan(
         input.trace,
         "runner.artifact.discover",
@@ -10614,17 +10671,17 @@ async function createRunnerdBackendWithinSessionClaim(
             "runner.artifact.link",
             () => linkPreinstalledExecutable(preinstalledRunner, remoteBinary),
           );
-          usedPreinstalledRunner = true;
+          runnerArtifactPrepared = true;
           await input.onLog?.(
             "stderr",
             "[paperclip-runner] using preinstalled runnerd from the sandbox image\n",
           );
         } catch {
-          usedPreinstalledRunner = false;
+          runnerArtifactPrepared = false;
         }
       }
     }
-    if (!usedPreinstalledRunner) {
+    if (!runnerArtifactPrepared) {
       // Upload the same artifact used for the controller identity. The server
       // vendors the runner under vendor/paperclip-runner/bin, so the package
       // development fallback cannot locate it in a deployed server.
@@ -11187,7 +11244,7 @@ async function createRunnerdBackendWithinSessionClaim(
     }
   };
 
-  const ensureRemoteRunner = async () => {
+  const ensureRemoteRunner = async (stageLaunchAssets = true) => {
     await measureNativeRunnerSpan(
       input.trace,
       "stage.sync",
@@ -11339,7 +11396,6 @@ async function createRunnerdBackendWithinSessionClaim(
                       throw new Error("runner_harness_state_mismatch");
                     }
                   }
-                  await materializeRemoteHarnessLaunchState();
                 } else if (remoteTarget && remoteCommandRunner) {
                   // Local and generic SSH execution retain their existing checkpoint
                   // behavior. The manifest-only failover gate applies to managed sandbox
@@ -11382,6 +11438,15 @@ async function createRunnerdBackendWithinSessionClaim(
           );
           remoteHarnessStatePrepared = true;
         }
+        // Authority rotation needs durable history, before the transport writes
+        // this turn's launch files. Stage assets only at the actual launch so we
+        // neither upload stale context nor transfer every bundle twice on resume.
+        if (!stageLaunchAssets) return;
+        // Resume can prepare/rotate durable state before the transport creates
+        // this invocation's isolated Codex auth/config. The later launch must
+        // still stage those fresh files even when history was already restored.
+        // Launch material is never recovered from a failover backup.
+        await materializeRemoteHarnessLaunchState();
         if (
           remoteTarget &&
           remoteCommandRunner &&
@@ -11632,7 +11697,7 @@ async function createRunnerdBackendWithinSessionClaim(
             target: remoteTarget,
             runnerIngressAuthorized: input.runnerIngressAuthorized === true,
           });
-          await ensureRemoteRunner();
+          await ensureRemoteRunner(false);
         }
       : undefined;
   const archiveExternalRunnerState =
@@ -12284,27 +12349,14 @@ async function createRunnerdBackendWithinSessionClaim(
         },
       }).transport,
   });
+  const boundManagedSessions = new WeakSet<NativeSession>();
   const wrapManagedSession = (session: NativeSession): NativeSession => {
-    if (!input.managedAiCredentialHome || input.execution.provider.kind !== "codex") return session;
-    const close = session.close.bind(session);
-    const detach = session.detachControllerForRestart?.bind(session);
-    let detachedForRestart = false;
-    if (detach) {
-      session.detachControllerForRestart = async () => {
-        // Ownership is relinquished before the asynchronous detach completes.
-        // Late close finalizers must leave the live runner's credentials alone.
-        detachedForRestart = true;
-        await detach();
-      };
-    }
-    let copied = false;
-    session.close = async (closeInput) => {
-      await close(closeInput);
-      if (detachedForRestart || copied) return;
-      copied = true;
-      const remoteAuth = remoteRunnerFilesystemRoot ? posix.join(remoteRunnerFilesystemRoot, "codex-home", "auth.json") : null;
-      const localAuth = join(root, "codex-home", "auth.json");
-      try {
+    if (!input.managedAiCredentialHome || input.execution.provider.kind !== "codex" || boundManagedSessions.has(session)) return session;
+    boundManagedSessions.add(session);
+    const remoteAuth = remoteRunnerFilesystemRoot ? posix.join(remoteRunnerFilesystemRoot, "codex-home", "auth.json") : null;
+    const localAuth = join(root, "codex-home", "auth.json");
+    return bindManagedNativeCredentialTurn(session, {
+      copyBack: async () => {
         await copyBackCodexAuth({
           hostAuthPath: join(input.managedAiCredentialHome!, "auth.json"),
           readSandboxAuth: async () => {
@@ -12315,12 +12367,12 @@ async function createRunnerdBackendWithinSessionClaim(
           },
           log: () => {},
         });
-      } finally {
+      },
+      remove: async () => {
         rmSync(localAuth, { force: true });
         if (remoteAuth && remoteCommandRunner) await remoteCommandRunner.execute({ command: "rm", args: ["-f", "--", remoteAuth], bypassSession: true, timeoutMs: 10000 });
-      }
-    };
-    return session;
+      },
+    });
   };
   const priorAuthorityEpoch = sessionToolAuthorityEpochs.get(sessionScopeId);
   if (priorAuthorityEpoch && priorAuthorityEpoch !== authorityEpoch) {
@@ -12328,6 +12380,7 @@ async function createRunnerdBackendWithinSessionClaim(
   }
   sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
   return {
+    bindManagedSession: wrapManagedSession,
     descriptor: () => backend.descriptor(),
     openSession: async (sessionInput) => wrapManagedSession(await backend.openSession(sessionInput)),
     recoverSession: async (snapshot, options) => {
@@ -12343,5 +12396,5 @@ async function createRunnerdBackendWithinSessionClaim(
       );
       return wrapManagedSession(await backend.openSession(sessionInput));
     },
-  } satisfies NativeSessionBackend;
+  } satisfies NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession };
 }

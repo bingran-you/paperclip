@@ -44,3 +44,78 @@ describe("native continuation event projection", () => {
     expect(build({ ...wake, ...extra })).toBeNull();
   });
 });
+
+
+describe("plain-text Slack continuation projection", () => {
+  const slackComment = { ...message, author: { type: "user", id: "board" } };
+  const slackWake = {
+    ...wake,
+    reason: "External chat message received",
+    issue: { id: "task", title: "OLD_EXACT_REPLY", description: "Started from Slack", workMode: "standard" },
+    externalChatProvider: "slack", checkedOutByHarness: true,
+    comments: [slackComment],
+    commentIds: [message.id], latestCommentId: message.id,
+    commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+    attachmentOmissions: [],
+  };
+  const buildChat = (value: unknown = slackWake) => buildNativeContinuationPrompt({
+    wakePayload: value, previousRunId: "prior", issue: slackWake.issue,
+    previousIssue: slackWake.issue,
+    allowExternalChat: true,
+  });
+  it("sends the new message once without prior titles, history or instructions", () => {
+    const text = buildChat()!;
+    expect(text).not.toBeNull();
+    expect(JSON.parse(text)).toEqual({ messages: [message] });
+    expect(text).not.toContain("OLD_EXACT_REPLY");
+    expect(text).not.toContain("OLD_HISTORY");
+    expect(text.length).toBeLessThan(600);
+  });
+  it("excludes edited history and prior agent output outside the current Slack delivery", () => {
+    const text = buildChat({ ...slackWake, executionContinuation: {
+      ...wake.executionContinuation,
+      resumeDelta: { baseRunId: "prior", messages: [
+        { ...message, id: "old-edited", body: "STALE_DIRECTION" },
+        { ...message, id: "old-reply", authorType: "agent", body: "OLD_AGENT_REPLY" },
+        message,
+      ] },
+    } });
+    expect(JSON.parse(text!).messages).toEqual([message]);
+    expect(text).not.toContain("STALE_DIRECTION");
+    expect(text).not.toContain("OLD_AGENT_REPLY");
+  });
+  it("preserves an actual task brief edit beside the current message", () => {
+    const text = buildNativeContinuationPrompt({
+      wakePayload: slackWake, previousRunId: "prior", allowExternalChat: true,
+      issue: { ...slackWake.issue, description: "Updated scope" }, previousIssue: slackWake.issue,
+    });
+    expect(JSON.parse(text!).taskChanges).toEqual({ description: "Updated scope" });
+  });
+  it("accepts the verified non-assignee chat binding", () => {
+    expect(buildChat({ ...slackWake, checkedOutByHarness: false, externalChatExecutionBound: true })).not.toBeNull();
+  });
+  it.each([
+    { comments: [{ ...slackComment, attachments: [{ id: "file" }] }] },
+    { comments: [{ ...slackComment, attachments: "malformed" }] },
+    { comments: [{ ...slackComment, body: "EDITED_SINCE_DELTA" }] },
+    { comments: [{ ...slackComment, author: { type: "user", id: "different-user" } }] },
+    { attachmentOmissions: [{ commentId: message.id, notice: "Unavailable input" }] },
+    { externalChatProvider: "discord" },
+    { checkedOutByHarness: false },
+    { truncated: true },
+    { fallbackFetchNeeded: true },
+    { comments: [{ ...slackComment, bodyTruncated: true }] },
+    { interactionId: "approval", interactionKind: "request_confirmation" },
+    { recovery: { cause: "interrupted" } },
+    { executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "wrong", messages: [message] } } },
+    { executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [] } } },
+    { commentIds: [message.id, "missing"], latestCommentId: "missing" },
+    { commentIds: [message.id, message.id], latestCommentId: message.id },
+    { executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [message, message] } } },
+  ])("keeps specialized or incomplete input on the full path: %j", (extra) => {
+    expect(buildChat({ ...slackWake, ...extra })).toBeNull();
+  });
+  it("requires the constructor to explicitly opt into chat continuation", () => {
+    expect(build(slackWake)).toBeNull();
+  });
+});
