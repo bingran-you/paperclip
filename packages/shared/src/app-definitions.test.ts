@@ -181,9 +181,7 @@ const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
     riskTier: "S3",
     scopes: [
       googleScope("chat.spaces.readonly"),
-      googleScope("chat.memberships.readonly"),
       googleScope("chat.messages.readonly"),
-      googleScope("chat.users.readstate.readonly"),
     ],
     writeTools: [],
   },
@@ -195,9 +193,7 @@ const GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS = [
     riskTier: "S4",
     scopes: [
       googleScope("chat.spaces.readonly"),
-      googleScope("chat.memberships.readonly"),
       googleScope("chat.messages.readonly"),
-      googleScope("chat.users.readstate.readonly"),
       googleScope("chat.messages.create"),
     ],
     writeTools: ["send_message"],
@@ -692,7 +688,6 @@ describe("AppDefinition catalog", () => {
       "brex",
       "candid",
       "coda",
-      "composio",
       "context7",
       "egnyte",
       "embat",
@@ -709,7 +704,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(48);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(51);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );

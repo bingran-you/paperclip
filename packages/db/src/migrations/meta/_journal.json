@@ -1961,6 +1961,20 @@
       "when": 1789827314772,
       "tag": "0281_true_boom_boom",
       "breakpoints": true
+    },
+    {
+      "idx": 282,
+      "version": "7",
+      "when": 1790004509370,
+      "tag": "0282_colossal_shocker",
+      "breakpoints": true
+    },
+    {
+      "idx": 283,
+      "version": "7",
+      "when": 1790018362070,
+      "tag": "0283_jittery_psynapse",
+      "breakpoints": true
     }
   ]
 }

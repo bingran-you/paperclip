@@ -1007,6 +1007,19 @@ describe("agent live run routes", () => {
       });
     });
 
+    it("refuses a quarantined native retry before queuing another failed attempt", async () => {
+      const fixture = createFailedChatRetryDb(false);
+      mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun,
+        runtimeMode: "native", errorCode: "native_session_cleanup_quarantined" });
+      const res = await requestApp(await createApp(fixture.db, {
+        type: "board", userId: "operator", source: "session", companyIds: ["company-1"],
+      }), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ error: expect.stringContaining("cleanup and reconciliation") });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockChatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+    });
+
     it("retries a task for an operator without agent-creation permission", async () => {
       const fixture = createFailedChatRetryDb(false);
       mockHeartbeatService.getRun.mockResolvedValue({ ...selectedRun, contextSnapshot: {

@@ -18,7 +18,7 @@ const {
     signal: null,
     timedOut: false,
     stdout: args.includes("--version")
-      ? "2.1.251 (Claude Code)\n"
+      ? "2.1.280 (Claude Code)\n"
       : [
           JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
           JSON.stringify({ type: "assistant", session_id: "claude-session-1", message: { content: [{ type: "text", text: "hello" }] } }),
@@ -466,14 +466,14 @@ describe("claude remote execution", () => {
       return { args: call?.[2] ?? [], result };
     }
 
-    it("passes the exact configured Fable 5.1 ID as --model on the CLI lane", async () => {
+    it.each(["claude-fable-5-1", "claude-opus-5-5"])("passes %s as --model on the CLI lane", async (model) => {
       const { args } = await executeWithModel("paperclip-claude-model-direct-", {
-        model: "claude-fable-5-1",
+        model,
       });
 
       const modelFlag = args.indexOf("--model");
       expect(modelFlag).toBeGreaterThanOrEqual(0);
-      expect(args[modelFlag + 1]).toBe("claude-fable-5-1");
+      expect(args[modelFlag + 1]).toBe(model);
     });
 
     it("passes the Bedrock-native Fable 5.1 ID as --model under Bedrock auth", async () => {
@@ -496,27 +496,30 @@ describe("claude remote execution", () => {
       expect(args).not.toContain("--model");
     });
 
-    it("rejects Fable 5.1 before launch when the CLI is older than 2.1.251", async () => {
+    it.each([
+      ["claude-fable-5-1", "2.1.251", "2.1.247"],
+      ["claude-opus-5-5", "2.1.280", "2.1.279"],
+    ])("rejects %s before launch below CLI %s", async (model, minimumVersion, detectedVersion) => {
       runChildProcess.mockResolvedValueOnce({
         exitCode: 0,
         signal: null,
         timedOut: false,
-        stdout: "2.1.247 (Claude Code)\n",
+        stdout: `${detectedVersion} (Claude Code)\n`,
         stderr: "",
         pid: 123,
         startedAt: new Date().toISOString(),
       });
 
       const { args, result } = await executeWithModel("paperclip-claude-model-old-cli-", {
-        model: "claude-fable-5-1",
+        model,
       });
 
       expect(args).toEqual([]);
       expect(result.errorCode).toBe("claude_cli_version_incompatible");
-      expect(result.errorMessage).toContain("requires Claude Code 2.1.251 or newer");
+      expect(result.errorMessage).toContain(`${model} requires Claude Code ${minimumVersion} or newer`);
       expect(result.resultJson).toMatchObject({
-        requiredClaudeCodeVersion: "2.1.251",
-        detectedClaudeCodeVersion: "2.1.247",
+        requiredClaudeCodeVersion: minimumVersion,
+        detectedClaudeCodeVersion: detectedVersion,
       });
     });
 

@@ -207,6 +207,16 @@ const apps = [
       },
     ),
   ],
+  ...[
+    ["arcade", "Arcade", "https://api.arcade.dev/*", "https://docs.arcade.dev/en/operate/governance/mcp-gateways"],
+    ["executor", "Executor", "https://executor.sh/*", "https://executor.sh/docs/mcp-proxy"],
+  ].map(([slug, name, pattern, docsUrl]) => [
+    slug, name, `Use the tools exposed by your ${name} MCP connection.`, "productivity", new URL(pattern).hostname, [pattern],
+    method("mcp", "mcp_remote", "none", {}, "S3", `Paste your ${name} MCP URL. Sign in if required, or add a token or headers under Advanced authentication.`, {
+      label: "Connect MCP server", ownershipModes: ["dcr", "customer"], consoleLinks: { docs: docsUrl },
+    }),
+    { featured: true, docsUrl },
+  ]),
   [
     "railway",
     "Railway",
@@ -693,36 +703,12 @@ const apps = [
   [
     "composio",
     "Composio",
-    "Connect Composio so Paperclip can discover and manage the toolkits in your project.",
+    "Discover and use connected apps through Composio Connect.",
     "productivity",
     "composio.dev",
-    ["https://backend.composio.dev/*"],
-    method(
-      "api-key",
-      "rest_api",
-      "api_key",
-      { serviceHost: "backend.composio.dev" },
-      "S3",
-      "Create a scoped project API key in Composio. It needs read access to toolkits and auth configs; later service-connection phases also need connected-account and session access.",
-      {
-        whenToUse:
-          "Use a project API key from the Composio project that owns the toolkits and connected accounts.",
-        credentialFields: [
-          field(
-            "apiKey",
-            "Composio project API key",
-            "Paste the Composio API key",
-          ),
-        ],
-        keyPlacement: { location: "header", name: "x-api-key" },
-        consoleLinks: {
-          keys: "https://app.composio.dev/",
-          settings: "https://app.composio.dev/",
-          docs: "https://docs.composio.dev/reference/authenticating-to-composio/project-api-key-permissions",
-        },
-      },
-    ),
-    { featured: true },
+    ["https://backend.composio.dev/*", "https://connect.composio.dev/*", "https://mcp.composio.dev/*", "https://*.composio.dev/*"],
+    [method("mcp", "mcp_remote", "none", { serverUrl: "https://connect.composio.dev/mcp" }, "S3", "Sign in to Composio Connect, or paste an externally configured MCP session URL and headers.", { label: "Composio Connect", ownershipModes: ["dcr", "customer"] })],
+    { featured: true, docsUrl: "https://docs.composio.dev/docs/composio-connect" },
   ],
   [
     "oauth-generic",

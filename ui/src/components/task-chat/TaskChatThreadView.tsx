@@ -172,7 +172,7 @@ function renderItem(
         <TaskChatMarker
           item={item}
           onTryAgain={
-            item.id === retryableMarkerId
+            item.id === retryableMarkerId && item.retryable !== false
               ? item.runId && onRetryFailedRun
                 ? () => onRetryFailedRun(item.runId!)
                 : onTryAgainNoLiveExecutionPath

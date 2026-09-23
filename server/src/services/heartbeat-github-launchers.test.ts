@@ -11,6 +11,18 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", remoteCwd: "/workspace" };
 
 describe("heartbeat GitHub launcher lifetime", () => {
+  it.each([target, null])("defers native managed authorization/staging to the session owner (%j)", async (target) => {
+    const prepare = vi.fn();
+    const mint = vi.fn();
+    const result = await prepareHeartbeatGitHubLaunchers({
+      native: true, githubConfigured: true, agentId: "agent-a", runId: "run-a", target,
+      cwd: "/workspace", env: { GH_TOKEN: "ambient" }, brokerUrl: "https://paperclip.test", createBrokerToken: mint,
+    }, prepare);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(mint).not.toHaveBeenCalled();
+    expect(result.cleanupLocation).toBeNull();
+    expect(result.env).toMatchObject({ GH_TOKEN: "", PAPERCLIP_GITHUB_BROKER_TOKEN: "" });
+  });
   it("keeps anonymous native sandbox launchers stable without issuing a run capability", async () => {
     const createBrokerToken = vi.fn(() => "run-secret");
     const prepareLaunchers = vi.fn(async (input) => input.env);
@@ -31,7 +43,7 @@ describe("heartbeat GitHub launcher lifetime", () => {
       if (cleanupFails) throw new Error("cleanup unavailable");
     });
     await expect(prepareHeartbeatGitHubLaunchers({
-      native: true, githubConfigured: true, agentId: "agent-a", target,
+      native: false, githubConfigured: true, agentId: "agent-a", target,
       runId: "failed-run", cwd: "/workspace", env: {}, brokerUrl: "https://paperclip.test",
       createBrokerToken: () => "current-run-secret",
     }, prepareLaunchers, cleanupLaunchers)).rejects.toBe(stagingError);
@@ -50,7 +62,7 @@ describe("heartbeat GitHub launcher lifetime", () => {
   });
 
   it.each([
-    { native: true, githubConfigured: true, target },
+    { native: false, githubConfigured: true, target },
     { native: false, githubConfigured: false, target },
     { native: true, githubConfigured: false, target: null },
   ])("preserves run-scoped managed capabilities outside anonymous native sandboxes: %j", async (mode) => {

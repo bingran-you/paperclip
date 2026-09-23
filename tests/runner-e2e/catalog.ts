@@ -2,7 +2,7 @@ import { continuationTasks } from "./continuation-cases.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
-import { chatTasks } from "./chat-cases.js";
+import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
 import { createEnvironmentSchema } from "../../packages/shared/src/validators/environment.js";
@@ -849,16 +849,14 @@ export const daytonaWarmContinuityTask: RunnerTaskFixture = {
     warmTurnInstructions(3, nonce),
   ],
   buildMatchers(nonce, execution) {
-    const markers = ([1, 2, 3] as const).map((turn) =>
-      warmTurnMarker(turn, nonce),
-    );
+    // Workspace persistence is the oracle for this story. Exact response text
+    // formatting must not mask a valid workspace, but every warm turn still
+    // needs one visible marker in chronological order. Surrounding provider
+    // prose is allowed; the occurrence and order matchers grade only markers.
+    const markers = ([1, 2, 3] as const).map((turn) => warmTurnMarker(turn, nonce));
     return [
-      { kind: "message_exact", expected: markers[2] },
-      ...markers.map(
-        (expected) =>
-          ({ kind: "message_occurrences", expected, count: 1 }) as const,
-      ),
-      { kind: "message_ordered", expected: markers },
+      ...markers.map((marker) => ({ kind: "message_occurrences" as const, expected: marker, count: 1 })),
+      { kind: "message_ordered" as const, expected: markers },
       {
         kind: "file_exact",
         path: `daytona-warm-${nonce}.txt`,
@@ -948,7 +946,36 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)).map(defaultPermissionProfile),
     environments: [localEnvironment], tasks: chatTasks, expectedMatrixSize: 28,
     excludedExecutionIds: ["legacy-codex", "legacy-claude"].flatMap(profile => ["reassign-task", "create-backlog"].map(task => `agent-chat.${profile}.local.${task}`)),
-    definitionMetadata: { version: 4, resetRunsCountedSeparately: true, permissions: "production-defaults" },
+    definitionMetadata: { version: 6, resetRunsCountedSeparately: true, permissions: "production-defaults", stopBoundary: "provider-turn-started", restartMemory: "required-after-restart" },
+  },
+  {
+    id: "agent-chat-hardening", label: "Agent Chat Recovery and Coordination", manualOnly: true,
+    description: "Native chat startup cancellation, committed sends, hiring, grounded status, and remote continuity.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment, daytonaWarmEnvironment], tasks: chatHardeningTasks, expectedMatrixSize: 18,
+    excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
+      ["stop-startup-new-resume", "hire-delegate-reuse", "blocked-status-review"].map(task => `agent-chat-hardening.${profile}.daytona.${task}`)),
+    definitionMetadata: { version: 5, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations", hiringReference: "neutral-document-reference-line" },
+  },
+  {
+    id: "agent-chat-stories", label: "Agent Chat Setup and Interruptions", manualOnly: true,
+    description: "Experimental settings lifecycle and user follow-ups during active native work.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatStoryTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 3, setup: "configured-native-agent", permissions: "production-defaults", interruptionBoundary: "provider-file-wait-in-agent-workspace", grading: "persisted-comments-and-plan-run-attributed", scheduling: "explicit-only" },
+  },
+  {
+    id: "agent-chat-qualification", label: "Agent Chat Remaining Qualification", manualOnly: true,
+    description: "Active ownership transfer, user recovery after worker loss, and grounded answer quality.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatQualificationTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 9, permissions: "production-defaults", instructions: "production", crashBoundary: "verified-native-worker-pid-at-file-wait", recovery: "new-user-message-after-verified-cleanup", answerGrading: "exact-grounded-propositions-plus-separate-semantic-review", scheduling: "explicit-only" },
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
@@ -1024,6 +1051,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: task.id,
           flow: task.flow,
           expectedRunCount: task.expectedRunCount,
+          ...(task.minimumExpectedRunCount === undefined ? {} : { minimumExpectedRunCount: task.minimumExpectedRunCount }),
           restartServerBeforeQuestionAnswer:
             task.restartServerBeforeQuestionAnswer ?? false,
         })),

@@ -188,6 +188,13 @@ export interface SlackAppConfiguration {
 }
 
 export interface ChatEndpointSetupState {
+  github?: {
+    stage: "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
+    appSlug?: string;
+    installationUrl?: string;
+    managementUrl?: string;
+    registrationStatus?: "pending" | "completed" | "failed";
+  };
   step: "choose_agent" | "provider_setup" | "test" | "complete";
   /** Server-generated boundary; only provider events at or after this time can complete setup. */
   testStartedAt?: string | null;
@@ -217,6 +224,8 @@ export type ChannelPublicationMode = "automatic" | "explicit";
 export type ExternalMessageExecutionPolicy = "restricted" | "agent";
 
 export interface ChatEndpoint {
+  /** Additional presentation instructions captured only for newly created tasks. */
+  communicationInstructions?: string;
   id: string;
   companyId: string;
   connectionId: string;
@@ -474,6 +483,7 @@ export interface CreateChatEndpointInput {
 
 export interface UpdateChatEndpointInput {
   slackApp?: SlackAppConfiguration;
+  communicationInstructions?: string;
   allowDirectMessages?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople?: boolean;

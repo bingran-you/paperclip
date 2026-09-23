@@ -309,7 +309,7 @@ describe("OpenCodeServerDriver", () => {
           headers: { "Content-Type": "application/json" },
         });
       if (url.pathname === "/global/health")
-        return json({ healthy: true, version: "1.18.29" });
+        return json({ healthy: true, version: "1.18.32" });
       if (url.pathname === "/event") {
         return new Response(
           new ReadableStream<Uint8Array>({
@@ -681,7 +681,7 @@ describe("OpenCodeServerDriver", () => {
       output: 2,
       costUsd: 0.001,
       provider: "openrouter",
-      driverVersion: "1.18.29",
+      driverVersion: "1.18.32",
     });
     await session.interrupt?.({ turnId: turn.turnId });
     const snapshot = await session.snapshot();

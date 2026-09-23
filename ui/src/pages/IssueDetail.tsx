@@ -192,7 +192,7 @@ import { isImageAttachment, isVideoAttachment } from "../lib/issue-attachments";
 import {
   getIssueOutputs,
   getPromotedOutputAttachmentIds,
-  isImageContentType,
+  isImageLikeOutput,
   isVideoLikeOutput,
 } from "../lib/issue-output";
 import { IssueSiblingNavigation } from "../components/IssueSiblingNavigation";
@@ -1562,6 +1562,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           tone: "success",
         });
       }
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.issues.runs(issueId),
       });
@@ -3511,10 +3513,12 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     const createdTasks = createdTasksQuery.data ?? EMPTY_ISSUES;
     const hasError = createdTasksQuery.isError || childIssuesError;
     return {
-      count: new Set([...childIssues, ...createdTasks].map((task) => task.id)).size,
+      count: new Set([...(issue?.ancestors ?? []), ...childIssues, ...createdTasks].map((task) => task.id)).size,
       hasError,
       content: (
         <TaskDetailTasksPanel
+          ancestors={issue?.ancestors}
+          issueLinkState={resolvedIssueDetailState ?? location.state}
           subtasks={childIssues}
           createdTasks={createdTasks}
           projects={projects ?? []}
@@ -3529,6 +3533,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     };
   }, [
     tasksTab,
+    issue?.ancestors,
+    resolvedIssueDetailState,
+    location.state,
     streamlinedTaskDetailEnabled,
     childIssues,
     childIssuesLoading,
@@ -3712,13 +3719,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // from the blocker counts — so the key signs over the full blockerAttention,
   // not just `state`, to avoid a stale label when counts change.
   const breadcrumbStatusKey = breadcrumbStatus
-    ? `${breadcrumbStatus}|${JSON.stringify(breadcrumbBlockerAttention ?? null)}`
+    ? `${breadcrumbStatus}|${issue?.externalConversationState ?? ""}|${JSON.stringify(breadcrumbBlockerAttention ?? null)}`
     : undefined;
   const breadcrumbStatusLeading = useMemo(
     () =>
       breadcrumbStatus ? (
         <StatusIcon
           status={breadcrumbStatus}
+          externalConversationState={issue?.externalConversationState}
           className="size-3"
           blockerAttention={breadcrumbBlockerAttention}
         />
@@ -5524,7 +5532,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       const meta = item.metadata;
       if (!meta) continue;
       const isMedia =
-        isImageContentType(meta.contentType) ||
+        isImageLikeOutput(meta.contentType, meta.originalFilename ?? item.title) ||
         isVideoLikeOutput(meta.contentType, meta.originalFilename);
       if (!isMedia || hasSeen(meta.attachmentId, meta.contentPath)) continue;
       items.push({
@@ -6841,7 +6849,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
   const issueStatusControl = (
     <StatusIcon
-      status={issue.status}
+      status={issue.status} externalConversationState={issue.externalConversationState}
       size="lg"
       blockerAttention={issue.blockerAttention}
       onChange={(status) => updateIssue.mutate({ status })}
@@ -7378,6 +7386,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
             issueId={issue.id}
             issueCacheRefs={issueCacheRefs}
           />
+
+          {issue.status === "in_review" && issue.externalConversationState === "waiting" && (
+            <p role="status" className="text-sm text-muted-foreground">Reply sent. Send a message to continue.</p>
+          )}
 
           {issue.hiddenAt && (
             <div

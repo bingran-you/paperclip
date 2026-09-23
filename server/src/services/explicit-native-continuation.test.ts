@@ -1,3 +1,4 @@
+import * as nativeExecutor from "./native-runtime/native-session-executor.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -373,6 +374,32 @@ const support = await getEmbeddedPostgresTestSupport();
       agentId: f.agentId, status: "queued", contextSnapshot: { issueId: f.issueId, previousRunId: result.previousRunId, forceFreshSession: true } });
     return result;
   });
+
+  it.each(["verified", "unproven", "changed", "dry_run", "retry", "duplicate"])(
+    "requires exact local cleanup for a new turn after worker loss (%s)", async mode => {
+      const f = await seed();
+      await db.update(heartbeatRuns).set({ errorCode: "native_session_cleanup_quarantined" }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      const retire = vi.fn(() => mode !== "changed");
+      const verify = vi.spyOn(nativeExecutor, "verifyStoppedNativeSessionForContinuation").mockResolvedValue(
+        mode === "unproven" ? null : { evidence: { runId: f.sourceRunId, schema: "paperclip.stopped_native_conversation.v1" }, retire });
+      try {
+        const result = mode === "retry"
+          ? await db.transaction(tx => admitExplicitNativeContinuation({ ...f, db: tx as unknown as typeof db,
+              reason: "retry_failed_run", failedRunId: f.sourceRunId }))
+          : await admit(f, mode === "dry_run");
+        expect(Boolean(result)).toBe(["verified", "dry_run", "duplicate"].includes(mode));
+        expect(retire).toHaveBeenCalledTimes(["verified", "changed", "duplicate"].includes(mode) ? 1 : 0);
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+        expect(Boolean(actions[0].evidence.explicitUserContinuation)).toBe(["verified", "duplicate"].includes(mode));
+        const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.sourceRunId),
+          eq(heartbeatRunEvents.eventType, "native.stopped_conversation_verified")));
+        expect(events).toHaveLength(["verified", "duplicate"].includes(mode) ? 1 : 0);
+        if (mode === "duplicate") {
+          expect(await admit(f)).toBeNull();
+          expect(retire).toHaveBeenCalledTimes(1);
+        }
+      } finally { verify.mockRestore(); }
+    });
 
   it.each(["suspended", "ready", "wrong_run", "wrong_thread", "active_provider", "pending_tool", "pending_output", "missing_state", "new_launch"])(
     "recovers a historical run without process metadata only from exact suspended state (%s)", async kind => {

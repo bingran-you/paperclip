@@ -226,7 +226,7 @@ export function AgentBasicsDialog({
                     {error.message}
                   </p>
                 )}
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                <div className={cn("grid grid-cols-2 gap-3", choices.length !== 4 && "sm:grid-cols-3")}>
                   {choices.map((adapter) => {
                     const display = getAdapterDisplay(adapter.type);
                     return (

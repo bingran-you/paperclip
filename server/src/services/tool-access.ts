@@ -1,4 +1,6 @@
-import { connectionPurposeTransportSchema } from "@paperclipai/shared";
+import { isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@paperclipai/shared";
+import { instanceSettingsService } from "./instance-settings.js";
+import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
@@ -184,8 +186,13 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { isSlackMcpAccessDisabledResponse } from "./slack-mcp-error.js";
 import {
   initializeMcpHttpSession,
+  McpHttpInitializationError,
+  getMcpHttpSession,
+  forgetMcpHttpSessions,
+  readMcpHttpResponse,
   mcpHttpRequestHeaders,
   parseMcpHttpResponseBody,
 } from "./mcp-http.js";
@@ -218,6 +225,7 @@ import {
   narrowestScopeBindings,
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
+import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription, googleChatToolInputSchema } from "./google-chat-tool-policy.js";
 import {
   recordToolRuntimeAuditWriteFailure,
   TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC,
@@ -227,15 +235,7 @@ import {
   ToolRuntimeSupervisorError,
 } from "./tool-runtime-supervisor.js";
 import { listConnectionLifecycleEvents } from "./tool-connection-activity.js";
-import {
-  ComposioApiError,
-  createComposioClient,
-  type ComposioClient,
-} from "./composio.js";
-import {
-  composioChildConfig,
-  createComposioSessionManager,
-} from "./composio-session-manager.js";
+import { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "@paperclipai/shared";
 import {
   appWithPaperclipCloudConnectorAvailability,
   paperclipCloudConnectorCapabilitiesFromEnv,
@@ -643,8 +643,6 @@ type ToolAccessServiceOptions = {
   remoteHttpEndpointLookup?: RemoteHttpEndpointLookup;
   /** Test seam for protocol fixtures. Production uses the DNS-pinned transport. */
   remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
-  /** Test seam for Composio without live vendor traffic. */
-  composioClientFactory?: (apiKey: string) => ComposioClient;
   /** Test seam for the centrally registered Gmail OAuth broker. */
   paperclipCloudConnector?: PaperclipCloudConnector | null;
   /** @deprecated Use paperclipCloudConnector. */
@@ -917,7 +915,6 @@ const APPROVED_STDIO_TEMPLATES: Record<
 };
 
 const GOOGLE_SHEETS_GALLERY_KEY = "google-sheets";
-const COMPOSIO_GALLERY_KEY = "composio";
 const GOOGLE_SHEETS_TEMPLATE_ID = "paperclip.google-sheets";
 const GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS_ENV =
   "GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS";
@@ -1286,7 +1283,9 @@ export function projectConnectionMethodToolInputSchema(
 export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
+  toolName: string,
 ): Record<string, unknown> {
+  assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1304,7 +1303,9 @@ export function projectedConnectionToolArguments(
 export function projectedConnectionToolInputSchema(
   connection: typeof toolConnections.$inferSelect,
   inputSchema: Record<string, unknown>,
+  toolName: string,
 ): Record<string, unknown> {
+  inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1585,6 +1586,7 @@ function assertClass3ToolCredentialRefAllowed(ref: {
 
 function toConnection(row: typeof toolConnections.$inferSelect): ToolConnection {
   connectionPurposeTransportSchema.parse(row);
+  const retired = isRetiredComposioConnection(row);
   return {
     id: row.id,
     companyId: row.companyId,
@@ -1600,13 +1602,13 @@ function toConnection(row: typeof toolConnections.$inferSelect): ToolConnection 
     externalCredential: row.externalCredential ?? null,
     credentialPolicy: row.credentialPolicy,
     status: row.status,
-    enabled: row.enabled,
+    enabled: row.enabled && !retired,
     config: row.config ?? {},
     transportConfig: row.transportConfig ?? {},
     credentialRefs: row.credentialRefs ?? [],
     credentialSecretRefs: row.credentialSecretRefs ?? [],
-    healthStatus: row.healthStatus,
-    healthMessage: row.healthMessage,
+    healthStatus: retired ? "error" : row.healthStatus,
+    healthMessage: retired ? RETIRED_COMPOSIO_MESSAGE : row.healthMessage,
     healthCheckedAt: row.healthCheckedAt,
     lastHealthAt: row.lastHealthAt,
     lastCatalogRefreshAt: row.lastCatalogRefreshAt,
@@ -1695,7 +1697,9 @@ function toCatalogEntryForConnection(
     inputSchema: projectedConnectionToolInputSchema(
       connection,
       rawCatalogEntry.inputSchema ?? {},
+      row.toolName,
     ),
+    description: googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
   };
   if (
     connection.transport === "local_stdio" &&
@@ -2316,6 +2320,16 @@ function normalizedProviderToolName(toolName: string): string {
     .replace(/[:._-]+/g, "-");
 }
 
+// Aggregators can add arbitrarily powerful tools without changing their MCP
+// endpoint. Only these reviewed, exact capabilities are read-only. Unknown or
+// renamed actions remain enabled by the usual access rules, but have write risk.
+const AGGREGATOR_READ_TOOLS = new Map<string, ReadonlySet<string>>([
+  ["executor", new Set(["skills"])],
+  ["composio", new Set(["COMPOSIO_SEARCH_TOOLS", "COMPOSIO_GET_TOOL_SCHEMAS", "COMPOSIO_SEARCH_SKILLS", "COMPOSIO_USE_SKILL"])],
+  ["arcade", new Set(["Github.GetRepository"])],
+  ["zapier", new Set()],
+]);
+
 export function classifyRisk(
   tool: McpToolDescriptor,
   sourceTemplateKey?: string | null,
@@ -2324,6 +2338,12 @@ export function classifyRisk(
   if (annotations.destructiveHint === true || annotations.destructive === true)
     return "destructive";
   const normalizedToolName = normalizedProviderToolName(tool.name);
+  const reviewedReads = AGGREGATOR_READ_TOOLS.get(sourceTemplateKey ?? "");
+  if (reviewedReads) {
+    if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
+    if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+    return reviewedReads.has(tool.name) ? "read" : "write";
+  }
   if (sourceTemplateKey === "railway") {
     const reviewed = railwayRisk(normalizedToolName);
     return reviewed === "read" && (annotations.readOnlyHint === false || annotations.writeHint === true) ? "write" : reviewed;
@@ -2791,8 +2811,12 @@ function healthFailureHttpStatus(failure: {
   code: string;
 }): number {
   if (failure.status === "missing_secret") return 422;
+  if (failure.code === "oauth_challenge") return 422;
+  if (failure.code === "oauth_refresh_missing") return 422;
+  if (failure.code === "oauth_reauthorization_required") return 422;
+  if (failure.code === "slack_mcp_access_disabled") return 422;
   if (failure.code === "user_authorization_required") return 422;
-  if (failure.code === "composio_api_key_rejected") return 422;
+  if (failure.code === "composio_broker_retired") return 422;
   if (failure.code === "tool_connection_transport_unsupported") return 422;
   if (failure.code.endsWith("_endpoint_rejected")) return 422;
   return 502;
@@ -2810,26 +2834,19 @@ function sanitizeHttpFailure(error: unknown): {
   message: string;
   code: string;
 } {
-  if (error instanceof ComposioApiError) {
-    return {
-      status: "error",
-      message: error.message,
-      code:
-        error.status === 401 || error.status === 403
-          ? "composio_api_key_rejected"
-          : "composio_request_failed",
-    };
-  }
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (code === "slack_mcp_access_disabled") {
+      return { status: "error", message: error.message, code };
+    }
     if (code === "user_authorization_required") {
       return { status: "error", message: error.message, code };
     }
     if (code === "tool_connection_transport_unsupported") {
       return { status: "error", message: error.message, code };
     }
-    if (code === "composio_connected_account_inactive") {
-      return { status: "degraded", message: error.message, code };
+    if (code === "composio_broker_retired") {
+      return { status: "error", message: error.message, code };
     }
     if (typeof code === "string" && code.startsWith("remote_http_")) {
       return { status: "error", message: error.message, code };
@@ -2998,10 +3015,6 @@ export function toolAccessService(
       badRequest(message, { code }),
     ).toString();
   }
-  const composioSessions = createComposioSessionManager(db, {
-    composioClientFactory: options.composioClientFactory,
-    now: options.now,
-  });
   const policySvc = toolAccessPolicyService(db);
   const now = options.now ?? (() => new Date());
   const configuredCloudConnector =
@@ -6065,34 +6078,11 @@ export function toolAccessService(
     connectionId: string,
     companyId?: string,
     actor?: ActorInfo,
-    removalOptions: { confirmComposioChildren?: boolean } = {},
   ): Promise<ToolConnectionRemovalResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    forgetMcpHttpSessions(connection.id);
     const now = new Date();
     const binding = actorBinding(actor);
-
-    if (isComposioConnection(connection)) {
-      const children = (await existingComposioChildren(connection)).filter(
-        (child) => child.status !== "archived",
-      );
-      if (
-        children.length > 0 &&
-        removalOptions.confirmComposioChildren !== true
-      ) {
-        throw conflict(
-          "Deleting this Composio connection also removes its connected services. Confirm child removal to continue.",
-          {
-            code: "composio_child_removal_confirmation_required",
-            childConnectionCount: children.length,
-          },
-        );
-      }
-      for (const child of children) {
-        await removeConnection(child.id, child.companyId, actor, {
-          confirmComposioChildren: true,
-        });
-      }
-    }
 
     // Grants are read before they are revoked: a retried removal must still see
     // the credential refs of a grant an earlier pass already marked revoked.
@@ -6751,45 +6741,35 @@ export function toolAccessService(
     credentialHeaders?: Record<string, string>,
     actor?: ActorInfo,
   ): Promise<McpToolDescriptor[]> {
-    const composioChild = composioChildConfig(connection);
-    const composioSession = composioChild
-      ? await composioSessions.ensureSession(connection.id)
-      : null;
-    let headers = composioSession?.headers ??
-      credentialHeaders ?? {
-        ...projectedConnectionHeaders(connection),
-        ...(await resolveCredentialHeaders(connection, actor)),
-      };
-    const endpoint =
-      composioSession?.url ?? (await resolvedRemoteEndpoint(connection, actor));
+    assertSupportedConnection(connection);
+    let headers = credentialHeaders ?? {
+      ...projectedConnectionHeaders(connection),
+      ...(await resolveCredentialHeaders(connection, actor)),
+    };
+    const endpoint = await resolvedRemoteEndpoint(connection, actor);
     // Pinned to the address the guard approved: `config.url` is operator-supplied,
     // so a second DNS resolution here would reopen the rebinding window that
     // PAP-17098 closed for the OAuth endpoints.
-    const listRequestBody = JSON.stringify({
-      jsonrpc: "2.0",
-      id: "paperclip-catalog-refresh",
-      method: "tools/list",
-      params: {},
-    });
-    const sendRemote = (init: RequestInit) =>
-      requestRemoteHttpEndpoint(new URL(endpoint), init);
-    const sendToolsList = (requestHeaders: Record<string, string>) =>
-      sendRemote({
-        method: "POST",
-        // MCP Streamable HTTP requires advertising that we accept both a JSON body
-        // and an SSE stream; spec-compliant servers 406 without it (see mcp-http.ts).
-        headers: mcpHttpRequestHeaders(requestHeaders),
-        body: listRequestBody,
-      });
+    let listRequestId = "paperclip-catalog-refresh";
+    let sessionHeaders = headers;
+    const sendRemote = (init: RequestInit) => requestRemoteHttpEndpoint(new URL(endpoint), init);
+    const sendToolsList = (requestHeaders: Record<string, string>, cursor?: string) => {
+      sessionHeaders = requestHeaders;
+      return sendRemote({ method: "POST", headers: mcpHttpRequestHeaders(requestHeaders),
+        body: JSON.stringify({ jsonrpc: "2.0", id: listRequestId, method: "tools/list", params: cursor ? { cursor } : {} }) });
+    };
     let usedInitializedSession = connection.config.mcpSessionRequired === true;
     let response: Response;
     if (usedInitializedSession) {
-      const sessionHeaders = await initializeMcpHttpSession({
-        send: sendRemote,
-        headers,
-        requestId: "paperclip-catalog-refresh",
-      });
-      response = await sendToolsList(sessionHeaders);
+      try {
+        sessionHeaders = await getMcpHttpSession({ send: sendRemote, headers,
+          scope: `${connection.id}:catalog:${actor?.actorType}:${actor?.actorId}:${endpoint}`,
+          requestId: listRequestId });
+        response = await sendToolsList(sessionHeaders);
+      } catch (error) {
+        if (!(error instanceof McpHttpInitializationError) || !error.response) throw error;
+        response = error.response;
+      }
     } else {
       response = await sendToolsList(headers);
       // `tools/list` is read-only, so a 400 can safely be retried after the MCP
@@ -6810,6 +6790,17 @@ export function toolAccessService(
         }
       }
     }
+    if (response.status === 404 && new Headers(sessionHeaders).has("mcp-session-id")) {
+      // MCP uses 404 for an expired server session. Discovery is read-only, so
+      // discard the stale session and retry it once with a new handshake.
+      forgetMcpHttpSessions(connection.id);
+      await response.body?.cancel().catch(() => undefined);
+      sessionHeaders = await getMcpHttpSession({ send: sendRemote, headers,
+        scope: `${connection.id}:catalog:${actor?.actorType}:${actor?.actorId}:${endpoint}`,
+        requestId: listRequestId });
+      response = await sendToolsList(sessionHeaders);
+      if (response.status === 404) forgetMcpHttpSessions(connection.id);
+    }
     if (
       usedInitializedSession &&
       connection.config.mcpSessionRequired !== true
@@ -6828,21 +6819,6 @@ export function toolAccessService(
             eq(toolConnections.companyId, connection.companyId),
           ),
         );
-    }
-    if (response.status === 401 && composioChild) {
-      const refreshed = await composioSessions.ensureSession(connection.id, {
-        force: true,
-      });
-      response = await requestRemoteHttpEndpoint(new URL(refreshed.url), {
-        method: "POST",
-        headers: mcpHttpRequestHeaders(refreshed.headers),
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "paperclip-catalog-refresh-retry",
-          method: "tools/list",
-          params: {},
-        }),
-      });
     }
     if (
       response.status === 401 &&
@@ -6897,6 +6873,12 @@ export function toolAccessService(
       }
     }
     if (!response.ok) {
+      if (await isSlackMcpAccessDisabledResponse(endpoint, response)) {
+        throw unprocessable(
+          "Slack MCP access is disabled for this app. Ask the Slack app owner to enable MCP access, then refresh this connection.",
+          { code: "slack_mcp_access_disabled", setupUrl: connectionSetupUrl(connection) },
+        );
+      }
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (
         response.status === 401 &&
@@ -6942,7 +6924,7 @@ export function toolAccessService(
             })
             .where(eq(toolConnections.id, connection.id));
         }
-        throw new HttpError(502, "This app needs you to sign in.", {
+        throw unprocessable("This app needs you to sign in.", {
           code: "oauth_challenge",
           status: response.status,
           setupUrl: connectionSetupUrl(connection),
@@ -6954,20 +6936,23 @@ export function toolAccessService(
         status: response.status,
       });
     }
-    const payload = parseMcpHttpResponseBody(
-      await response.text(),
-      response.headers.get("content-type"),
-    );
-    const result = asRecord(asRecord(payload).result);
-    const payloadTools = asRecord(payload).tools;
-    const tools: unknown[] = Array.isArray(result.tools)
-      ? result.tools
-      : Array.isArray(payloadTools)
-        ? payloadTools
-        : [];
-    const descriptors = tools
-      .map((tool) => normalizeToolDescriptor(tool))
-      .filter((tool): tool is McpToolDescriptor => Boolean(tool));
+    const descriptors: McpToolDescriptor[] = [];
+    const seenCursors = new Set<string>();
+    for (let page = 0; ; page += 1) {
+      const payload = await readMcpHttpResponse(response, listRequestId);
+      const record = asRecord(payload);
+      if (record.error) throw new HttpError(502, "Remote MCP tool discovery failed", { code: "mcp_catalog_error" });
+      const result = asRecord(record.result);
+      if (!Array.isArray(result.tools)) throw new HttpError(502, "Remote MCP returned an invalid tool catalog", { code: "mcp_catalog_invalid" });
+      descriptors.push(...result.tools.map((tool) => normalizeToolDescriptor(tool)).filter((tool): tool is McpToolDescriptor => Boolean(tool)));
+      const cursor = typeof result.nextCursor === "string" ? result.nextCursor : null;
+      if (!cursor) break;
+      if (seenCursors.has(cursor) || page >= 99 || descriptors.length > 20_000) throw new HttpError(502, "Remote MCP tool catalog pagination did not finish", { code: "mcp_catalog_pagination" });
+      seenCursors.add(cursor);
+      listRequestId = `paperclip-catalog-refresh-${page + 1}`;
+      response = await sendToolsList(sessionHeaders, cursor);
+      if (!response.ok) throw new HttpError(502, "Remote MCP catalog page could not be read", { status: response.status });
+    }
     if (!isRailwayConnection(connection)) return descriptors;
     if (descriptors.some((tool) => normalizeRailwayToolName(tool.name).startsWith(RAILWAY_TOOL_PREFIX))) {
       throw unprocessable("Railway advertised a reserved Paperclip action name. Refresh is blocked pending review.", { code: "railway_tool_name_collision" });
@@ -7011,432 +6996,6 @@ export function toolAccessService(
     }));
   }
 
-  function isComposioConnection(
-    connection: typeof toolConnections.$inferSelect,
-  ): boolean {
-    return (
-      asRecord(connection.config).sourceTemplateKey === COMPOSIO_GALLERY_KEY
-    );
-  }
-
-  async function composioClientForParent(
-    parent: typeof toolConnections.$inferSelect,
-  ) {
-    if (!isComposioConnection(parent) || parent.transport !== "rest_api") {
-      throw unprocessable(
-        "This connection is not a parent Composio connection.",
-        { code: "not_composio_parent" },
-      );
-    }
-    const headers = await resolveCredentialHeaders(parent);
-    const apiKey = Object.entries(headers).find(
-      ([name]) => name.toLowerCase() === "x-api-key",
-    )?.[1];
-    if (!apiKey)
-      throw unprocessable("The Composio API key secret is missing.", {
-        code: "secret_missing",
-      });
-    return (
-      options.composioClientFactory?.(apiKey) ??
-      createComposioClient({ apiKey })
-    );
-  }
-
-  async function existingComposioChildren(
-    parent: typeof toolConnections.$inferSelect,
-  ) {
-    const rows = await db
-      .select()
-      .from(toolConnections)
-      .where(
-        and(
-          eq(toolConnections.companyId, parent.companyId),
-          eq(toolConnections.applicationId, parent.applicationId),
-        ),
-      );
-    return rows.filter(
-      (row) => composioChildConfig(row)?.parentConnectionId === parent.id,
-    );
-  }
-
-  async function assertComposioConnectedAccountActive(
-    child: typeof toolConnections.$inferSelect,
-  ) {
-    const childConfig = composioChildConfig(child);
-    if (!childConfig) return;
-    const parent = await getConnectionRow(
-      childConfig.parentConnectionId,
-      child.companyId,
-    );
-    const client = await composioClientForParent(parent);
-    const accounts = await client.listConnectedAccounts({
-      toolkitSlugs: [childConfig.toolkitSlug],
-      userIds: [`paperclip:${child.companyId}`],
-      limit: 100,
-    });
-    const account = childConfig.connectedAccountId
-      ? accounts.items.find(
-          (candidate) => candidate.id === childConfig.connectedAccountId,
-        )
-      : accounts.items.find(
-          (candidate) => candidate.toolkit.slug === childConfig.toolkitSlug,
-        );
-    if (account?.status.toUpperCase() === "ACTIVE") return;
-    const status = account?.status.trim().toUpperCase() || "MISSING";
-    throw unprocessable(
-      `Composio reports the ${childConfig.toolkitSlug} connected account as ${status}. Reconnect it in Composio.`,
-      {
-        code: "composio_connected_account_inactive",
-        connectedAccountStatus: status,
-      },
-    );
-  }
-
-  async function disableComposioChildren(
-    parent: typeof toolConnections.$inferSelect,
-  ) {
-    const children = await existingComposioChildren(parent);
-    for (const child of children) {
-      if (child.status === "archived") continue;
-      const config = asRecord(child.config);
-      await db
-        .update(toolConnections)
-        .set({
-          enabled: false,
-          config: child.enabled
-            ? { ...config, disabledByComposioParent: true }
-            : config,
-          updatedAt: now(),
-        })
-        .where(eq(toolConnections.id, child.id));
-    }
-  }
-
-  async function restoreComposioChildren(
-    parent: typeof toolConnections.$inferSelect,
-  ) {
-    const children = await existingComposioChildren(parent);
-    const restorable = children.filter(
-      (child) =>
-        child.status !== "archived" &&
-        asRecord(child.config).disabledByComposioParent === true,
-    );
-    if (restorable.length === 0) return;
-
-    let accounts: Awaited<
-      ReturnType<ComposioClient["listConnectedAccounts"]>
-    >["items"] = [];
-    try {
-      const client = await composioClientForParent(parent);
-      accounts = (
-        await client.listConnectedAccounts({
-          userIds: [`paperclip:${parent.companyId}`],
-          limit: 1000,
-        })
-      ).items;
-    } catch {
-      // Fail closed while Composio is unavailable. A later resume or reconnect
-      // can retry without exposing a child whose account state is unknown.
-      return;
-    }
-
-    for (const child of restorable) {
-      const childConfig = composioChildConfig(child)!;
-      const account = childConfig.connectedAccountId
-        ? accounts.find(
-            (candidate) => candidate.id === childConfig.connectedAccountId,
-          )
-        : accounts.find(
-            (candidate) => candidate.toolkit.slug === childConfig.toolkitSlug,
-          );
-      const config = { ...asRecord(child.config) };
-      delete config.disabledByComposioParent;
-      const active = account?.status.toUpperCase() === "ACTIVE";
-      await db
-        .update(toolConnections)
-        .set({
-          enabled: active,
-          config: active
-            ? config
-            : { ...config, disabledByComposioParent: true },
-          healthStatus: active ? "unchecked" : "degraded",
-          healthMessage: active
-            ? null
-            : `Composio reports the ${childConfig.toolkitSlug} connected account as ${account?.status.toUpperCase() ?? "MISSING"}. Reconnect it in Composio.`,
-          updatedAt: now(),
-        })
-        .where(eq(toolConnections.id, child.id));
-    }
-  }
-
-  async function syncComposioChild(
-    parent: typeof toolConnections.$inferSelect,
-    account: { id: string; status: string; toolkit: { slug: string } },
-    toolkitName: string,
-    actor?: ActorInfo,
-  ) {
-    if (account.status.toUpperCase() !== "ACTIVE") return null;
-    const children = await existingComposioChildren(parent);
-    const existing = children.find((candidate) => {
-      const config = composioChildConfig(candidate);
-      return (
-        config?.toolkitSlug === account.toolkit.slug &&
-        candidate.status !== "archived"
-      );
-    });
-    if (existing) {
-      const config = composioChildConfig(existing)!;
-      if (config.connectedAccountId !== account.id) {
-        const nextConfig = {
-          ...existing.config,
-          connectedAccountId: account.id,
-        };
-        const [updated] = await db
-          .update(toolConnections)
-          .set({
-            config: nextConfig,
-            transportConfig: {
-              ...existing.transportConfig,
-              connectedAccountId: account.id,
-              composioSessions: {},
-            },
-            updatedAt: now(),
-          })
-          .where(eq(toolConnections.id, existing.id))
-          .returning();
-        return updated;
-      }
-      return existing;
-    }
-    const connectionId = randomUUID();
-    const binding = actorBinding(actor);
-    const config = {
-      provider: "composio",
-      parentConnectionId: parent.id,
-      toolkitSlug: account.toolkit.slug,
-      connectedAccountId: account.id,
-    };
-    const [created] = await db
-      .insert(toolConnections)
-      .values({
-        id: connectionId,
-        companyId: parent.companyId,
-        applicationId: parent.applicationId,
-        name: `${toolkitName} (via Composio)`,
-        uid: connectionUid(
-          `composio:${parent.id}`,
-          account.toolkit.slug,
-          connectionId,
-        ),
-        connectionKind: "managed",
-        ownership: parent.ownership,
-        transport: "mcp_remote",
-        authKind: "none",
-        credentialPolicy: "shared",
-        status: "active",
-        enabled: true,
-        config,
-        transportConfig: { ...config, composioSessions: {} },
-        credentialRefs: [],
-        credentialSecretRefs: [],
-        createdByAgentId:
-          binding.actorType === "agent" ? binding.actorId : null,
-        createdByUserId: binding.actorType === "user" ? binding.actorId : null,
-      })
-      .returning();
-    if (!created)
-      throw new Error("Failed to create Composio toolkit connection");
-    await ensureDefaultOrganizationGrant(created);
-    await syncCredentialBindings(created);
-    await ensureRuntimeSlot(created);
-    await audit({
-      companyId: created.companyId,
-      connectionId: created.id,
-      action: "composio.child_created",
-      outcome: "success",
-      actor,
-      details: {
-        parentConnectionId: parent.id,
-        toolkitSlug: account.toolkit.slug,
-      },
-    });
-    return created;
-  }
-
-  async function syncComposioToolkit(
-    parent: typeof toolConnections.$inferSelect,
-    toolkitSlug: string,
-    actor?: ActorInfo,
-  ) {
-    const client = await composioClientForParent(parent);
-    const userId = `paperclip:${parent.companyId}`;
-    const [toolkits, accounts] = await Promise.all([
-      client.listToolkits({ limit: 1000 }),
-      client.listConnectedAccounts({
-        toolkitSlugs: [toolkitSlug],
-        userIds: [userId],
-        limit: 100,
-      }),
-    ]);
-    const toolkit = toolkits.items.find((item) => item.slug === toolkitSlug);
-    if (!toolkit) throw notFound("Composio toolkit not found");
-    const account =
-      accounts.items.find(
-        (item) =>
-          item.toolkit.slug === toolkitSlug &&
-          item.status.toUpperCase() === "ACTIVE",
-      ) ??
-      accounts.items.find((item) => item.toolkit.slug === toolkitSlug) ??
-      null;
-    const child = account
-      ? await syncComposioChild(parent, account, toolkit.name, actor)
-      : null;
-    if (child)
-      await refreshCatalog(child.id, actor, { enableAllByDefault: true });
-    return {
-      toolkit,
-      account,
-      child: child ? toConnection(await getConnectionRow(child.id)) : null,
-    };
-  }
-
-  async function validateComposioConnection(
-    connection: typeof toolConnections.$inferSelect,
-  ) {
-    const client = await composioClientForParent(connection);
-    await client.validateApiKey();
-  }
-
-  async function listComposioServices(
-    parentConnectionId: string,
-    actor?: ActorInfo,
-  ) {
-    const parent = await getConnectionRow(parentConnectionId);
-    const client = await composioClientForParent(parent);
-    const userId = `paperclip:${parent.companyId}`;
-    const [toolkits, accounts] = await Promise.all([
-      client.listToolkits({ limit: 1000 }),
-      client.listConnectedAccounts({ userIds: [userId], limit: 1000 }),
-    ]);
-    const children = await existingComposioChildren(parent);
-    const childByToolkit = new Map(
-      children
-        .filter((child) => child.status !== "archived")
-        .map((child) => [composioChildConfig(child)?.toolkitSlug, child]),
-    );
-    const services = [];
-    for (const toolkit of toolkits.items) {
-      const toolkitAccounts = accounts.items.filter(
-        (account) => account.toolkit.slug === toolkit.slug,
-      );
-      const account =
-        toolkitAccounts.find(
-          (candidate) => candidate.status.toUpperCase() === "ACTIVE",
-        ) ??
-        toolkitAccounts[0] ??
-        null;
-      let child = childByToolkit.get(toolkit.slug) ?? null;
-      if (account?.status.toUpperCase() === "ACTIVE" && !child) {
-        child = await syncComposioChild(parent, account, toolkit.name, actor);
-        if (child)
-          await refreshCatalog(child.id, actor, { enableAllByDefault: true });
-      }
-      services.push({
-        toolkit,
-        status:
-          account?.status.toUpperCase() === "ACTIVE"
-            ? "connected"
-            : account
-              ? "pending"
-              : "not_connected",
-        connectedAccountId: account?.id ?? null,
-        connectedAccountStatus: account?.status ?? null,
-        childConnectionId: child?.id ?? null,
-      });
-    }
-    return { parentConnectionId: parent.id, userId, services };
-  }
-
-  async function startComposioServiceConnect(
-    parentConnectionId: string,
-    toolkitSlug: string,
-    input: { authConfigId?: string; callbackUrl?: string },
-  ) {
-    const parent = await getConnectionRow(parentConnectionId);
-    const client = await composioClientForParent(parent);
-    let authConfigId = input.authConfigId?.trim();
-    if (!authConfigId) {
-      const configs = await client.listAuthConfigs({
-        toolkitSlugs: [toolkitSlug],
-        showDisabled: false,
-        limit: 100,
-      });
-      authConfigId = configs.items.find(
-        (config) =>
-          config.toolkit.slug === toolkitSlug && config.status !== "DISABLED",
-      )?.id;
-    }
-    if (!authConfigId)
-      throw unprocessable(
-        "This Composio toolkit has no enabled auth configuration.",
-        { code: "composio_auth_config_missing" },
-      );
-    const link = await client.createConnectLink({
-      authConfigId,
-      userId: `paperclip:${parent.companyId}`,
-      alias: `paperclip-${parent.companyId}-${toolkitSlug}`,
-      ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),
-    });
-    return { toolkitSlug, authConfigId, ...link };
-  }
-
-  async function disconnectComposioService(
-    parentConnectionId: string,
-    toolkitSlug: string,
-    actor?: ActorInfo,
-  ) {
-    const parent = await getConnectionRow(parentConnectionId);
-    const client = await composioClientForParent(parent);
-    const accounts = await client.listConnectedAccounts({
-      toolkitSlugs: [toolkitSlug],
-      userIds: [`paperclip:${parent.companyId}`],
-      limit: 100,
-    });
-    for (const account of accounts.items.filter(
-      (candidate) => candidate.toolkit.slug === toolkitSlug,
-    )) {
-      await client.deleteConnectedAccount(account.id);
-    }
-    const children = await existingComposioChildren(parent);
-    const removedChildIds: string[] = [];
-    for (const child of children) {
-      if (
-        composioChildConfig(child)?.toolkitSlug !== toolkitSlug ||
-        child.status === "archived"
-      )
-        continue;
-      await removeConnection(child.id, child.companyId, actor);
-      removedChildIds.push(child.id);
-    }
-    await audit({
-      companyId: parent.companyId,
-      connectionId: parent.id,
-      action: "composio.service_disconnected",
-      outcome: "success",
-      actor,
-      details: {
-        toolkitSlug,
-        connectedAccountCount: accounts.items.length,
-        removedChildCount: removedChildIds.length,
-      },
-    });
-    return {
-      toolkitSlug,
-      disconnectedAccountIds: accounts.items.map((account) => account.id),
-      removedChildIds,
-    };
-  }
-
   function isAgentMailConnection(connection: typeof toolConnections.$inferSelect) {
     return connection.transport === "rest_api" && connection.config.provider === "agentmail";
   }
@@ -7470,11 +7029,18 @@ export function toolAccessService(
     await agentmailApi(key).whoami();
   }
 
+  function assertSupportedConnection(connection: typeof toolConnections.$inferSelect) {
+    if (isRetiredComposioConnection(connection)) {
+      throw unprocessable(RETIRED_COMPOSIO_MESSAGE, { code: "composio_broker_retired" });
+    }
+  }
+
   async function discoverTools(
     connection: typeof toolConnections.$inferSelect,
     credentialHeaders?: Record<string, string>,
     actor?: ActorInfo,
   ): Promise<McpToolDescriptor[]> {
+    assertSupportedConnection(connection);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections provide runtime authentication, not tool actions");
     if (isAgentMailConnection(connection)) {
       await validateAgentMailConnection(connection);
@@ -7482,10 +7048,6 @@ export function toolAccessService(
     }
     if (connection.transport === "mcp_remote")
       return remoteTools(connection, credentialHeaders, actor);
-    if (isComposioConnection(connection)) {
-      await validateComposioConnection(connection);
-      return [];
-    }
     if (connection.transport !== "local_stdio") {
       throw unsupportedToolConnectionTransport();
     }
@@ -7589,6 +7151,7 @@ export function toolAccessService(
     const connection = await getConnectionRow(connectionId);
     if (connection.connectionPurpose === "ai") return { connection: toConnection(connection), runtimeSlot: null };
     try {
+      assertSupportedConnection(connection);
       const config = asRecord(connection.config);
       const oauth = asRecord(config.oauth);
       if (
@@ -7631,7 +7194,6 @@ export function toolAccessService(
       } else if (isAgentMailConnection(connection)) {
         await validateAgentMailConnection(connection);
       } else if (connection.transport === "mcp_remote") {
-        await assertComposioConnectedAccountActive(connection);
         const canProbeWithoutAuthorization =
           options.allowUnauthenticatedProbe === true &&
           connection.status === "draft" &&
@@ -7648,8 +7210,6 @@ export function toolAccessService(
               ? {}
               : undefined;
         await remoteTools(connection, credentialHeaders, actor);
-      } else if (isComposioConnection(connection)) {
-        await validateComposioConnection(connection);
       } else if (connection.transport === "local_stdio") {
         await resolveCredentialHeaders(connection);
         await stdioTemplateId(connection.companyId, connection.config);
@@ -7664,11 +7224,9 @@ export function toolAccessService(
           ? "GitHub account, installation, and repository access are available."
           : isAgentMailConnection(connection)
             ? "AgentMail API key is connected."
-            : isComposioConnection(connection)
-              ? "Composio accepted the API key and returned its toolkits."
-              : connection.transport === "local_stdio"
-                ? "Approved stdio template is ready."
-                : "Remote MCP server responded to tools/list.",
+            : connection.transport === "local_stdio"
+              ? "Approved stdio template is ready."
+              : "Remote MCP server responded to tools/list.",
       );
       const runtimeSlot = await ensureRuntimeSlot(updated);
       await audit({
@@ -7772,6 +7330,13 @@ export function toolAccessService(
     const existingByName = new Map(
       existingRows.map((entry) => [entry.toolName, entry]),
     );
+    if (isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
+      const discoveredNames = new Set(descriptors.map((descriptor) => descriptor.name));
+      const removedIds = existingRows.filter((entry) => !discoveredNames.has(entry.toolName) && entry.status !== "disabled").map((entry) => entry.id);
+      if (removedIds.length) await db.update(toolCatalogEntries)
+        .set({ status: "disabled", quarantineReason: "mcp_tool_removed", updatedAt: refreshedAt })
+        .where(and(eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id), inArray(toolCatalogEntries.id, removedIds)));
+    }
     // Retired native actions are absent from discovery, but old catalog rows
     // still need to show as disabled. Gateway denial also applies before refresh.
     const blockedRailwayEntryIds = isRailwayEndpoint(connection.config.url)
@@ -7835,7 +7400,7 @@ export function toolAccessService(
         ? "disabled"
         : shouldQuarantine
           ? "quarantined"
-          : existing?.status === "disabled"
+          : existing?.status === "disabled" && existing.quarantineReason !== "mcp_tool_removed"
             ? "disabled"
             : quarantineOnRefresh && existing?.status === "quarantined"
               ? "quarantined"
@@ -7950,10 +7515,12 @@ export function toolAccessService(
     const activeEntries = updatedEntries.filter(
       (entry) => entry.status === "active",
     );
-    if (!refreshOptions.skipDefaultProfileSync) {
+    const preserveMcpAccess = connection.config.mcpPreserveAccess === true
+      && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
+    if (!refreshOptions.skipDefaultProfileSync || preserveMcpAccess) {
       await enableCatalogEntriesByDefault({
         connection: updatedConnection,
-        newCatalogEntryIds: refreshOptions.enableAllByDefault
+        newCatalogEntryIds: refreshOptions.enableAllByDefault && !isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)
           ? activeEntries.map((entry) => entry.id)
           : activeEntries
               .filter((entry) => {
@@ -7962,7 +7529,7 @@ export function toolAccessService(
               })
               .map((entry) => entry.id),
         activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
-        restoreDraftDefaults: refreshOptions.restoreDraftDefaults,
+        restoreDraftDefaults: refreshOptions.restoreDraftDefaults || preserveMcpAccess,
         actor,
       });
     }
@@ -12231,6 +11798,15 @@ export function toolAccessService(
     return `${base.slice(0, 151).trimEnd()} (${randomUUID().slice(0, 6)})`;
   }
 
+  async function assertMcpAggregatorSetupEnabled(provider: unknown, method: unknown) {
+    if (isRemoteMcpConnectorMethod(provider, method)
+      && !(await instanceSettingsService(db).getExperimental()).enableMcpAggregators) {
+      throw forbidden("Enable MCP aggregators in Settings → Experimental to set up this connection", {
+        code: "mcp_aggregators_disabled",
+      });
+    }
+  }
+
   async function connectGalleryApp(
     companyId: string,
     input: ConnectToolApp,
@@ -12260,6 +11836,7 @@ export function toolAccessService(
           ),
         );
       if (!connection) throw notFound("Incomplete app connection not found");
+      assertSupportedConnection(connection);
       if (input.resumeConnectionId && connection.status !== "draft") {
         throw conflict("Only an incomplete app connection can resume setup", {
           code: "connection_setup_not_incomplete",
@@ -12377,18 +11954,20 @@ export function toolAccessService(
     const method = galleryEntry
       ? connectionMethodFor(galleryEntry, inferredMethodKey)
       : null;
+    const remoteMcpConnector = isRemoteMcpConnectorMethod(galleryEntry?.slug, method?.key);
+    await assertMcpAggregatorSetupEnabled(galleryEntry?.slug, method?.key);
     if (galleryEntry && input.link) {
       const acceptsProviderGeneratedUrl =
         method?.transport === "mcp_remote" &&
         method.auth === "none" &&
         !method.defaults?.serverUrl &&
         !method.defaults?.serverUrlTemplate;
-      if (!acceptsProviderGeneratedUrl) {
+      if (!acceptsProviderGeneratedUrl && !remoteMcpConnector) {
         throw badRequest(
           `${galleryEntry.name} does not accept a provider-generated connection URL`,
         );
       }
-      if (!getAppDefinitionForUrl(input.link, [galleryEntry])) {
+      if (!(remoteMcpConnector && galleryEntry.slug === "executor") && !getAppDefinitionForUrl(input.link, [galleryEntry])) {
         throw badRequest(
           `That connection URL does not belong to ${galleryEntry.name}`,
         );
@@ -12699,6 +12278,7 @@ export function toolAccessService(
       transport === "mcp_remote"
         ? {
             url:
+              (remoteMcpConnector ? remoteUrlCredential?.publicUrl : undefined) ??
               normalizedMethodConfig?.url ??
               method?.defaults?.serverUrl ??
               remoteUrlCredential?.publicUrl ??
@@ -12716,6 +12296,11 @@ export function toolAccessService(
           // the wizard projects the app's action defaults into policies at
           // finish time instead of using catalog quarantine as access state.
           quarantineNewEntries: galleryEntry.slug === "railway",
+          ...(remoteMcpConnector ? {
+            mcpSessionRequired: true,
+            mcpAuthMode: input.authMode ?? "auto",
+            mcpPreserveAccess: Boolean(retainedConnection && (retainedConnection.status === "active" || asRecord(retainedConnection.config).mcpPreserveAccess === true)),
+          } : {}),
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
@@ -12734,7 +12319,7 @@ export function toolAccessService(
       config.quarantineNewEntries = true;
     }
     const acceptsCustomerOAuthClient =
-      method?.auth === "oauth" && method.ownershipModes.includes("customer");
+      remoteMcpConnector || (method?.auth === "oauth" && method.ownershipModes.includes("customer"));
     if (galleryEntry && input.oauthClient && !acceptsCustomerOAuthClient) {
       throw badRequest(
         `${galleryEntry.name} does not accept customer-owned OAuth client credentials`,
@@ -12784,7 +12369,7 @@ export function toolAccessService(
     // operator supplied and is upgraded to `oauth` when discovery proves the
     // endpoint needs sign-in (see `remoteTools` and `startOAuth`).
     const genericAuthKind: ToolConnectionAuthKind =
-      method?.auth ??
+      (remoteMcpConnector ? undefined : method?.auth) ??
       (input.authMode === "oauth" || input.oauthClient
         ? "oauth"
         : input.authMode === "bearer" || input.authMode === "custom_headers"
@@ -12834,7 +12419,8 @@ export function toolAccessService(
       previousGrantKind === requestedGrantKind &&
       galleryEntry &&
       retainedSource === galleryEntry.slug &&
-      retainedMethodKey === method?.key,
+      retainedMethodKey === method?.key &&
+      (!remoteMcpConnector || (baseConfig.url === retainedConfig.url && genericAuthKind === retainedConnection.authKind)),
     );
     const retainedCredentialSecretRefs = canRetainCredentialMaterial
       ? (retainedPersonalIdentity?.grant?.credentialSecretRefs ??
@@ -12866,9 +12452,9 @@ export function toolAccessService(
       const credentialFields =
         credentialSource === "vercel_connect"
           ? []
-          : galleryEntry
+          : galleryEntry && !remoteMcpConnector
             ? credentialFieldsFor(galleryEntry, method?.key)
-            : linkCredentialFields(credentialValues);
+            : linkCredentialFields({ ...Object.fromEntries(retainedCredentialSecretRefs.filter((ref) => ref.configPath.startsWith("headers.") || ref.configPath === "credentials.authorization").map((ref) => [ref.configPath, "retained"])), ...credentialValues });
       for (const field of credentialFields) {
         const value = credentialValues[field.configPath];
         const retainedSecretRef = retainedCredentialSecretRefs.find(
@@ -12923,6 +12509,13 @@ export function toolAccessService(
         }
       }
 
+      if (!remoteUrlCredential?.secretUrl && canRetainCredentialMaterial && baseConfig.url === retainedConfig.url) {
+        const retainedUrl = retainedCredentialSecretRefs.find((ref) => ref.configPath === REMOTE_URL_SECRET_CONFIG_PATH);
+        if (retainedUrl) {
+          credentialSecretRefs.push(retainedUrl);
+          credentialRefs.push({ name: REMOTE_URL_SECRET_CONFIG_PATH, secretId: retainedUrl.secretId, version: retainedUrl.versionSelector ?? "latest", placement: "url", key: "url", prefix: null });
+        }
+      }
       if (remoteUrlCredential?.secretUrl) {
         const secret = await secrets.create(
           companyId,
@@ -13072,6 +12665,7 @@ export function toolAccessService(
       const connectionCredentialSecretRefs =
         personalIdentityUserId || dedicatedAgentId ? [] : credentialSecretRefs;
       if (revivedConnectionPrevious) {
+        forgetMcpHttpSessions(revivedConnectionPrevious.id);
         [connectionRow] = await db
           .update(toolConnections)
           .set({
@@ -13292,6 +12886,10 @@ export function toolAccessService(
       );
       await ensureRuntimeSlot(connectionRow);
 
+      if (input.saveDraft && remoteMcpConnector) {
+        return { connectionId: connectionRow.id, application: toApplication(applicationRow), connection: toConnection(connectionRow),
+          catalog: [], actions: { readOnly: [], canMakeChanges: [] }, suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] } };
+      }
       if (galleryEntry && method?.auth === "oauth") {
         const suggestedDefaults = recommendedDefaultsForApp(
           galleryEntry,
@@ -13317,7 +12915,7 @@ export function toolAccessService(
       // empty personal grant below so later catalog refreshes use the same
       // identity policy.
       const unauthenticatedPersonalProbe = Boolean(
-        !galleryEntry &&
+        (!galleryEntry || remoteMcpConnector) &&
           genericAuthKind === "none" &&
           credentialSecretRefs.length === 0 &&
           personalIdentityUserId &&
@@ -13330,7 +12928,10 @@ export function toolAccessService(
         });
       } catch (error) {
         if (
-          !galleryEntry &&
+          (!galleryEntry || remoteMcpConnector) &&
+          input.authMode !== "none" &&
+          input.authMode !== "bearer" &&
+          input.authMode !== "custom_headers" &&
           error instanceof HttpError &&
           asRecord(error.details).code === "oauth_challenge"
         ) {
@@ -13421,26 +13022,9 @@ export function toolAccessService(
         // later fails: another retry may already be using the committed grant.
         personalPublicSetupEstablished = true;
       }
-      if (galleryEntry?.slug === COMPOSIO_GALLERY_KEY) {
-        const [application] = await db
-          .select()
-          .from(toolApplications)
-          .where(eq(toolApplications.id, applicationRow.id));
-        return {
-          connectionId: health.connection.id,
-          application: toApplication(application),
-          connection: health.connection,
-          catalog: [],
-          actions: { readOnly: [], canMakeChanges: [] },
-          suggestedDefaults: recommendedDefaultsForApp(
-            galleryEntry,
-            method?.key,
-          ),
-        };
-      }
       const restoreDraftDefaults = Boolean(revivedConnectionPrevious);
       const refreshOptions = {
-        enableAllByDefault: restoreDraftDefaults,
+        enableAllByDefault: restoreDraftDefaults && !remoteMcpConnector,
         restoreDraftDefaults,
       };
       const catalogConnectionId = connectionRow.id;
@@ -13802,6 +13386,23 @@ export function toolAccessService(
     const connection = await getConnectionRow(connectionId, companyId);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
+    if (connection.config.mcpPreserveAccess === true && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
+      const [profile] = await db.select().from(toolProfiles).where(and(
+        eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${connection.id}`),
+      )).limit(1);
+      if (!profile) throw conflict("The saved connection permissions could not be found");
+      const config = { ...connection.config };
+      delete config.mcpPreserveAccess;
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, updatedAt: new Date() })
+          .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId))).returning();
+        await tx.update(toolApplications).set({ status: "active", updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
+        return row;
+      });
+      const details = await profileDetails(profile.id, companyId);
+      const policies = (await db.select().from(toolPolicies).where(eq(toolPolicies.companyId, companyId))).filter((policy) => asRecord(policy.config).connectionId === connection.id);
+      return { connection: toConnection(updated), profile: toProfile(profile), profileEntries: details.entries, profileBindings: details.bindings, policies: policies.map(toPolicy) };
+    }
     const enabledIds = [
       ...new Set([
         ...input.enabledCatalogEntryIds,
@@ -13825,7 +13426,7 @@ export function toolAccessService(
       connection.id,
       input.askFirstCatalogEntryIds,
     );
-    if (enabledRows.some((entry) => entry.status === "disabled")) {
+    if (enabledRows.some((entry) => entry.status === "disabled" && !(entry.quarantineReason === "mcp_tool_removed" && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)))) {
       throw badRequest("Disabled actions cannot be enabled");
     }
     if (reviewedIds.length > 0) {
@@ -14032,6 +13633,28 @@ export function toolAccessService(
       }
 
       const profileBindings: ToolProfileBinding[] = [];
+      // These connectors expose one agent-access choice. Commit installation
+      // reach and permission bindings together, including an empty selection.
+      if (isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
+        const existingInstalls = await tx.select().from(toolConnectionInstalls).where(and(
+          eq(toolConnectionInstalls.companyId, companyId), eq(toolConnectionInstalls.connectionId, connection.id),
+        ));
+        const desired = new Map(bindingInputs.flatMap((binding) => binding.targetType === "company" || binding.targetType === "agent"
+          ? [[`${binding.targetType}:${binding.targetId}`, { targetType: binding.targetType, targetId: binding.targetId }] as const] : []));
+        const removed = existingInstalls.filter((install) => !desired.has(`${install.targetType}:${install.targetId}`));
+        const added = [...desired.values()].filter((binding) => !existingInstalls.some((install) => install.targetType === binding.targetType && install.targetId === binding.targetId));
+        if (removed.length) await tx.delete(toolConnectionInstalls).where(inArray(toolConnectionInstalls.id, removed.map((install) => install.id)));
+        if (added.length) await tx.insert(toolConnectionInstalls).values(added.map((binding) => ({
+          companyId, connectionId: connection.id, targetType: binding.targetType, targetId: binding.targetId,
+          createdByAgentId: actor?.actorType === "agent" ? (actor.actorId ?? null) : null,
+          createdByUserId: actor?.actorType === "user" ? (actor.actorId ?? null) : null,
+        })));
+        if (added.length || removed.length) await tx.insert(toolAccessAuditEvents).values({
+          companyId, connectionId: connection.id, actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? null,
+          action: "connection_installs.changed", outcome: "success", reasonCode: "installs_changed",
+          details: { added: added.map(({ targetType, targetId }) => ({ targetType, targetId })), removed: removed.map(({ targetType, targetId }) => ({ targetType, targetId })) },
+        });
+      }
       for (const bindingInput of bindingInputs) {
         const [binding] = await tx
           .insert(toolProfileBindings)
@@ -14094,6 +13717,7 @@ export function toolAccessService(
               eq(toolCatalogEntries.companyId, companyId),
               inArray(toolCatalogEntries.id, enabledIds),
               ne(toolCatalogEntries.status, "quarantined"),
+              ne(toolCatalogEntries.status, "disabled"),
             ),
           );
       }
@@ -14228,6 +13852,8 @@ export function toolAccessService(
     actor?: ActorInfo,
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId, companyId);
+    assertSupportedConnection(connection);
+    await assertMcpAggregatorSetupEnabled(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be reconnected");
     if (connection.credentialSource === "vercel_connect") {
@@ -14381,13 +14007,6 @@ export function toolAccessService(
       personalIdentity ? credentialSecretRefs : [],
     );
     const health = await checkConnectionHealth(updated.id, actor);
-    if (
-      isComposioConnection(updated) &&
-      updated.enabled &&
-      updated.status === "active"
-    ) {
-      await restoreComposioChildren(updated);
-    }
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
     });
@@ -14409,6 +14028,8 @@ export function toolAccessService(
     },
   ): Promise<ToolOAuthStartResult> {
     let connection = await getConnectionRow(connectionId, companyId);
+    assertSupportedConnection(connection);
+    await assertMcpAggregatorSetupEnabled(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot start sign in");
     const sourceTemplateKey =
@@ -15143,10 +14764,11 @@ export function toolAccessService(
         : suggestedAgentIds.length > 0
           ? { agentIds: suggestedAgentIds }
           : "all_agents";
+    const remoteMcpAccess = isRemoteMcpConnectorMethod(input.connection.config.sourceTemplateKey, input.connection.config.connectionMethodKey);
     const access: FinishToolApp["access"] = deferTaskAccess
       ? { agentIds: [] }
       : installs.length === 0
-        ? normalizedSuggestedAccess
+        ? remoteMcpAccess ? { agentIds: [] } : normalizedSuggestedAccess
         : companyInstall
           ? "all_agents"
           : { agentIds };
@@ -15181,7 +14803,7 @@ export function toolAccessService(
       },
       input.actor,
     );
-    if (!deferTaskAccess && installs.length === 0) {
+    if (!deferTaskAccess && !remoteMcpAccess && installs.length === 0) {
       const installTargets =
         access === "all_agents"
           ? [
@@ -16856,6 +16478,7 @@ export function toolAccessService(
     if (!app || app.availability?.available === false)
       throw notFound("App not found");
     const method = connectionMethodFor(app, methodKey);
+    await assertMcpAggregatorSetupEnabled(app.slug, method.key);
     if (method.transport !== "mcp_remote" || !method.defaults?.serverUrl) {
       throw unprocessable(
         "This app method does not use a hosted remote MCP endpoint",
@@ -16958,6 +16581,23 @@ export function toolAccessService(
   }
 
   return {
+    /** Identity-only verification: no bot installation/repository access required. */
+    verifyPersonalGitHubIdentity: async (companyId: string, connectionId: string, userId: string) => {
+      const [connection] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, connectionId), eq(toolConnections.enabled, true)));
+      if (!connection || (connection.config.sourceTemplateKey !== "github" && connection.transportConfig?.sourceTemplateKey !== "github")) throw notFound("GitHub connection not found");
+      const [ownGrant] = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, companyId), eq(connectionGrants.connectionId, connectionId), eq(connectionGrants.kind, "user"), eq(connectionGrants.subjectUserId, userId), eq(connectionGrants.status, "active")));
+      if (!ownGrant) throw forbidden("Connect your own GitHub account first. Shared and agent connections cannot prove your identity.");
+      const actor = { actorType: "user" as const, actorId: userId };
+      const grant = await refreshOAuthGrantCredentials({ companyId, connectionId, grantId: ownGrant.id, actor });
+      const accessRef = grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token");
+      if (!accessRef) throw unprocessable("Reconnect your personal GitHub connection");
+      const { value } = await resolveOAuthGrantSecret(connection, grant, accessRef, actor, undefined);
+      const identity = await githubBotRequest<{ id?: number; login?: string; avatar_url?: string }>(fetch, value, "/user");
+      if (!Number.isSafeInteger(identity.id) || !identity.id || !identity.login || !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,38}$/.test(identity.login)) throw unprocessable("GitHub returned an invalid account identity");
+      const [current] = await db.select({ id: connectionGrants.id }).from(connectionGrants).where(and(eq(connectionGrants.id, grant.id), eq(connectionGrants.companyId, companyId), eq(connectionGrants.subjectUserId, userId), eq(connectionGrants.status, "active")));
+      if (!current) throw forbidden("Your GitHub connection was revoked. Connect it again.");
+      return { githubUserId: String(identity.id), login: identity.login, avatarUrl: identity.avatar_url ?? null, connectionId, grantId: grant.id };
+    },
     preflightGalleryAppMetadata,
     approvedStdioTemplates: async (
       companyId: string,
@@ -17042,6 +16682,8 @@ export function toolAccessService(
 
     reconnectGalleryApp,
 
+    storeConnectorOAuthSecret: createOrRotateOAuthSecret,
+    resolveConnectorOAuthGrantSecret: resolveOAuthGrantSecret,
     startOAuth,
 
     startAuthorizationForAgent: async (input: {
@@ -17612,21 +17254,6 @@ export function toolAccessService(
       return connections;
     },
 
-    listComposioServices,
-
-    startComposioServiceConnect,
-
-    pollComposioService: async (
-      parentConnectionId: string,
-      toolkitSlug: string,
-      actor?: ActorInfo,
-    ) => {
-      const parent = await getConnectionRow(parentConnectionId);
-      return syncComposioToolkit(parent, toolkitSlug, actor);
-    },
-
-    disconnectComposioService,
-
     createConnection: async (
       companyId: string,
       input: CreateToolConnection,
@@ -17710,14 +17337,6 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(row);
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
-      if (
-        isComposioConnection(row) &&
-        (input.enabled !== undefined || input.status !== undefined)
-      ) {
-        if (!row.enabled || row.status !== "active")
-          await disableComposioChildren(row);
-        else await restoreComposioChildren(row);
-      }
       return toConnection(row);
     },
 
@@ -18608,10 +18227,6 @@ export function toolAccessService(
         .returning();
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
-      if (isComposioConnection(row)) {
-        if (row.enabled) await restoreComposioChildren(row);
-        else await disableComposioChildren(row);
-      }
       return toConnection(row);
     },
 

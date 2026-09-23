@@ -14,6 +14,8 @@ import { ChatEndpointDetail } from "./ChatEndpointDetail";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
+  getAgent: vi.fn(),
+  listAgents: vi.fn(),
   tab: "access",
   listActivityPage: vi.fn(),
   create: vi.fn(),
@@ -23,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   finishSlackSetup: vi.fn(),
   generateSetupSecret: vi.fn(),
   listPrincipals: vi.fn(),
+  listResources: vi.fn().mockResolvedValue([]),
   createLinkIntent: vi.fn(),
   confirmIdentityLink: vi.fn(),
   pushToast: vi.fn(),
@@ -31,9 +34,13 @@ const mocks = vi.hoisted(() => ({
   setParams: vi.fn(),
 }));
 vi.mock("@/api/chatEndpoints", () => ({ chatEndpointsApi: mocks }));
+vi.mock("@/api/githubChat", () => ({ githubChatApi: {
+  configuration: async () => ({ revision: 0, configuration: {} }),
+  progress: async () => mocks.get(),
+} }));
 vi.mock("@/api/auth", () => ({ authApi: { getSession: async () => ({ user: { id: "owner-user", name: "Owner" } }) } }));
 vi.mock("@/api/health", () => ({ healthApi: { get: async () => ({ deploymentMode: "authenticated" }) } }));
-vi.mock("@/api/agents", () => ({ agentsApi: { list: async () => [] } }));
+vi.mock("@/api/agents", () => ({ agentsApi: { list: mocks.listAgents, get: mocks.getAgent } }));
 vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableIsolatedWorkspaces: true }) } }));
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({ selectedCompanyId: "company-a" }),
@@ -67,6 +74,10 @@ describe("chat setup and identity-link clipboard actions", () => {
   const secret = "synthetic-one-time-webhook-secret";
 
   beforeEach(() => {
+    localStorage.clear();
+    mocks.listAgents.mockResolvedValue([{ id: "agent-a", name: "Maya", status: "idle" }]);
+    mocks.getAgent.mockResolvedValue({ id: "agent-a", name: "Maya", appearance: { schemaVersion: 1, characterVersion: "cap-v1", paletteId: "cherry-pop" } });
+    mocks.listResources.mockResolvedValue([]);
     mocks.tab = "access";
     mocks.listActivityPage.mockReset();
     container = document.createElement("div");
@@ -363,13 +374,13 @@ describe("chat setup and identity-link clipboard actions", () => {
     await client.invalidateQueries({ queryKey: ["chat-endpoint-slack-webhook-verification", endpoint.id] });
     await settle();
     expect(mocks.setup).toHaveBeenLastCalledWith(endpoint.id, { action: "verify", credentials: undefined });
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
-    expect(container.textContent).toContain("/maya-test connect");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Add avatar");
+    expect(container.textContent).toContain("Give Maya a face in Slack");
     await click("4Verify Slack connection");
     expect(container.querySelector("h1")?.textContent).toBe("Verify Slack connection");
     expect(container.textContent).toContain("Slack verified your connection.");
     await click("Continue");
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Add avatar");
     expect(mocks.setup).toHaveBeenCalledTimes(2);
     await click("3Add credentials");
     expect(container.querySelector("h1")?.textContent).toBe("Add Slack credentials");
@@ -386,7 +397,7 @@ describe("chat setup and identity-link clipboard actions", () => {
     await settle();
     expect(mocks.setup).toHaveBeenCalledTimes(1);
     expect(mocks.setup).toHaveBeenCalledWith(endpoint.id, { action: "verify", credentials: undefined });
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Add avatar");
   });
 
   it("picks up verification completed in another tab", async () => {
@@ -400,7 +411,7 @@ describe("chat setup and identity-link clipboard actions", () => {
     flushSync(() => client.setQueryData(["chat-endpoint-setup-resume", endpoint.id], verified));
     await settle();
     expect(mocks.setup).toHaveBeenCalledTimes(1);
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Add avatar");
     expect(container.textContent).not.toContain("Connection failed");
   });
 
@@ -418,7 +429,7 @@ describe("chat setup and identity-link clipboard actions", () => {
     mocks.setup.mockResolvedValueOnce({ ...verified, setup: { ...verified.setup, step: "test" } });
     await click("Continue");
     expect(mocks.setup).toHaveBeenCalledTimes(2);
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Add avatar");
   });
 
   async function renderSlackIdentityStep() {
@@ -428,8 +439,55 @@ describe("chat setup and identity-link clipboard actions", () => {
       setup: { ...endpoint.setup, step: "test", command: "/maya-test", testStartedAt: "2026-09-18T20:00:00Z" },
     }));
     await settle();
+    await click("Skip for now");
     return endpoint;
   }
+
+  it("uses the persisted agent appearance and remembers avatar confirmation on resume", async () => {
+    await renderSlackIdentityStep();
+    await click("5Add avatar");
+    const download = container.querySelector<HTMLAnchorElement>('a[download]')!;
+    expect(download.getAttribute("href")).toBe("/api/agent-avatars/cap-v1/cherry-pop/rest.png?size=512&scale=1");
+    expect(download.download).toBe("maya-paperclip-avatar.png");
+    const endpoint = client.getQueryData<ChatEndpoint>(["chat-endpoint-setup-resume", "endpoint-a"])!;
+    flushSync(() => client.setQueryData(["chat-endpoint-setup-resume", "endpoint-a"], {
+      ...endpoint, setup: { ...endpoint.setup, slackApp: { appName: "Custom Slack App", botName: "custom", command: "/custom" } },
+    }));
+    await settle();
+    expect(container.querySelector<HTMLAnchorElement>('a[download]')!.download).toBe("Custom-Slack-App-avatar.png");
+    expect(container.textContent).toContain("Custom Slack App");
+    await click("I’ve uploaded the avatar");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("6Connect your Slack account");
+    await click("5Add avatar");
+    expect(container.textContent).toContain("You marked the avatar as uploaded in Slack.");
+    expect(localStorage.getItem("paperclip:slack-avatar:v1:company-a:endpoint-a")).toBe("uploaded");
+    flushSync(() => root.unmount());
+    root = createRoot(container);
+    const saved = client.getQueryData<ChatEndpoint>(["chat-endpoint-setup-resume", "endpoint-a"])!;
+    mocks.get.mockResolvedValue(saved);
+    flushSync(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ChatSetupSidebarProvider><ChatSetupSidebar /><ChatEndpointSetup /></ChatSetupSidebarProvider></TooltipProvider></QueryClientProvider>));
+    await settle();
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("6Connect your Slack account");
+  });
+
+  it("keeps a terminated agent’s saved avatar when the company list omits it", async () => {
+    mocks.listAgents.mockResolvedValue([]);
+    mocks.getAgent.mockResolvedValue({ id: "agent-a", name: "Maya", status: "terminated", appearance: { schemaVersion: 1, characterVersion: "cap-v1", paletteId: "orchid-peach" } });
+    await renderSlackIdentityStep();
+    await click("5Add avatar");
+    expect(container.querySelector('a[download]')?.getAttribute("href")).toBe("/api/agent-avatars/cap-v1/orchid-peach/rest.png?size=512&scale=1");
+    expect(mocks.getAgent).toHaveBeenCalledWith("agent-a", "company-a");
+  });
+
+  it("keeps avatar download available in connector settings", async () => {
+    mocks.tab = "settings";
+    await render("slack", true);
+    const section = container.querySelector('section[aria-label="Slack avatar"]')!;
+    expect(section.textContent).toContain("Download avatar");
+    expect(section.querySelector('a[download]')?.getAttribute("href")).toContain("/cherry-pop/rest.png?size=512&scale=1");
+    expect(section.querySelector("details")?.open).toBe(false);
+    expect(mocks.getAgent).toHaveBeenCalledWith("agent-a", "company-a");
+  });
 
   it("waits for a fresh connect command and links the selected identity inside the wizard", async () => {
     mocks.listPrincipals.mockResolvedValue([
@@ -459,9 +517,9 @@ describe("chat setup and identity-link clipboard actions", () => {
     expect(mocks.createLinkIntent).toHaveBeenCalledWith("endpoint-a", "principal-a");
     expect(mocks.confirmIdentityLink).toHaveBeenCalledWith("synthetic-private-confirmation-token");
     expect(container.textContent).toContain("Linked to you");
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("5Connect your Slack account");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("6Connect your Slack account");
     await click("Continue to message test");
-    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("6Try it");
+    expect(container.querySelector('aside button[aria-current="step"]')?.textContent).toBe("7Try it");
     expect(container.textContent).toContain("@Maya you there?");
     await click("Copy message");
     expect(copied).toContain("@Maya you there?");
@@ -478,10 +536,10 @@ describe("chat setup and identity-link clipboard actions", () => {
     client.setQueryData(["chat-endpoint-setup-test-status", "endpoint-a"], { messageReceivedAt: "2026-09-18T20:02:00Z" });
     await settle();
     expect(container.textContent).toContain("Received your Slack message.");
-    await click("5Connect your Slack account");
+    await click("6Connect your Slack account");
     expect([...container.querySelectorAll("h1")].find((heading) => !heading.closest("[hidden]"))?.textContent).toBe("Connect your Slack account");
     expect(container.textContent).toContain("Linked to you");
-    await click("6Try it");
+    await click("7Try it");
     expect([...container.querySelectorAll("h1")].find((heading) => !heading.closest("[hidden]"))?.textContent).toBe("Try Maya in Slack");
   });
 
@@ -533,9 +591,9 @@ describe("chat setup and identity-link clipboard actions", () => {
     "lets %s setup revisit the agent without duplicating the connection or losing provider fields",
     async (provider) => {
       await render(provider);
-      const nav = container.querySelector('aside nav[aria-label="Connection setup progress"]')!;
+      const nav = container.querySelector(provider === "github" ? 'nav[aria-label="Setup progress"]' : 'aside nav[aria-label="Connection setup progress"]')!;
       expect(nav).not.toBeNull();
-      expect(container.querySelector("main nav")).toBeNull();
+      if (provider !== "github") expect(container.querySelector("main nav")).toBeNull();
       const steps = [...nav.querySelectorAll("button")];
       expect(steps[1].getAttribute("aria-current")).toBe("step");
       expect(steps[2].disabled).toBe(true);
@@ -549,13 +607,14 @@ describe("chat setup and identity-link clipboard actions", () => {
       expect([...container.querySelectorAll("main input")]).toEqual(fields);
       expect(mocks.create).not.toHaveBeenCalled();
       await click("1Choose agent");
-      await click(provider === "slack" ? "2Create Slack app" : "2Connect provider");
+      await click(provider === "slack" ? "2Create Slack app" : provider === "github" ? "2Connect GitHub App" : "2Connect provider");
       expect(steps[1].getAttribute("aria-current")).toBe("step");
     },
   );
 
   it("copies the one-time webhook secret through the same fallback", async () => {
     await render("github");
+    await click("Use an existing App");
     await click("Generate webhook secret");
     await click("Copy webhook secret");
     expect(copied).toEqual([secret]);
@@ -564,6 +623,7 @@ describe("chat setup and identity-link clipboard actions", () => {
 
   it("reports a failed secret copy without exposing the secret or an unhandled rejection", async () => {
     await render("github");
+    await click("Use an existing App");
     await click("Generate webhook secret");
     execCommand.mockReturnValue(false);
     await click("Copy webhook secret");
@@ -580,6 +640,7 @@ describe("chat setup and identity-link clipboard actions", () => {
   // once and then nothing. The inline state has to answer every click.
   it("still shows a repeated copy failure the toast would have deduplicated", async () => {
     await render("github");
+    await click("Use an existing App");
     await click("Generate webhook secret");
     execCommand.mockReturnValue(false);
 

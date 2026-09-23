@@ -217,6 +217,7 @@ jobs:
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
+            type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           labels: |
             io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
             io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
@@ -279,6 +280,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       # Checked out for `packages/db` (schema labels) and the orphan-reaping
       # script the verification step pipes in.
@@ -332,6 +335,7 @@ jobs:
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=sha
+            type=raw,value=sha-${{ github.sha }},enable=${{ github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           labels: |
             io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
             io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
@@ -361,6 +365,27 @@ jobs:
           test -n "$image"
           echo "Verifying orphan reaping in $image"
           docker run --rm -i --pull always "$image" sh -s < scripts/assert-orphan-reaping.sh
+
+      # This generic contract is useful to any downstream image composer. Only
+      # canonical master pushes own the full-SHA tag and its signed provenance.
+      # Capture exact registry bytes; both the smoke and attestation use their
+      # digest, so later tag movement cannot change what was verified.
+      - name: Resolve standard image digest
+        id: standard
+        if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: node scripts/standard-image-contract.mjs --resolve "$GITHUB_SHA"
+      - name: Verify the immutable standard image
+        if: steps.standard.outputs.digest != ''
+        env:
+          IMAGE_DIGEST: ${{ steps.standard.outputs.digest }}
+        run: docker run --rm -i --pull always "ghcr.io/paperclipai/paperclip@$IMAGE_DIGEST" sh -s < scripts/assert-orphan-reaping.sh
+      - name: Attest the standard production image
+        if: steps.standard.outputs.digest != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/paperclipai/paperclip
+          subject-digest: ${{ steps.standard.outputs.digest }}
+          push-to-registry: true
 
   # Master cloud builds start independently in docker-cloud.yml. Tag builds
   # and manual Docker dispatches call the same implementation, preserving the

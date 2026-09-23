@@ -1,5 +1,7 @@
+import { MediaArtifactCard } from "@/components/artifacts/MediaArtifactCard";
 import { WebhookUrlWarning } from "@/components/routine-triggers/WebhookUrlWarning";
 import { SetupWizardNavigation, SetupWizardFooter } from "../components/SetupWizard";
+import { RemoteMcpDesignExample } from "@/features/connections/remote-mcp/RemoteMcpDesignExample";
 import { AgentChatPicker } from "@/components/AgentChatPicker";
 import { TaskChatProjectCreatedCard } from "@/components/task-chat/TaskChatProjectCreatedCard";
 import { AnnouncementCard } from "@/components/AnnouncementCard";
@@ -16,9 +18,6 @@ import { TaskChatMarker } from "@/components/task-chat/TaskChatMarker";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
 import { TaskTreeControlDialog, TaskTreeControlMenuItems } from "@/components/TaskTreeControls";
 import { useState } from "react";
-import { ServicesList } from "./apps/app-detail/ServicesPanel";
-import { ComposioProvenanceChip } from "./apps/ComposioProvenanceChip";
-import type { ComposioServiceRow } from "./apps/composio-services";
 import {
   BookOpen,
   Bot,
@@ -272,58 +271,6 @@ const DESIGN_GUIDE_TASK = {
 /* ------------------------------------------------------------------ */
 /*  Section wrapper                                                    */
 /* ------------------------------------------------------------------ */
-
-/**
- * Composio service rows for the design guide (PAP-17865). One row per state, so
- * a reader can compare all four side by side rather than connecting a real
- * Composio project to see them.
- */
-const DESIGN_GUIDE_COMPOSIO_ROWS: ComposioServiceRow[] = [
-  {
-    toolkitSlug: "github",
-    name: "GitHub",
-    description: "Issues, pull requests, and repository actions",
-    logoUrl: null,
-    state: "connected",
-    connectedAccountStatus: "ACTIVE",
-    childConnectionId: "design-guide-child",
-    toolCount: 42,
-    noAuth: false,
-  },
-  {
-    toolkitSlug: "hubspot",
-    name: "HubSpot",
-    description: "CRM contacts and deals",
-    logoUrl: null,
-    state: "attention",
-    connectedAccountStatus: "EXPIRED",
-    childConnectionId: "design-guide-child-2",
-    toolCount: 18,
-    noAuth: false,
-  },
-  {
-    toolkitSlug: "slack",
-    name: "Slack",
-    description: "Channels and messages",
-    logoUrl: null,
-    state: "pending",
-    connectedAccountStatus: "INITIALIZING",
-    childConnectionId: null,
-    toolCount: 12,
-    noAuth: false,
-  },
-  {
-    toolkitSlug: "gmail",
-    name: "Gmail",
-    description: "Read and send mail",
-    logoUrl: null,
-    state: "not_connected",
-    connectedAccountStatus: null,
-    childConnectionId: null,
-    toolCount: 9,
-    noAuth: false,
-  },
-];
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -808,6 +755,10 @@ export function DesignGuide() {
           </div>
         </SubSection>
 
+        <SubSection title="Idle Slack conversation">
+          <StatusIcon status="in_review" externalConversationState="waiting" showLabel />
+          <IssueStatusBadge status="in_review" externalConversationState="waiting" />
+        </SubSection>
         <SubSection title="StatusIcon (interactive)">
           <div className="flex items-center gap-3 flex-wrap">
             {["backlog", "todo", "in_progress", "in_review", "done", "cancelled", "blocked"].map(
@@ -1693,6 +1644,10 @@ export function DesignGuide() {
       {/*  NAVIGATION PATTERNS                                          */}
       {/* ============================================================ */}
       <Section title="Navigation Patterns">
+        <SubSection title="Independent MCP connections">
+          <p className="text-sm text-muted-foreground">Zapier, Arcade, Composio and Executor each own a connection. Their controlled setup views share Access → Connect. Tool discovery completes setup. Saved connections reuse the standard Permissions action list and per-action Test dialog. Storybook’s Apps / Connections groups use in-memory provider fixtures.</p>
+          <RemoteMcpDesignExample />
+        </SubSection>
         <SubSection title="Setup wizard">
           <p className="text-sm text-muted-foreground">Shared by connection setup and trigger previews. Setup navigation takes over the section sidebar; each step owns a single footer.</p>
           <div className="max-w-sm space-y-6">
@@ -2190,49 +2145,6 @@ export function DesignGuide() {
         </SubSection>
       </Section>
 
-      <Section title="Composio Services">
-        <p className="text-sm text-muted-foreground">
-          A broker connection (Composio) fronts many services, so its detail page lists toolkits
-          with per-service state instead of one credential. Row state comes from Composio's own
-          account status, which is why there is a fourth <code>attention</code> state alongside the
-          three the design asks for: an expired credential is neither connected nor still settling.
-        </p>
-        <SubSection title="Row states">
-          <ServicesList
-            rows={DESIGN_GUIDE_COMPOSIO_ROWS}
-            busySlug={null}
-            onConnect={() => {}}
-            onRecheck={() => {}}
-            onDisconnect={() => {}}
-          />
-        </SubSection>
-        <SubSection title="Busy row">
-          <ServicesList
-            rows={[DESIGN_GUIDE_COMPOSIO_ROWS[2]!]}
-            busySlug={DESIGN_GUIDE_COMPOSIO_ROWS[2]!.toolkitSlug}
-            onConnect={() => {}}
-            onRecheck={() => {}}
-            onDisconnect={() => {}}
-          />
-        </SubSection>
-        <SubSection title="Provenance chip">
-          <p className="mb-2 text-xs text-muted-foreground">
-            Shown wherever a brokered child connection appears, so the parent/child coupling is
-            legible. Links to the broker's Services tab when the parent is known.
-          </p>
-          <div className="flex items-center gap-3">
-            <ComposioProvenanceChip
-              connection={{
-                config: { provider: "composio", parentConnectionId: "parent-1", toolkitSlug: "github" },
-              }}
-            />
-            <ComposioProvenanceChip
-              connection={{ config: { provider: "composio", toolkitSlug: "gmail" } }}
-            />
-          </div>
-        </SubSection>
-      </Section>
-
       <Section title="Source Repositories">
         <SubSection title="Empty and disconnected">
           <RepositoryEditor selected={[]} onChange={() => {}} state="disconnected" onConnect={() => {}} onRetry={() => {}} />
@@ -2394,6 +2306,14 @@ export function DesignGuide() {
           <InlineBanner tone="info" compact>
             Compact variant for embedding inside dialogs and modals.
           </InlineBanner>
+        </div>
+      </Section>
+
+      <Section title="Media artifacts">
+        <p className="text-sm text-muted-foreground">Images and videos use gallery tiles. The whole tile opens the task gallery; files and links keep compact, fully clickable rows. Task/Artifact Gallery in Storybook covers playable videos, mixed files, narrow panels, and unavailable previews.</p>
+        <div className="grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+          <MediaArtifactCard id="design-image" title="Launch artwork" contentPath="/announcement-preview.svg" contentType="image/svg+xml" originalFilename="launch.svg" detail="Image" />
+          <MediaArtifactCard id="design-video" title="Video preview unavailable" contentPath="" contentType="video/mp4" originalFilename="preview.mp4" detail="Video" />
         </div>
       </Section>
 

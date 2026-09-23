@@ -369,6 +369,7 @@ Mount surfaces currently wired in the host include:
 - `projectSidebarItem`
 - `globalToolbarButton`
 - `appShellOverlay` (persistent, signed-in application shell)
+- `organizationSwitcher` (one React contribution replacing the organization menu)
 - `toolbarButton`
 - `contextMenuItem`
 - `commentAnnotation`
@@ -617,3 +618,21 @@ pnpm build
 
 For image-supplied plugins and the persistent shell lifecycle, see
 [Distribution plugins](DISTRIBUTION-PLUGINS.md).
+
+### Organization switcher
+
+Declare one `organizationSwitcher` slot with `ui.sidebar.register`. The host
+passes `PluginOrganizationSwitcherProps`: current company display data, collapsed
+and open state, navigation/logout callbacks, and an icon renderer. Use the host
+logout callback; authenticate remote account requests at their owning service.
+`currentCompany` describes the host-local company. A distribution plugin must
+resolve its external account/organization label itself; the host does not fetch
+that portfolio on the plugin's behalf.
+The slot props and `useHostContext()` are display context, not proof of identity.
+The host reserves the trigger with a neutral placeholder while account, company,
+and plugin discovery load. Plugins should reserve the same space while their
+external label loads and retain resolved labels during same-account refreshes.
+The host resets plugin state on account/company changes and keeps its built-in
+menu when no unique contribution exists, discovery fails, the module is missing,
+or rendering throws. The slot is a React-only contract; do not use a custom
+element export. This replaces only the menu, not company policy or authorization.

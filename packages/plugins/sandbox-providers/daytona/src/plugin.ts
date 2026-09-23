@@ -502,6 +502,13 @@ async function ensureSandboxStarted(sandbox: Sandbox, timeoutSeconds: number): P
   await withLivenessTimeout("sandbox.start", startBoundMs, () => sandbox.start(timeoutSeconds));
 }
 
+function hasMissingSandboxContainer(sandbox: Sandbox): boolean {
+  if (sandbox.state !== "error" || sandbox.recoverable !== false || typeof sandbox.errorReason !== "string") return false;
+  if (typeof sandbox.id !== "string" || !sandbox.id) return false;
+  return sandbox.errorReason ===
+    `not found: failed to inspect sandbox container ${sandbox.id}: Error response from daemon: No such container: ${sandbox.id}`;
+}
+
 async function resolveSandboxWorkingDirectory(sandbox: Sandbox): Promise<string> {
   const root = (await sandbox.getWorkDir())?.trim()
     || (await sandbox.getUserHomeDir())?.trim()
@@ -2226,6 +2233,26 @@ const plugin = definePlugin({
       const sandbox = await getSandboxOrNull(scope, { bypassTeardownGate: true });
       if (!sandbox) {
         return { providerLeaseId: null, metadata: { expired: true } };
+      }
+
+      // Daytona can retain the API record after losing its container. Confirm
+      // the exact provider report again before allowing the host's existing
+      // backup-guarded replacement path. Unknown errors preserve the lease.
+      if (hasMissingSandboxContainer(sandbox)) {
+        try {
+          await withLivenessTimeout("sandbox.refreshData", config.livenessTimeoutMs, () => sandbox.refreshData());
+          assertHandleMatchesLease(sandbox, params.providerLeaseId);
+        } catch (error) {
+          evictSandboxHandle(scope);
+          if (error instanceof DaytonaNotFoundError) {
+            return { providerLeaseId: null, metadata: { expired: true } };
+          }
+          throw error;
+        }
+        if (hasMissingSandboxContainer(sandbox)) {
+          evictSandboxHandle(scope);
+          return { providerLeaseId: null, metadata: { expired: true } };
+        }
       }
 
         // A stopped sandbox loses its session shell, so the stored session id is

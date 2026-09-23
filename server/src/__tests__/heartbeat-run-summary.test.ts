@@ -847,6 +847,20 @@ describe("resolveHeartbeatRunResponse", () => {
     ).toBeNull();
   });
 
+  it.each([false, true])("keeps board approval comments unless the chat origin is verified (%s)", (verified) => {
+    const resolved = resolveHeartbeatRunResponse({
+      resultJson: {},
+      existingComment: { id: "approval-comment", body: "Explicit task outcome" },
+      finalAgentMessage: { text: "Final Slack outcome", sourceEventId: "final-10", channel: "final" },
+      preferFinalResponseOverExistingComment: isExternalChatPresentationContext({
+        source: "tool_action_review",
+        externalChatContinuation: true,
+      }, verified),
+    });
+    expect(resolved.text).toBe(verified ? "Final Slack outcome" : "Explicit task outcome");
+    expect(resolved.decision.commentAction).toBe(verified ? "create" : "reuse");
+  });
+
   it("recognizes root and continuation external-chat presentation contexts", () => {
     expect(
       isExternalChatPresentationContext({
@@ -872,6 +886,8 @@ describe("resolveHeartbeatRunResponse", () => {
     expect(isExternalChatPresentationContext({ source: "chatty:github" })).toBe(
       false,
     );
+    expect(isExternalChatPresentationContext({ source: "tool_action_review" })).toBe(false);
+    expect(isExternalChatPresentationContext({ source: "tool_action_review" }, true)).toBe(true);
     expect(isExternalChatPresentationContext(null)).toBe(false);
   });
 });

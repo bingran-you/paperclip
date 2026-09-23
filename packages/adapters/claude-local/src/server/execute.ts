@@ -1286,7 +1286,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? `detected ${detectedCliVersion}`
           : "could not determine the installed version";
         const errorMessage =
-          `Claude Fable 5.1 requires Claude Code ${minimumCliVersion} or newer on the CLI lane; ${detected}. ` +
+          `${model} requires Claude Code ${minimumCliVersion} or newer on the CLI lane; ${detected}. ` +
           "Upgrade Claude Code or restore the default ACP lane before retrying.";
         await onLog("stderr", `[paperclip] ${errorMessage}\n`);
         return {
