@@ -1,4 +1,4 @@
-import { APP_STORE_DEFINITIONS, appSupportsCatalogSetup } from "@paperclipai/shared";
+import { APP_STORE_DEFINITIONS, aiConnectionRouterAppDefinition, appSupportsCatalogSetup } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
 import {
   MCP_DIRECT_OAUTH_CONNECT_SLUGS,
@@ -32,6 +32,10 @@ describe("app connect policy", () => {
     expect(canEnterAppsConnect(new URLSearchParams("source=context7"))).toBe(false);
     expect(canEnterAppsConnect(new URLSearchParams("source=zapier"))).toBe(true);
     expect(canEnterAppsConnect(new URLSearchParams("source=unknown"))).toBe(false);
+    expect(canEnterAppsConnect(new URLSearchParams("source=model-provider"))).toBe(false);
+    for (const source of ["responses-api", "messages-api", "chat-completions-api", "bedrock", "local", "google", "openrouter"]) {
+      expect(canEnterAppsConnect(new URLSearchParams({ source })), source).toBe(true);
+    }
     expect(canEnterAppsConnect(new URLSearchParams("byo=1"))).toBe(false);
     expect(canEnterAppsConnect(new URLSearchParams("byo=1&source=zapier"))).toBe(false);
   });
@@ -61,6 +65,14 @@ describe("app connect policy", () => {
     );
     expect(vercelConnectSourceHref()).toBe("/apps/vercel-connect");
     expect(vercelConnectSourceHref("notion")).toBe("/apps/vercel-connect?source=notion");
+  });
+
+  it("lets installed router connectors reach host catalog validation", () => {
+    const pool = aiConnectionRouterAppDefinition("example.pool", { name: "AI connection pool", description: "Use saved connections" });
+    const params = new URL(appSourceConnectHref(pool.slug), "http://paperclip.test").searchParams;
+    expect(canEnterAppsConnect(params)).toBe(true);
+    expect(canEnterAppsConnect(new URLSearchParams("source=ai-router-invalid"))).toBe(false);
+    expect(canEnterAppsConnect(new URLSearchParams("source=ai-router-1"))).toBe(false);
   });
 
   it("routes every capability-backed catalog definition through its source deep link", () => {

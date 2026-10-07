@@ -1,7 +1,7 @@
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, isNull, ne, sql } from "drizzle-orm";
 import {
   type Db,
   agents,
@@ -27,6 +27,7 @@ import {
   companyMemberships,
   instanceUserRoles,
 } from "@paperclipai/db";
+import { compareCents } from "@paperclipai/shared";
 import type {
   AgentPermissions,
   EmailEndpointSetupInput,
@@ -74,6 +75,8 @@ export type EmailActor = {
 type Endpoint = typeof chatEndpoints.$inferSelect;
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export interface EmailChannelOptions {
+  /** Suppress periodic database work while an unclaimed Cloud app stands by. */
+  isBackgroundWorkEnabled?: () => boolean;
   heartbeat: Pick<ReturnType<typeof heartbeatService>, "wakeup">;
   storage?: StorageService;
   publicBaseUrl?: string;
@@ -520,7 +523,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         );
       await authorizeRead(endpoint.companyId, issueId, actor);
       const [agent] = await db
-        .select()
+        .select({ ...getTableColumns(agents), spentMonthlyCentsExact: sql<string>`${agents.spentMonthlyCents}::text` })
         .from(agents)
         .where(
           and(
@@ -532,7 +535,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
         !agent ||
         ["paused", "terminated", "pending_approval"].includes(agent.status) ||
         (agent.budgetMonthlyCents > 0 &&
-          agent.spentMonthlyCents >= agent.budgetMonthlyCents)
+          compareCents(agent.spentMonthlyCentsExact, agent.budgetMonthlyCents) >= 0)
       )
         throw forbidden("Agent is not available to send email");
       if (!actor.runId)
@@ -2041,6 +2044,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       await Promise.all(items.slice(i, i + 4).map(work));
   }
   async function tick() {
+    if (options.isBackgroundWorkEnabled?.() === false) return;
     if (activeTick) return activeTick;
     activeTick = runTick();
     try {

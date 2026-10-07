@@ -198,7 +198,7 @@ const embeddedPostgresSupport = externalTestDatabaseUrl
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
-  ? describe.sequential
+  ? describe
   : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -1088,7 +1088,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await db.insert(companies).values({
       id: companyId,
       name: `Chat Test ${companyId.slice(0, 8)}`,
-      issuePrefix: `C${companyId.replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+      issuePrefix: `C${companyId.replace(/-/g, "").toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
     const now = new Date();
@@ -7679,6 +7679,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).toBe(1);
     expect(deferred).toHaveLength(1);
 
+    // The production reorder window is 750 ms; allow the subsequent database
+    // drain to finish on loaded CI instead of sharing the default one-second budget.
     deferred.shift()?.();
     await vi.waitFor(async () => {
       const rows = await db
@@ -7686,7 +7688,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
-    });
+    }, { timeout: 10_000 });
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -7702,7 +7704,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "unmentioned follow-up delivered first",
       ]);
       expect(wakeup).toHaveBeenCalledTimes(2);
-    });
+    }, { timeout: 10_000 });
     await service.shutdown();
   });
 
@@ -20830,6 +20832,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       trigger: "subscribed_message",
     });
 
+    // Keep this ordering assertion independent of database/CI wall-clock speed.
+    // The next drain below explicitly makes both deliveries due.
+    await db.update(chatDeliveries).set({ nextAttemptAt: new Date(Date.now() + 60_000) })
+      .where(and(eq(chatDeliveries.endpointId, endpoint.id), inArray(chatDeliveries.state, ["received", "retry"])));
     await service.processPendingDeliveries();
     expect(wakeup).not.toHaveBeenCalled();
     await db
@@ -60633,19 +60639,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             db
               .select({ id: issueComments.id })
               .from(issueComments)
-              .where(eq(issueComments.companyId, fixture.companyId)),
+              .where(eq(issueComments.companyId, fixture.companyId))
+              .orderBy(issueComments.id),
             db
               .select({ id: issues.id })
               .from(issues)
-              .where(eq(issues.companyId, fixture.companyId)),
+              .where(eq(issues.companyId, fixture.companyId))
+              .orderBy(issues.id),
             db
               .select({ id: heartbeatRuns.id })
               .from(heartbeatRuns)
-              .where(eq(heartbeatRuns.companyId, fixture.companyId)),
+              .where(eq(heartbeatRuns.companyId, fixture.companyId))
+              .orderBy(heartbeatRuns.id),
             db
               .select({ id: chatPublications.id })
               .from(chatPublications)
-              .where(eq(chatPublications.endpointId, endpoint.id)),
+              .where(eq(chatPublications.endpointId, endpoint.id))
+              .orderBy(chatPublications.id),
           ]);
         const baseline = await unchangedRows();
         const wakeupCount = wakeup.mock.calls.length;

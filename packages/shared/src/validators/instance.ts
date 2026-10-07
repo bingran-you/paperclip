@@ -41,6 +41,7 @@ export const patchInstanceGeneralSettingsSchema = z
 export const instanceExperimentalSettingsSchema = z.object({
   enableEnvironments: z.boolean().default(false),
   enableNativeRunner: z.boolean().default(true),
+  enableAiConnectionRouters: z.boolean().default(false),
   enableManagedSandboxOnly: z.boolean().default(false),
   enableIsolatedWorkspaces: z.boolean().default(false),
   enableIsolatedWorkspacesByDefault: z.boolean().default(false),
@@ -50,6 +51,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   // always enabled; this remains accepted so older stored rows and managed
   // configs continue to load during upgrades.
   enableApps: z.boolean().default(true),
+  enablePublicMcp: z.boolean().default(false),
   enableChatConnectors: z.boolean().default(false),
   // Compatibility only: old stored and managed values must still parse.
   enableMcpAggregators: z.boolean().default(true),

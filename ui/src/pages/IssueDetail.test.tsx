@@ -42,6 +42,7 @@ import {
   createIssueDetailLocationState,
 } from "../lib/issueDetailBreadcrumb";
 import { getRecentTasksStorageKey, readRecentTasks } from "../lib/recent-tasks";
+import { getLastProjectId, trackRecentProject } from "../lib/recent-projects";
 import { ApiError } from "../api/client";
 import type { issuesApi } from "../api/issues";
 
@@ -53,6 +54,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   listComments: vi.fn(),
   listAttachments: vi.fn(),
   listWorkProducts: vi.fn(),
+  checkMonitorNow: vi.fn(),
   listFeedbackVotes: vi.fn(),
   listInteractions: vi.fn(),
   getQueuedComments: vi.fn(),
@@ -121,6 +123,7 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
 
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockLocation = vi.hoisted(() => ({
+  key: "task-entry",
   pathname: "/issues/PAP-1",
   search: "",
   hash: "",
@@ -1328,6 +1331,7 @@ describe("IssueDetail", () => {
     mockIssuesApi.listComments.mockResolvedValue([]);
     mockIssuesApi.listAttachments.mockResolvedValue([]);
     mockIssuesApi.listWorkProducts.mockResolvedValue([]);
+    mockIssuesApi.checkMonitorNow.mockReset();
     mockIssuesApi.listFeedbackVotes.mockResolvedValue([]);
     mockIssuesApi.listInteractions.mockResolvedValue([]);
     mockIssuesApi.getQueuedComments.mockResolvedValue(
@@ -1418,6 +1422,37 @@ describe("IssueDetail", () => {
     mockRouteParams.companyPrefix = "PAP";
   });
 
+  it.each([false, true])("keeps monitor errors on the checked task (late response: %s)", async (lateResponse) => {
+    const monitor = { monitor: { status: "scheduled", nextCheckAt: new Date(Date.now() + 60_000).toISOString(), attemptCount: 1, serviceName: "github" } } as Issue["executionState"];
+    mockIssuesApi.get.mockResolvedValue(createIssue({ status: "in_progress", executionState: monitor }));
+    const check = createDeferred<never>();
+    mockIssuesApi.checkMonitorNow.mockReturnValue(check.promise);
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    let button: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      button = Array.from(container.querySelectorAll("button")).find((entry) => entry.textContent === "Check now");
+      expect(button).toBeTruthy();
+    });
+    await act(async () => button!.click());
+    if (!lateResponse) {
+      check.reject(new Error("First task monitor failed"));
+      await waitForAssertion(() => expect(container.textContent).toContain("First task monitor failed"));
+    }
+    const second = createIssue({ id: "issue-2", identifier: "PAP-2", title: "Second monitored task", status: "in_progress", executionState: monitor });
+    mockIssuesApi.get.mockResolvedValue(second);
+    queryClient.setQueryData(queryKeys.issues.detail("PAP-2"), second);
+    mockRouteParams.issueId = "PAP-2";
+    mockLocation.pathname = "/issues/PAP-2";
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    if (lateResponse) check.reject(new Error("First task monitor failed"));
+    await flushReact();
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Second monitored task");
+      expect(container.textContent).not.toContain("First task monitor failed");
+      expect(Array.from(container.querySelectorAll("button")).find((entry) => entry.textContent === "Check now")?.disabled).toBe(false);
+    });
+  });
+
   afterEach(async () => {
     await act(async () => {
       root.unmount();
@@ -1428,6 +1463,34 @@ describe("IssueDetail", () => {
     localStorage.clear();
     sessionStorage.clear();
     vi.restoreAllMocks();
+  });
+
+  it.each(["new-project", null])("remembers project %s only after its task update succeeds", async (projectId) => {
+    const issue = createIssue({ projectId: "original-project" });
+    trackRecentProject("original-project", issue.companyId);
+    const failedUpdate = createDeferred<Issue>();
+    const successfulUpdate = createDeferred<Issue>();
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.update.mockClear();
+    mockIssuesApi.update.mockReturnValueOnce(failedUpdate.promise).mockReturnValueOnce(successfulUpdate.promise);
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    let properties!: { onUpdate: (data: Record<string, unknown>) => void };
+    await waitForAssertion(() => {
+      properties = mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props;
+      expect(properties?.onUpdate).toBeTypeOf("function");
+    });
+    await act(async () => properties.onUpdate({ projectId }));
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledTimes(1));
+    expect(getLastProjectId(issue.companyId)).toBe("original-project");
+    await act(async () => failedUpdate.reject(new Error("Project save failed")));
+    await waitForAssertion(() => expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Task update failed" })));
+    expect(getLastProjectId(issue.companyId)).toBe("original-project");
+    await act(async () => properties.onUpdate({ projectId }));
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledTimes(2));
+    expect(getLastProjectId(issue.companyId)).toBe("original-project");
+    await act(async () => successfulUpdate.resolve({ ...issue, projectId }));
+    await waitForAssertion(() => expect(getLastProjectId(issue.companyId)).toBe(projectId ?? ""));
+    expect(getLastProjectId("company-2")).toBeUndefined();
   });
 
   it("keeps an existing conversation on its agent-addressed route", async () => {
@@ -1582,7 +1645,7 @@ describe("IssueDetail", () => {
     expect(windowOpen).not.toHaveBeenCalled();
   });
 
-  it.each(["comments", "description", "empty"])("reveals %s without waiting for supporting history unless the thread is empty", async (content) => {
+  it.each(["comments", "description", "empty"])("coordinates %s with the initial cards and supporting history", async (content) => {
     const history = createDeferred<[]>();
     mockIssuesApi.get.mockResolvedValue(createIssue({
       description: content === "description" ? "Saved task description" : null,
@@ -1600,7 +1663,7 @@ describe("IssueDetail", () => {
     });
     await waitForAssertion(() => {
       expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]).toMatchObject({
-        initialHistoryPending: content === "empty",
+        initialHistoryPending: true,
       });
     });
     // Resolving metadata fills the same thread rather than replacing its content.
@@ -2101,6 +2164,49 @@ describe("IssueDetail", () => {
     });
   });
 
+  it("routes the first document click through the mounted task, including UUID aliases", async () => {
+    mockLocation.pathname = "/PAP/issues/PAP-1";
+    mockLocation.state = { from: "inbox" };
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    });
+    await waitForAssertion(() => expect(queryClient.getQueryData(queryKeys.issues.detail("PAP-1"))).toBeDefined());
+    const getCalls = mockIssuesApi.get.mock.calls.length;
+    const link = document.createElement("a");
+    link.href = "/PAP/issues/issue-1#document-plan";
+    const closePreview = vi.fn((event: Event) => expect(event.defaultPrevented).toBe(true));
+    link.addEventListener("click", closePreview);
+    container.appendChild(link);
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    await act(async () => { link.dispatchEvent(event); });
+    expect(event.defaultPrevented).toBe(true);
+    expect(closePreview).toHaveBeenCalledTimes(1);
+    expect(mockNavigate).toHaveBeenCalledWith("/PAP/issues/PAP-1#document-plan", {
+      preventScrollReset: true,
+      state: { from: "inbox", taskDocumentScrollEntry: { key: "task-entry", hash: "", pathname: "/PAP/issues/PAP-1" } },
+    });
+    expect(mockIssuesApi.get).toHaveBeenCalledTimes(getCalls);
+  });
+
+  it.each(["modifier", "new-tab", "download"])("preserves native document-link behavior for %s", async (kind) => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    });
+    const link = document.createElement("a");
+    link.href = "#document-plan";
+    if (kind === "new-tab") link.target = "_blank";
+    if (kind === "download") link.download = "plan.md";
+    container.appendChild(link);
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, metaKey: kind === "modifier" });
+    // Keep jsdom from following the native link after observing our handler.
+    link.addEventListener("click", () => expect(event.defaultPrevented).toBe(false), { once: true });
+    link.addEventListener("click", (click) => click.preventDefault(), { once: true });
+    await act(async () => { link.dispatchEvent(event); });
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
   it("replays document routing when the current same-page hash is clicked again", async () => {
     mockLocation.hash = "#document-qa-evidence";
     mockIssuesApi.get.mockResolvedValue(createIssue());
@@ -2335,7 +2441,7 @@ describe("IssueDetail", () => {
       '[data-testid="mobile-task-side-panel"]',
     );
     expect(panel).not.toBeNull();
-    expect(panel?.className).toContain("max-h-(--sz-85dvh)");
+    expect(panel?.className).toContain("inset-0 h-dvh max-h-dvh");
     expect(panel?.className).toContain("w-full");
     expect(panel?.className).toContain("max-w-none");
     expect(panel?.textContent).toContain("Task side panel");

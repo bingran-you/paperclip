@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, FlaskConical, Lock, Play } from "lucide-react";
 import type {
@@ -18,6 +18,7 @@ import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Link } from "@/lib/router";
 
 type WorktreeRunExecutionDisplayState =
   | { kind: "off" }
@@ -81,7 +82,7 @@ function ExperimentalToggleCard({
 }: {
   title: string;
   description: string;
-  footnote?: string;
+  footnote?: ReactNode;
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
   disabled: boolean;
@@ -303,6 +304,18 @@ export function InstanceExperimentalSettings() {
           settingKey="enableAgentChat"
           managed={managedKeys.enableAgentChat}
           ariaLabel="Toggle agent chat experimental setting"
+        />
+
+        <ExperimentalToggleCard
+          title="Assistant connections (MCP)"
+          description="Connect Codex, Claude, and other assistants to your Paperclip organization. People sign in, select an organization once, and approve access to review work, delegate tasks, and add feedback."
+          footnote={<>Requires an authenticated instance with a configured public URL. Takes effect immediately. Turning this off blocks assistant calls and event delivery; work already delegated continues.{experimentalQuery.data?.enablePublicMcp && <> <Link className="underline" to="/apps/assistant-connection">Set up an assistant connection</Link></>}</>}
+          checked={experimentalQuery.data?.enablePublicMcp === true}
+          onCheckedChange={(checked) => toggleMutation.mutate({ enablePublicMcp: checked })}
+          disabled={toggleMutation.isPending}
+          settingKey="enablePublicMcp"
+          managed={managedKeys.enablePublicMcp}
+          ariaLabel="Toggle assistant connections experimental setting"
         />
 
         <ExperimentalToggleCard

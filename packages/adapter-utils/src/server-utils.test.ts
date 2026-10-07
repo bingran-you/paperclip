@@ -21,6 +21,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAPERCLIP_FEEDBACK_SKILL_KEYS,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -31,6 +32,8 @@ import {
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
+  sanitizeInheritedPaperclipEnv,
+  isForbiddenConfigEnvKey,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
@@ -39,6 +42,13 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+it("reserves identity credentials even for mixed-case inherited or configured keys", () => {
+  const keys = ["PAPERCLIP_AGENT_KEY_ID", "Paperclip_Agent_Public_Key", "paperclip_agent_private_key"];
+  const inherited = Object.fromEntries(keys.map(key => [key, "host-override"]));
+  expect(sanitizeInheritedPaperclipEnv({ ...inherited, PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  for (const key of keys) expect(isForbiddenConfigEnvKey(key)).toBe(true);
+});
 
 describe("runtime connection tool delivery", () => {
   const access = {
@@ -142,6 +152,17 @@ describe("legacy adapter skill selection", () => {
     expect(resolvePaperclipDesiredSkillNames({}, [operationalEntry])).toEqual(
       [],
     );
+  });
+
+  it("makes feedback available to existing legacy agents without opting native agents into API skills", () => {
+    const inventory = [operationalEntry, ...PAPERCLIP_FEEDBACK_SKILL_KEYS.map((key) => ({ key }))];
+    for (const config of [{}, { paperclipSkillSync: { desiredSkills: [] } }]) {
+      expect(resolveLegacyPaperclipDesiredSkillNames(config, inventory)).toEqual([
+        PAPERCLIP_OPERATIONAL_SKILL_KEY, ...PAPERCLIP_FEEDBACK_SKILL_KEYS,
+      ]);
+      expect(resolvePaperclipDesiredSkillNames(config, inventory)).toEqual([]);
+    }
+    expect(resolveLegacyPaperclipDesiredSkillNames({}, inventory.slice(1))).toEqual([]);
   });
 });
 

@@ -20,6 +20,7 @@ import {
 } from "./paperclip-runner-permissions.js";
 import type {
   AdapterExecutionContext,
+  AgentRuntimeIdentity,
   AdapterRuntimeToolAccess,
   AdapterSkillEntry,
   AdapterSkillSnapshot,
@@ -168,7 +169,8 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 // Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
 // not assigned the same key for the run (runtime vars always win).
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON";
+  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON" ||
+    AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase());
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -2245,6 +2247,7 @@ export function renderPaperclipWakePrompt(
   return joinPromptSections([
     renderPaperclipWakePromptBody(value, options),
     instructions ? `## Assigned connector skills\n\n${instructions}` : "",
+    asString(parseObject(parseObject(value).connectionInstructions).text, "").trim(),
   ]);
 }
 
@@ -3192,10 +3195,22 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
+export const AGENT_IDENTITY_ENV_KEYS = [
+  "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+];
+
+export function buildAgentIdentityEnv(identity?: AgentRuntimeIdentity): Record<string, string> {
+  return identity ? {
+    PAPERCLIP_AGENT_KEY_ID: identity.keyId,
+    PAPERCLIP_AGENT_PUBLIC_KEY: identity.publicKeyPem,
+    PAPERCLIP_AGENT_PRIVATE_KEY: identity.privateKeyPem,
+  } : {};
+}
+
 export function buildPaperclipEnv(agent: {
   id: string;
   companyId: string;
-}): Record<string, string> {
+}, identity?: AgentRuntimeIdentity): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -3206,6 +3221,7 @@ export function buildPaperclipEnv(agent: {
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    ...buildAgentIdentityEnv(identity),
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
@@ -3494,6 +3510,10 @@ export function sanitizeInheritedPaperclipEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   for (const key of Object.keys(env)) {
+    if (AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase())) {
+      delete env[key];
+      continue;
+    }
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
@@ -4209,6 +4229,11 @@ export function resolvePaperclipDesiredSkillNames(
 export const PAPERCLIP_OPERATIONAL_SKILL_KEY =
   "paperclipai/paperclip/paperclip";
 
+export const PAPERCLIP_FEEDBACK_SKILL_KEYS = [
+  "paperclipai/paperclip/complain",
+  "paperclipai/paperclip/suggestion-box",
+] as const;
+
 /**
  * Native Paperclip Runner sessions receive the control-plane contract through
  * PRP, so carrying the legacy operational skill into their stored preference
@@ -4269,12 +4294,11 @@ export function resolveLegacyPaperclipDesiredSkillNames(
   );
   if (!operationalEntry) return desiredSkills;
 
-  return [
-    operationalEntry.key,
-    ...desiredSkills.filter(
-      (key) => key.trim().toLowerCase() !== PAPERCLIP_OPERATIONAL_SKILL_KEY,
-    ),
-  ];
+  const feedbackEntries = PAPERCLIP_FEEDBACK_SKILL_KEYS.flatMap((key) => {
+    const entry = availableEntries.find((candidate) => candidate.key.trim().toLowerCase() === key);
+    return entry ? [entry.key] : [];
+  });
+  return Array.from(new Set([operationalEntry.key, ...feedbackEntries, ...desiredSkills]));
 }
 
 export function writePaperclipSkillSyncPreference(

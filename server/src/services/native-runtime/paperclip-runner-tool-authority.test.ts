@@ -102,7 +102,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(36);
+    expect(authority.definitions()).toHaveLength(39);
     const questions = authority.definitions().find(tool => tool.name === "request_human_input")!;
     expect(questions.description).toContain("ask only the next unanswered question");
     expect(questions.description).toContain("Never fabricate answers");
@@ -123,9 +123,12 @@ describe("PaperclipRunnerToolAuthority", () => {
         "get_task_history",
         "search_tasks",
         "report_progress",
+        "submit_complaint",
+        "submit_suggestion",
         "request_human_input",
         "create_task",
         "set_dependencies",
+        "set_task_monitor",
         "list_documents",
         "read_document",
         "list_document_revisions",
@@ -830,6 +833,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       disposition: "applied",
       created: true,
       document: { key: "plan", body },
+      documentHref: "/RNT/issues/RNT-1#document-plan",
     });
     expect(
       await db
@@ -1282,16 +1286,15 @@ describe("PaperclipRunnerToolAuthority", () => {
   it("captures delegation and approval origins before steering and preserves replay identity", async () => {
     const issueId = "00000000-0000-4000-8000-000000000120";
     const runId = "00000000-0000-4000-8000-000000000121";
-    for (const userId of ["person-a", "person-b"]) {
-      await db.insert(authUsers).values({ id: userId, name: userId, email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
-      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
-    }
+
     await db.insert(issues).values({ id: issueId, companyId, title: "Identity delegation",
       status: "in_progress", assigneeAgentId: agentId });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
       status: "running", runtimeMode: "native", nativeIssueId: issueId,
       invocationSource: "assignment", triggerDetail: "system", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    await db.insert(authUsers).values(["person-a", "person-b"].map(id => ({ id, name: id, email: `${id}@example.test`, createdAt: new Date(), updatedAt: new Date() })));
+    await db.insert(companyMemberships).values(["person-a", "person-b"].map(principalId => ({ companyId, principalType: "user", principalId, status: "active", membershipRole: "operator" })));
     const origin = await initializeRunIdentity(db, {
       companyId, runId, issueId, responsibleUserId: "person-a", cause: "instruction",
     });
