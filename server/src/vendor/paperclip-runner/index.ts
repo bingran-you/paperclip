@@ -10,6 +10,8 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  DotHarnessDriver,
+  DotAssignment,
   PaperclipJsonValue,
   PaperclipQuestionResponse,
   PaperclipSemanticActionBinding,
@@ -32,6 +34,10 @@ export type {
   NativeExecutionInput,
   NativeExecutionInputV4,
   NativeExecutionInputV5,
+  NativeExecutionInputV6,
+  DotBindingSnapshot,
+  ExternalProviderPort,
+  ExternalProviderOperation,
   NativeCompletionSource,
   NativeCompletionSources,
   NativeInteractionResponseEnvelope,
@@ -137,6 +143,7 @@ export const nativeRestartInterruptedTurnId = runner.nativeRestartInterruptedTur
 export const completeTerminatedRemoteNativeSessionCleanup = runner.completeTerminatedRemoteNativeSessionCleanup;
 export const completeTerminatedLocalNativeSessionCleanup = runner.completeTerminatedLocalNativeSessionCleanup;
 
+export const externalOperationDigest = runner.externalOperationDigest;
 export const bundledRemoteProviderPackManifestPath = runner.bundledRemoteProviderPackManifestPath;
 export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
 

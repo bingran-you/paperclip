@@ -1,5 +1,11 @@
 # Paperclip evaluation guide
 
+The [Slack connector probe catalog](../server/src/services/connectors/slack/evals/README.md)
+organizes eleven manual model acceptance probes and a selector for existing
+deterministic regressions (`pnpm test:slack-connector`). It is not a registered
+model campaign; transport fixtures do not prove that an agent chooses a tool
+or that a real Slack interaction completes.
+
 The explicit-only [live provider connection suite](../tests/runner-e2e/PROVIDER-CONNECTIONS.md)
 is a Product E2E workflow for fresh subscription/API-key/gateway connections,
 with attended login and independent artifact checks against local or staging targets.

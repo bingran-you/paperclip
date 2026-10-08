@@ -118,6 +118,11 @@ describe("buildCodexLocalConfig", () => {
 });
 
 describe("buildPaperclipRunnerConfig", () => {
+  it.each([undefined, false, true])("preserves Dot attachment consent in create/import forms: %s", value => {
+    const config = buildPaperclipRunnerConfig(makeValues({ adapterType: "paperclip_runner", adapterSchemaValues: { provider: "openai_dot", dotAttachmentAccess: value } }));
+    expect(config.dotAttachmentAccess).toBe(value === true);
+    expect(config.dotWorkspaceAccess).toBe(false);
+  });
   it("keeps only settings implemented by the Codex runner profile", () => {
     const config = buildPaperclipRunnerConfig(makeValues({
       codexEngine: "acp",

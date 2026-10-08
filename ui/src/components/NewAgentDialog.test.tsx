@@ -171,6 +171,20 @@ it.each([true, false, undefined])("gates the Cloud native runner on explicit ena
   expect(query.get("name")).toBe("Ada & Co");
 });
 
+it("offers Dot as a standalone choice with the general Runner flag off", async () => {
+  await act(async () => cache.setQueryData(queryKeys.instance.experimentalSettings, { enableNativeRunner: false, enableOpenAiDot: true }));
+  await name();
+  expect(document.querySelector('input[value="paperclip_runner"]')).toBeNull();
+  const dot = document.querySelector<HTMLInputElement>('input[value="openai_dot"]');
+  expect(dot).not.toBeNull();
+  await act(async () => dot!.click());
+  expect(document.querySelector("select")).toBeNull();
+  await click("Configure agent");
+  const query = new URL(state.navigate.mock.calls[0][0], "http://local").searchParams;
+  expect(query.get("adapterType")).toBe("paperclip_runner");
+  expect(query.get("runnerProvider")).toBe("openai_dot");
+});
+
 it("keeps agent-only invitations reachable from the new-agent flow", async () => {
   await click("Invite an external agent");
   const message = document.querySelector("textarea")!;

@@ -155,7 +155,7 @@ export async function captureStockHarness(input: {
 export function stockHarnessSourceDigest() {
   const hash = createHash("sha256");
   for (const source of [
-    "stock-harness.ts", "context-integrity-cases.ts", "context-integrity-scoring.ts",
+    "stock-harness.ts", "checkout-activity.ts", "context-integrity-cases.ts", "context-integrity-scoring.ts",
     "context-integrity-flow.ts", "chat-cases.ts", "chat-flow.ts", "live-fixtures.ts", "runner.spec.ts",
     "stock-harness-checks.mjs", "stock-harness-admission.ts", "stock-harness-manifest.ts",
     "stock-harness-instruction-variant.mjs", "stock-harness-instruction-variant.d.mts", "stock-harness-instruction-variant.test.mjs",

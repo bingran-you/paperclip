@@ -4,7 +4,8 @@ import { agentAvatarUrl as apiAvatarUrl } from "@paperclipai/shared";
 export const agentAvatarUrl: typeof apiAvatarUrl = (...args) => {
   const url = new URL(apiAvatarUrl(...args), "https://storybook.invalid");
   const preset = url.pathname.slice("/api/agent-avatars/".length).replace(/\.png$/, "");
-  const path = `./agent-avatar-images/${preset}-${url.searchParams.get("size")}-${url.searchParams.get("scale")}.png`;
+  const background = url.searchParams.get("background") === "paperclip-dark" ? "-paperclip-dark-v1" : "";
+  const path = `./agent-avatar-images/${preset}-${url.searchParams.get("size")}-${url.searchParams.get("scale")}${background}.png`;
   // The build-time asset packer needs relative file names. Browser consumers
   // need absolute URLs because CSS custom properties use the stylesheet base.
   return typeof document === "undefined" ? path : new URL(path, document.baseURI).href;

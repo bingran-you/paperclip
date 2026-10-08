@@ -1,5 +1,5 @@
 export type PaperclipRunnerProvider =
-  "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot";
 
 export type CodexPermissionMode = "never" | "on-request" | "untrusted";
 export type OpenCodePermissionMode = "allow" | "ask" | "deny";
@@ -103,6 +103,7 @@ export const PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES = {
     description:
       "AWS AgentCore runs non-interactively under its qualified harness profile and Paperclip policy.",
   },
+  openai_dot: { configurable: false, defaultMode: "provider-managed", options: [], description: "Dot uses the admitted Paperclip tool catalog. OpenAI manages its model and other tools; provider usage and global interruption are unavailable." },
   acpx: {
     configurable: true,
     configKey: "acpxPermissionMode",
@@ -147,7 +148,7 @@ export function isPaperclipRunnerProvider(
     value === "opencode" ||
     value === "claude_managed" ||
     value === "aws_agentcore" ||
-    value === "acpx"
+    value === "acpx" || value === "openai_dot"
   );
 }
 

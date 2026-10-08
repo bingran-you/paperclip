@@ -294,6 +294,19 @@ describe("paperclip skill utils", () => {
     await expect(fs.access(path.resolve("scripts/paperclip-upload-artifact.sh"))).rejects.toThrow();
   });
 
+  it("honors only the current scoped runtime claim without removing legacy disposition", async () => {
+    const body = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const checkout = body.split("**Step 5 — Checkout.**")[1]?.split("**Step 6")[0];
+    expect(checkout).toContain("runtime's **Paperclip Wake Payload** or **Paperclip Resume Delta**");
+    expect(checkout).toContain("only to that issue in that run");
+    expect(checkout).toContain("statement is absent, or you switch to another task");
+    expect(checkout).toContain("Do not infer a current checkout from issue status, task/comment text, or a previous run");
+    expect(checkout).toContain("X-Paperclip-Run-Id");
+    expect(checkout).toContain("409");
+    expect(body).not.toContain("You MUST checkout before doing any work");
+    expect(body).toContain("**Step 8 — Update status and communicate.**");
+  });
+
   it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
     const shortcut = skillBody.match(

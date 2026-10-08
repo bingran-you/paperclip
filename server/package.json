@@ -44,6 +44,9 @@
     "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
   },
   "dependencies": {
+    "ai": "7.0.130",
+    "@ai-sdk/openai": "4.0.86",
+    "@openrouter/ai-sdk-provider": "3.1.0",
     "@aws-sdk/client-s3": "^3.1141.0",
     "@chat-adapter/discord": "4.39.0",
     "@chat-adapter/github": "4.39.0",
@@ -79,6 +82,7 @@
     "better-auth": "1.7.2",
     "chat": "4.39.0",
     "chokidar": "^5.0.0",
+    "compression": "^1.8.2",
     "detect-port": "^2.1.0",
     "dompurify": "^3.4.16",
     "dotenv": "^17.4.2",
@@ -113,6 +117,7 @@
   ],
   "devDependencies": {
     "@paperclipai/paperclip-runner": "workspace:*",
+    "@types/compression": "^1.8.1",
     "@types/express": "^5.0.0",
     "@types/express-serve-static-core": "^5.1.3",
     "@types/jsdom": "^30.0.0",

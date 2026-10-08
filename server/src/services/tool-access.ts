@@ -1,3 +1,6 @@
+import { chatCredentialMutationLease } from "./chat-credential-mutation-lease.js";
+import { removeSlackRegistration } from "./chat-slack-registration-cleanup.js";
+import { chatEndpoints } from "@paperclipai/db";
 import { AGGREGATOR_NAMES, isAppAggregator, type AggregatorAppsResponse, type ArcadeDiscoverySetupInput } from "@paperclipai/shared/aggregator-apps";
 import { resolveAggregatorApp, type AppCatalogAggregator } from "@paperclipai/shared/aggregator-app-catalog";
 import { AggregatorDiscoveryUnavailableError, discoverArcadeApps, discoverExecutorApps, type DiscoveredApp } from "./aggregator-app-discovery.js";
@@ -6440,6 +6443,21 @@ export function toolAccessService(
     companyId?: string,
     actor?: ActorInfo,
   ): Promise<ToolConnectionRemovalResult> {
+    const connection = await getConnectionRow(connectionId, companyId);
+    const [endpoint] = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.connectionId, connection.id), eq(chatEndpoints.companyId, connection.companyId), eq(chatEndpoints.provider, "slack")));
+    if (!endpoint) return removeConnectionUnlocked(connectionId, companyId, actor);
+    return chatCredentialMutationLease(db)(endpoint, async lease => {
+      await db.transaction(async tx => {
+        await lease.assertOwned(tx);
+        await tx.update(chatEndpoints).set({ status: "archived", updatedAt: new Date() }).where(eq(chatEndpoints.id, endpoint.id));
+        await tx.update(toolConnections).set({ status: "archived", enabled: false, updatedAt: new Date() }).where(eq(toolConnections.id, connection.id));
+      });
+      await removeSlackRegistration(db, endpoint.id, lease);
+      return removeConnectionUnlocked(connectionId, companyId, actor);
+    });
+  }
+
+  async function removeConnectionUnlocked(connectionId: string, companyId?: string, actor?: ActorInfo): Promise<ToolConnectionRemovalResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     forgetMcpHttpSessions(connection.id);
     const now = new Date();

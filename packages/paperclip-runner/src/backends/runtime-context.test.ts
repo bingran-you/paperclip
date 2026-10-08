@@ -31,6 +31,7 @@ function runtimeInput(
   entryPath: string,
 ): NativeExecutionInput {
   return {
+    provider: { kind: "codex" },
     runtimeContext: {
       prompt: { text: "Paperclip runtime." },
       instructions: { bundle: { rootPath }, entryPath },

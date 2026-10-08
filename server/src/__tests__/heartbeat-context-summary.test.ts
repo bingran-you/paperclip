@@ -294,6 +294,30 @@ describe("buildPaperclipTaskMarkdown", () => {
     },
   );
 
+  it.each([true, false])("keeps rich Slack questions available on fresh and resumed turns (native=%s)", (nativeRunner) => {
+    for (const includeDescription of [true, false]) {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue: { id: "slack-question", title: "Ask me a zoo question", workMode: "standard" },
+        externalChatProvider: "slack", nativeRunner, includeDescription,
+      });
+      expect(markdown).toContain("Interactive questions in Slack:");
+      expect(markdown).toContain("ask_user_questions");
+      expect(markdown).toContain("single_select");
+      expect(markdown).toContain("resumes this task after the answer");
+      expect(markdown).toContain("Do not post a second copy of your ordinary reply");
+      expect(markdown).toContain("Neither queued nor uncertain means delivered");
+      expect(markdown).toContain("honor their action policies");
+      if (nativeRunner) {
+        expect(markdown).toContain('interactionKind: "questions"');
+        expect(markdown).not.toContain("POST /api/issues/$PAPERCLIP_TASK_ID/interactions");
+      } else {
+        expect(markdown).toContain("POST /api/issues/$PAPERCLIP_TASK_ID/interactions");
+        expect(markdown).toContain('resolverPolicy: "human_only"');
+        expect(markdown).toContain("PATCH this task to in_review");
+      }
+    }
+  });
+
   it("omits external file handoff instructions from non-chat tasks", () => {
     const markdown = buildPaperclipTaskMarkdown({
       issue: {
@@ -305,6 +329,7 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
     expect(markdown).not.toContain("External chat file delivery:");
     expect(markdown).not.toContain("External chat turn efficiency:");
+    expect(markdown).not.toContain("Interactive questions in Slack:");
   });
 
   it.each(["slack", "discord", "telegram", "microsoft-teams", "github"])(

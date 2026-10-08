@@ -1674,12 +1674,28 @@
       "additionalProperties": false,
       "properties": {
         "assigneeActorId": {
-          "description": "New company agent ID from list_agents.",
-          "minLength": 1,
-          "type": "string"
+          "description": "New company agent ID from list_agents; null when assigning a person.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assigneeUserId": {
+          "description": "Company person ID from list_people. Mutually exclusive with assigneeActorId.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "expectedAssigneeActorId": {
           "description": "Current assigneeAgentId from search_tasks; null means unassigned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedAssigneeUserId": {
+          "description": "Current assigneeUserId from search_tasks; omit only when there is no person assigned.",
           "type": [
             "string",
             "null"
@@ -2133,7 +2149,15 @@
       "additionalProperties": false,
       "properties": {
         "assigneeActorId": {
-          "description": "Optional actor assignee.",
+          "description": "Optional actor assignee. Mutually exclusive with assigneeUserId.",
+          "maxLength": 200,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assigneeUserId": {
+          "description": "Company person ID from list_people. Mutually exclusive with assigneeActorId.",
           "maxLength": 200,
           "type": [
             "string",

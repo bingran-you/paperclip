@@ -1472,6 +1472,36 @@ describe("worktree helpers", () => {
     }
   });
 
+  it("creates an explicitly empty worktree without inherited signing secrets or deferred copying", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-empty-"));
+    const originalCwd = process.cwd();
+    const originalJwt = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const originalSigning = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    try {
+      const repoRoot = path.join(tempRoot, "repo");
+      fs.mkdirSync(repoRoot, { recursive: true });
+      process.chdir(repoRoot);
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "source-jwt-secret";
+      process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "source-signing-secret";
+      await worktreeInitCommand({ empty: true, fromConfig: path.join(tempRoot, "missing.json"), home: path.join(tempRoot, "instances") });
+      const env = fs.readFileSync(path.join(repoRoot, ".paperclip/.env"), "utf8");
+      expect(env).not.toContain("source-jwt-secret");
+      expect(env).not.toContain("source-signing-secret");
+      expect(env).toContain("PAPERCLIP_AGENT_JWT_SECRET=");
+      expect(fs.existsSync(path.join(repoRoot, ".paperclip/seed-manifest.json"))).toBe(false);
+      expect(fs.existsSync(path.join(repoRoot, ".paperclip/seed-pending"))).toBe(false);
+      expect(fs.existsSync(path.join(repoRoot, ".paperclip/seed-empty"))).toBe(true);
+      await worktreeInitCommand({ seed: false, force: true, fromConfig: path.join(tempRoot, "missing.json"), home: path.join(tempRoot, "instances") });
+      expect(fs.existsSync(path.join(repoRoot, ".paperclip/seed-empty"))).toBe(false);
+      expect(readWorktreeSeedManifest(path.join(repoRoot, ".paperclip/config.json"))?.state).toBe("pending");
+    } finally {
+      process.chdir(originalCwd);
+      if (originalJwt === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalJwt;
+      if (originalSigning === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET; else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = originalSigning;
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it("persists the current agent jwt secret into the worktree env file", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-jwt-"));
     const repoRoot = path.join(tempRoot, "repo");

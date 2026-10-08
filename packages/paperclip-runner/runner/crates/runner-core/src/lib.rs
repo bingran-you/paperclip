@@ -13,6 +13,7 @@ pub mod claude_managed_provider;
 pub mod codex_provider;
 mod codex_startup_trust;
 mod configured_environment;
+pub mod dot_provider_backend;
 pub mod durable;
 pub mod fake_harness;
 mod generated_acpx_profiles;

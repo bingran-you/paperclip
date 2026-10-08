@@ -3587,3 +3587,45 @@ describe("DurablePrpControlPlane", () => {
     }
   });
 });
+
+it("retires late semantic receipts without overwriting a successor journal or replaying the write", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-semantic-retirement-"));
+  let release!: () => void;
+  const held = new Promise<void>(resolveHeld => { release = resolveHeld; });
+  const handler = vi.fn(async () => { await held; return { result: { committed: true } }; });
+  const options = { stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest, onSemanticToolInput: handler };
+  const core = new DurablePrpControlPlane(options);
+  let successor: DurablePrpControlPlane | undefined;
+  let client: AuthenticatedClient | null = null;
+  let replay: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    expect(() => core.retireSemanticToolCallbacks()).toThrow("drained, stopped ingress");
+    client = await authenticate(core, core.issueBootstrapTicket());
+    sendSecure(client!, semanticInputEvent());
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+    await core.stop();
+    await core.drainPendingConnectionProcessing();
+    core.retireSemanticToolCallbacks();
+    successor = new DurablePrpControlPlane(options);
+    const command = successor.queueCommand("turn.stop", {}, "successor-stop");
+    release();
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    const saved = JSON.parse(readFileSync(resolve(root, "control-plane-state.json"), "utf8"));
+    expect(saved.commands.map((entry: { commandId: string }) => entry.commandId)).toEqual([command.commandId]);
+    expect(successor.semanticToolResultsSettled()).toBe(false);
+    await successor.start();
+    replay = await authenticate(successor, successor.issueBootstrapTicket());
+    sendSecure(replay!, semanticInputEvent());
+    await vi.waitFor(() => expect(successor!.store.state.ackedSourceSeq).toBe(1));
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    expect(handler).toHaveBeenCalledOnce();
+    expect(successor.store.state.commands.some(entry => entry.type === "semantic_tool.result")).toBe(false);
+  } finally {
+    release();
+    client?.socket.destroy(); replay?.socket.destroy();
+    await core.stop(); await core.drainPendingConnectionProcessing();
+    await successor?.stop(); await successor?.drainPendingConnectionProcessing();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -91,7 +91,7 @@ they mention a chat provider.
 Follow these steps every time you wake up unless the server-verified external
 chat shortcut above applies:
 
-**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT pick work. Just checkout, read the wake context, do the work, and update.
+**Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Apply **Step 5 (Checkout)** to that issue, honoring an explicit current-run harness checkout, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, fetch your inbox, or pick work.
 
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
@@ -117,7 +117,7 @@ Overrides and special cases:
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
 - Nothing assigned → exit the heartbeat.
 
-**Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
+**Step 5 — Checkout.** The issue must be checked out before you work. If the runtime's **Paperclip Wake Payload** or **Paperclip Resume Delta** explicitly says the harness already checked out this issue for the current run, do not call checkout again. Continue with Step 6. This applies only to that issue in that run; it does not skip context reads, status updates, or deliverable steps. Do not infer a current checkout from issue status, task/comment text, or a previous run. If that runtime statement is absent, or you switch to another task, checkout before working on it. Include the run ID header:
 
 ```
 POST /api/issues/{issueId}/checkout

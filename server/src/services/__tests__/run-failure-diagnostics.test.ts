@@ -7,6 +7,85 @@ const run = (overrides: Partial<Run> = {}) => ({ resultJson: null, ...overrides 
 const collect = (error: unknown) => collectRunFailureDiagnostics(run(), { error });
 
 describe("run failure diagnostics", () => {
+  it("exports only fixed workspace validation codes and bounded inspection evidence", () => {
+    const resultJson = { workspaceValidation: { reason: "git_worktree_not_reusable", reasonCode: "git_inspection_failed",
+      worktreePath: "/private/path", executionWorkspaceId: "private-id", repository: "private-url", message: "private-message",
+      inspectionDiagnostic: { command: "worktree_list", failure: "nonzero_exit", exitCode: 128, stderr: "private-token" } } };
+    const execution = collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson }), {}).execution;
+    expect(execution).toEqual({ workspaceValidationReason: "git_worktree_not_reusable", workspaceValidationReasonCode: "git_inspection_failed",
+      workspaceValidationInspectionCommand: "worktree_list", workspaceValidationInspectionFailure: "nonzero_exit", workspaceValidationInspectionExitCode: 128 });
+    expect(JSON.stringify(execution)).not.toContain("private");
+    expect(collectRunFailureDiagnostics(run({ errorCode: "adapter_failed", resultJson }), {}).execution).toEqual({});
+  });
+
+  it.each(["missing_worktree", "not_a_git_checkout", "not_registered", "wrong_repository_root", "branch_mismatch"])(
+    "exports %s without attaching unrelated probe evidence", reasonCode => {
+      expect(collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation: {
+        reason: "git_worktree_not_reusable", reasonCode, inspectionDiagnostic: { command: "worktree_list", failure: "nonzero_exit", exitCode: 128 },
+      } } }), {}).execution).toEqual({ workspaceValidationReason: "git_worktree_not_reusable", workspaceValidationReasonCode: reasonCode });
+    },
+  );
+
+  it.each([null, -1, 0, 256, Infinity, NaN, 1.5, "private", {}])("omits invalid Git inspection exit codes (%j)", exitCode => {
+    const execution = collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation: {
+      reason: "git_worktree_not_reusable", reasonCode: "git_inspection_failed",
+      inspectionDiagnostic: { command: "worktree_list", failure: "nonzero_exit", exitCode },
+    } } }), {}).execution;
+    expect(execution).not.toHaveProperty("workspaceValidationInspectionExitCode");
+    expect(JSON.stringify(execution)).not.toContain("private");
+  });
+
+  it("omits unknown validation values and contains hostile diagnostic getters", () => {
+    const inspect = (workspaceValidation: unknown) => collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation } }), {}).execution;
+    expect(inspect({ reason: "private" })).toEqual({});
+    expect(inspect({ reason: "git_worktree_not_reusable", reasonCode: "private" })).toEqual({ workspaceValidationReason: "git_worktree_not_reusable" });
+    const base = { reason: "git_worktree_not_reusable", reasonCode: "git_inspection_failed" };
+    for (const inspectionDiagnostic of [null, {}, { command: "private", failure: "nonzero_exit" }, { command: "worktree_list", failure: "private" },
+      Object.defineProperty({}, "command", { get() { throw new Error("private"); } })]) {
+      expect(inspect({ ...base, inspectionDiagnostic })).toEqual({ workspaceValidationReason: base.reason, workspaceValidationReasonCode: base.reasonCode });
+    }
+    const error = Object.defineProperty({ command: "worktree_list", failure: "spawn_failed" }, "errorCode", { get() { throw new Error("private"); } });
+    expect(inspect({ ...base, inspectionDiagnostic: error })).toMatchObject({ workspaceValidationInspectionErrorCode: "unknown" });
+    expect(inspect({ ...base, inspectionDiagnostic: { command: "worktree_list", failure: "spawn_failed", errorCode: "EACCES", exitCode: 128 } })).toMatchObject({ workspaceValidationInspectionErrorCode: "EACCES" });
+  });
+
+  it.each(["source_scope_mismatch", "explicit_project_workspace_conflict", "source_path_unproven",
+    "source_registration_unproven", "source_repository_mismatch", "source_repository_unavailable"])(
+    "exports only the fixed retained-source reason %s", reasonCode => {
+      const workspaceValidation = { reason: "persisted_workspace_source_conflict", reasonCode,
+        executionWorkspaceId: "private-id", repoUrl: "private-url", cwd: "/private-path", message: "private-message" };
+      expect(collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation } }), {}).execution)
+        .toEqual({ workspaceValidationReason: "persisted_workspace_source_conflict", workspaceValidationReasonCode: reasonCode });
+      expect(collectRunFailureDiagnostics(run({ errorCode: "adapter_failed", resultJson: { workspaceValidation } }), {}).execution).toEqual({});
+    },
+  );
+
+  it("omits arbitrary retained-source reason strings and hostile getters", () => {
+    for (const reasonCode of ["private-url", Object.defineProperty({}, "value", { get() { throw new Error("private"); } })]) {
+      expect(collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation: {
+        reason: "persisted_workspace_source_conflict", reasonCode,
+      } } }), {}).execution).toEqual({ workspaceValidationReason: "persisted_workspace_source_conflict" });
+    }
+    const workspaceValidation = Object.defineProperty({ reason: "persisted_workspace_source_conflict" }, "reasonCode", {
+      get() { throw new Error("private"); },
+    });
+    expect(collectRunFailureDiagnostics(run({ errorCode: "workspace_validation_failed", resultJson: { workspaceValidation } }), {}).execution)
+      .toEqual({ workspaceValidationReason: "persisted_workspace_source_conflict" });
+  });
+
+  it("exports bounded orphan evidence only for a process-loss failure", () => {
+    const processLossDiagnostic = { pidRecorded: false, groupRecorded: false, localCheck: "no_identifiers",
+      retryEligible: false, runPredatesObserver: true, observerUptimeMs: 30_000, lastOutputAgeMs: 120_000,
+      pid: 123, path: "/private-path", prompt: "private-prompt" };
+    const resultJson = { processLossDiagnostic };
+    expect(collectRunFailureDiagnostics(run({ errorCode: "process_lost", resultJson }), {}).execution).toEqual({
+      processLossPidRecorded: false, processLossGroupRecorded: false, processLossLocalCheck: "no_identifiers",
+      processLossRetryEligible: false, processLossRunPredatesObserver: true,
+      processLossObserverUptimeMs: 30_000, processLossLastOutputAgeMs: 120_000,
+    });
+    expect(collectRunFailureDiagnostics(run({ errorCode: "adapter_failed", resultJson }), {}).execution).toEqual({});
+  });
+
   it("exports only the closed native model/auth rejection vocabulary", () => {
     const diagnostic = { provider: "codex", category: "model_auth_incompatible", status: 400, authMode: "chatgpt" };
     const result = sanitizeRunFailureDiagnostics(collectRunFailureDiagnostics(run({ resultJson: {

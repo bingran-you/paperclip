@@ -522,7 +522,13 @@ async function applyPendingMigrationsManually(
                 }
               }
             }
-            await sql.unsafe(statement);
+            // Older dev schemas can lack a replaced constraint. Preserve the
+            // published SQL/hash while allowing the harmless drop to proceed.
+            const executable = statement.replace(
+              /^(\s*ALTER TABLE "[^"]+" DROP CONSTRAINT) (?!IF EXISTS\b)/i,
+              "$1 IF EXISTS ",
+            );
+            await sql.unsafe(executable);
           }
 
           await recordMigrationHistoryEntry(

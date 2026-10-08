@@ -34,6 +34,7 @@ import type {
   PrpStructuredRunResult,
   PrpTerminalState,
 } from "../protocol/replay-contract.js";
+import { PRP_PROTOCOL_VERSION } from "../protocol/replay-contract.js";
 import { executeNativeSession } from "../native-session-runtime.js";
 import { redactCapabilityEvidenceData } from "./evidence-redaction.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
@@ -232,7 +233,7 @@ it("replaces an owned v1 runner with fresh v2 authorization before warm attachme
       async () => {
         expect(handles).toHaveLength(2);
         const state = await runnerState();
-        expect(state.lastConnectionProtocolVersion).toBe(2);
+        expect(state.lastConnectionProtocolVersion).toBe(PRP_PROTOCOL_VERSION);
         expect(state.v2ReplayEvents).toEqual({});
         expect(state.outbox).toEqual([]);
         expect(core.activeRunnerConnectionCount()).toBe(1);

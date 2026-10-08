@@ -7,6 +7,8 @@ import type {
   NativeAcpxPermissionMode,
   NativeCodexApprovalPolicy,
   NativeExecutionInputV5,
+  NativeExecutionInputV6,
+  DotBindingSnapshot,
   NativeCompletionSource,
   NativeInteractionResponseEnvelope,
   NativeOpenCodePermissionMode,
@@ -31,7 +33,7 @@ const NATIVE_GITHUB_ATTACHMENT_RECOVERY_GUIDANCE = [
 ].join("\n");
 
 /** Closed constructor: callers cannot spread legacy context or environment data. */
-export function buildNativeExecutionInput(input: {
+export interface BuildNativeExecutionInput {
   companyId: string;
   runId: string;
   issue: {
@@ -67,7 +69,8 @@ export function buildNativeExecutionInput(input: {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot";
+  dotBinding?: DotBindingSnapshot;
   acpxAgent?: NativeAcpxAgent;
   codexApprovalPolicy?: NativeCodexApprovalPolicy;
   codexReasoningEffort?: string;
@@ -101,7 +104,11 @@ export function buildNativeExecutionInput(input: {
     sources?: Array<{ id: string; source: NativeCompletionSource }>;
   };
   runtimeContext: NativeRuntimeContextSnapshot;
-}): NativeExecutionInputV5 {
+}
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "openai_dot"; dotBinding: DotBindingSnapshot }): NativeExecutionInputV6;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot"> }): NativeExecutionInputV5;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 {
   if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask") {
     throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, or ask");
   }
@@ -190,7 +197,7 @@ export function buildNativeExecutionInput(input: {
   const completionSources = !externalChatTurn && !input.conversationMode && input.taskPrompt.trim()
     ? verifiedCompletionSources(input.turnContext, input.completionContract.sources ?? [])
     : [];
-  return parseNativeExecutionInput({
+  const prepared = {
     schema: "paperclip.native-execution-input.v5",
     ...((input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
@@ -308,7 +315,12 @@ export function buildNativeExecutionInput(input: {
     interactionResponses: input.interactionResponses ?? [],
     credentialBindings: [],
     runtimeContext: input.runtimeContext,
-  }) as NativeExecutionInputV5;
+  };
+  return parseNativeExecutionInput(input.provider === "openai_dot" ? { ...prepared,
+    schema: "paperclip.native-execution-input.v6", provider: { kind: "openai_dot", model: null, binding: input.dotBinding },
+    workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
+    session: { ...prepared.session, driverKind: "openai_dot_mcp", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
+  } : prepared) as NativeExecutionInputV5 | NativeExecutionInputV6;
 }
 
 

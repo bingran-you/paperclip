@@ -78,12 +78,18 @@ impl Command {
         let schema_version = match self.schema.as_str() {
             "paperclip.prp.command.v1" => 1,
             "paperclip.prp.command.v2" => 2,
+            "paperclip.prp.command.v3" => 3,
             _ => {
                 return Err(DurableRunnerError::invalid(
                     "command requires a supported paperclip.prp.command schema",
                 ));
             }
         };
+        if self.command_type == "external_provider.operation" && schema_version < 3 {
+            return Err(DurableRunnerError::invalid(
+                "external provider operations require PRP v3",
+            ));
+        }
         if schema_version == 1 && self.command_type.starts_with("session.goal.") {
             return Err(DurableRunnerError::invalid(
                 "session goal commands require the paperclip.prp.command.v2 schema",
@@ -150,6 +156,7 @@ impl Command {
                 | "session.goal.get"
                 | "session.goal.set"
                 | "session.goal.clear"
+                | "external_provider.operation"
         ) {
             return Err(DurableRunnerError::invalid(format!(
                 "command type is not supported by PRP v{schema_version}"
@@ -578,7 +585,9 @@ impl DurableState {
 
         let source_seq = self.next_source_seq;
         let emitted_at = current_timestamp()?;
-        let schema_version = if matches!(
+        let schema_version = if event_type.starts_with("external_provider.") {
+            3
+        } else if matches!(
             event_type.as_str(),
             "session.capabilities.updated"
                 | "session.goal.snapshot"

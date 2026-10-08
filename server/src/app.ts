@@ -5,11 +5,14 @@ import { browserUseRoutes } from "./routes/browser-use.js";
 import { browserUseService } from "./services/browser-use.js";
 import { slackToolRoutes } from "./routes/slack-tools.js";
 import { createPublicMcpOAuth, publicMcpConfig } from "./services/public-mcp/oauth.js";
+import { createDotRunnerMcpTools } from "./services/dot-runner-broker.js";
+import { dotRunnerRoutes } from "./routes/dot-runner.js";
 import { createPublicMcpTransfers } from "./services/public-mcp/file-transfers.js";
 import { createMcpApiDispatch, createPublicMcpExecutor } from "./services/public-mcp/capabilities.js";
 import { createPublicMcpEvents, type PublicMcpEvents } from "./services/public-mcp/events.js";
 import { publicMcpIngressRoutes, publicMcpManagementRoutes } from "./routes/public-mcp.js";
 import { agentAvatarRoutes } from "./routes/agent-avatars.js";
+import { decisionModelRoutes } from "./routes/decision-models.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
@@ -107,6 +110,7 @@ import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { announcementRoutes } from "./routes/announcements.js";
 import { serverVersion } from "./version.js";
+import { primaryAgentRoutes } from "./routes/primary-agent.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
@@ -135,6 +139,7 @@ import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
+import { staticUiCompression } from "./middleware/static-ui-compression.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import {
@@ -824,6 +829,7 @@ export async function createApp(
   api.use(sidebarPreferenceRoutes(db));
   api.use(announcementRoutes(db, { ...opts.announcements, version: opts.hostVersion ?? serverVersion }));
   api.use(resourceMembershipRoutes(db));
+  api.use(primaryAgentRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   if (opts.databaseBackupService) {
@@ -875,6 +881,7 @@ export async function createApp(
   registerAssignedMcpGateway(db, toolGateway);
   app.locals.toolActionDeliveries = toolActionDeliveries;
   app.use(mcpGatewayProtocolRoutes(toolGateway));
+  api.use(decisionModelRoutes(db));
   api.use(aiConnectionRoutes(db, { deploymentMode: opts.deploymentMode, deploymentExposure: opts.deploymentExposure, trustedLocalStdioRuntimeHost }));
   api.use(
     toolAccessRoutes(db, {
@@ -974,6 +981,9 @@ export async function createApp(
       getNativeRunnerEnabled: async () =>
         (await instanceSettingsService(db).getExperimental())
           .enableNativeRunner === true,
+      getOpenAiDotEnabled: async () =>
+        (await instanceSettingsService(db).getExperimental())
+          .enableOpenAiDot === true,
     }),
   );
   api.use(
@@ -986,6 +996,7 @@ export async function createApp(
     }),
   );
   let publicMcpEvents: PublicMcpEvents | null = null;
+  let dotMcpEvents: PublicMcpEvents | null = null;
   if (publicMcpOAuth) {
     const dispatch = createMcpApiDispatch(api);
     publicMcpEvents = createPublicMcpEvents(db, publicMcpOAuth, dispatch, {
@@ -995,7 +1006,12 @@ export async function createApp(
     const transfers = createPublicMcpTransfers(db, publicMcpOAuth, dispatch, opts.storageService);
     publicMcpIngress.use(transfers.router);
     publicMcpIngress.use(publicMcpIngressRoutes(publicMcpOAuth, createPublicMcpExecutor(db, publicMcpOAuth, dispatch, transfers), publicMcpEvents));
-    api.use(publicMcpManagementRoutes(publicMcpOAuth));
+    const dotOAuth = createPublicMcpOAuth(db, { ...publicMcpOAuth.config, resource: publicMcpOAuth.config.origin + "/mcp/runner" });
+    dotMcpEvents = createPublicMcpEvents(db, dotOAuth, dispatch, { enableDotRunner: true, isBackgroundWorkEnabled: () => !isWarmStandby() });
+    dotMcpEvents.start();
+    publicMcpIngress.use(publicMcpIngressRoutes(dotOAuth, createPublicMcpExecutor(db, dotOAuth, dispatch), dotMcpEvents, createDotRunnerMcpTools(db)));
+    api.use(publicMcpManagementRoutes(publicMcpOAuth, dotOAuth));
+    api.use(dotRunnerRoutes(db, publicMcpOAuth.config.origin + "/mcp/runner"));
   }
 
   app.use("/api", api);
@@ -1019,6 +1035,7 @@ export async function createApp(
       fs.existsSync(path.join(p, "index.html")),
     );
     if (uiDist) {
+      staticUi.use(staticUiCompression());
       // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
       // never change once built, so they can be cached aggressively.
       staticUi.use(
@@ -1364,6 +1381,7 @@ export async function createApp(
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
       await publicMcpEvents?.stop();
+      await dotMcpEvents?.stop();
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();

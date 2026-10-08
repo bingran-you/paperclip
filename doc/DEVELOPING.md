@@ -92,6 +92,12 @@ The vite dev server serves an unbundled module graph. This is fast to reload on 
 
 The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN address (e.g. `http://<host>.ts.net:3101/`) works out of the box. The `/api` proxy sets `x-forwarded-host` and `x-forwarded-proto`, which the server's board mutation guard uses to trust the browser's Origin — mutations from `:3101` succeed against the API on `:3100` without further configuration. An HTTPS tunnel in front of the preview server (ngrok, tailscale funnel) is also supported: the tunnel's `x-forwarded-proto` header is preserved when set.
 
+Static UI mode compresses built JavaScript, CSS, and HTML with Brotli or gzip
+when the browser supports it. Hashed assets retain their immutable cache policy;
+byte-range responses retain their original representation. This reduces initial
+page downloads through bandwidth-limited HTTPS tunnels such as Tailscale Funnel.
+API responses and MCP transports keep their existing compression behavior.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
@@ -622,25 +628,34 @@ case.
 ### Slack chat setup in a test drive
 
 Enable **Chat connectors** in Instance Settings, then open **Connectors → Slack →
-Chat with an agent**. Before connecting, configure a public HTTPS URL that Slack
-can reach. The setup page shows this requirement above the app details.
-Slack app name, bot display name, and slash command are editable while the
-connection is a draft; valid edits save when a field loses focus. **Create Slack
-app** opens Slack with the generated manifest prefilled. **View Slack App Manifest**
-opens the read-only manifest in a modal to inspect or copy it. Once connected,
-the app details are locked so reconnecting cannot silently change the registered
-command. Slack still requires workspace selection, installation approval, and
-copying the bot token and signing secret back into Paperclip.
+Chat with an agent**. Before creating an app, configure a public HTTPS board URL
+and webhook ingress that Slack can reach. The setup page shows this prerequisite;
+a loopback test drive can exercise the UI before HTTPS is configured.
 
-After Slack verifies its Events Request URL, the wizard asks you to send
-`/<your-command> connect`. This command works before a sender or channel is
-allowed to start work. It records the Slack identity and sends a private,
-one-time confirmation link that expires after 15 minutes; it creates no task
-and grants no access. You can confirm **This is my Slack account** in the wizard,
-or follow the private link and sign into Paperclip. Both paths check company
-membership before linking, and future messages use the linked user's current
-permissions. The wizard only lists identities that sent the connect command to
-this endpoint during the current test.
+New Slack connections use five steps: choose an agent, enter an app configuration
+token, install the app, verify Slack delivery, and try a conversation. Agent
+selection generates readable defaults for the Slack app name, bot display name,
+and slash command; edit them under **Advanced** if needed. **Get your App
+configuration token** opens Slack app settings. Enter the temporary token directly
+into Paperclip, then select **Create Slack app**. Paperclip creates the app,
+vaults its credentials, and attempts avatar upload before discarding the token.
+App details lock after creation dispatch, including an uncertain result.
+
+**Install in Slack** obtains the bot token through OAuth, links the installing
+Slack account to the Paperclip account that started installation, and sends one
+welcome DM. Approve with your own Slack account. After Slack verifies the Events
+Request URL, use **Open your Slack DM**, send the suggested message, and continue
+in the thread. **Done** finishes setup; the conversation test is optional.
+See [Automatic Slack app setup](connections/SLACK-AUTOMATIC-SETUP.md) for
+HTTPS configuration and recovery.
+
+**Create manually** and **Use an existing app** are under **Advanced** on the
+token step. These paths retain manual credential entry and a separate personal
+account-linking step. Send `/<your-command> connect` to discover your identity
+without starting work, then confirm **This is my Slack account** in the wizard
+or use the private confirmation link. The link expires after 15 minutes and
+requires company membership. Future messages use the linked user's current
+permissions. Additional or different accounts can be linked later in **Access**.
 
 New Slack connections disable **Allow unlinked people** by default. The Access
 page includes the shareable connect command and instructions for other users.
@@ -658,14 +673,11 @@ company. Preview, access-request, and confirmation APIs also enforce the chat
 connector rollout flag on the server; invitees cannot read board experimental
 settings before they join. Expired or consumed tokens grant no access.
 
-The final wizard step suggests `@<your-bot> you there?`, then continuing in
-the agent's thread. Select the bot from Slack's @mention suggestions so the
-message includes a real mention. It detects a message or task command from the current user's
-linked Slack identity during this setup session and shows a checkmark. This
-conversation test is optional: **I've sent the test message** and **Skip test and
-finish** both finish setup once webhook verification and account linking are
-complete. The separate strict connection-test API retains its conversation and
-delivery checks.
+The manual path suggests `@<your-bot> you there?`, then continuing in the agent's
+thread. Select the bot from Slack's @mention suggestions so the message includes
+a real mention. **Done** finishes setup once webhook verification and required
+account linking are complete, whether or not a test message was sent. The
+separate strict connection-test API retains its conversation and delivery checks.
 
 ### Chat activity pagination and callback diagnostics
 
@@ -862,6 +874,8 @@ Agent, project, environment, secret, skill, and workspace config edits are sampl
 
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
+An explicit `reuse_existing` Git workspace keeps its recorded source repository, including after its project-workspace row is deleted or the project primary changes. The server verifies the original company, project, repository origin, and worktree registration before reuse. It does not attach a deleted association to the new primary. A conflicting explicit project-workspace selection, missing source identity, or an unverified legacy local checkout blocks the run. Restore the original source. Before intentionally clearing the existing-workspace binding to choose a new repository, review and preserve its retained work. Missing worktrees may be reconstructed only from the verified original source; current project defaults are not a fallback.
+
 ## Workspace Git Scan Protection
 
 Paperclip applies one process-wide scheduler to expensive host-side workspace Git enumeration, including changed-file browsing, runtime/finalization cleanliness guards, and adapter sandbox-sync snapshots. The scheduler defaults to two active scans and a bounded queue of 32. Identical buffered scans of the same canonical worktree share one subprocess, while successful changed-file listings are cached for 10 seconds. Streaming snapshot scans have caller-owned sinks, so they use separate jobs in the same queue and are never cached or coalesced. Correctness-sensitive runtime guards bypass the result cache.
@@ -920,7 +934,16 @@ Seed modes:
 
 - `minimal` keeps core app state like companies, projects, issues, comments, approvals, and auth state, preserves schema for all tables, but omits row data from heavy operational history such as heartbeat runs, wake requests, activity logs, runtime services, and agent session state
 - `full` makes a full logical clone of the source instance
-- `--no-seed` creates an empty isolated instance
+- `--no-seed` defers database copying until the worktree is first used
+- `--empty` creates an empty isolated instance, with fresh signing secrets and no deferred copy; use this for synthetic test drives
+
+`--empty` persists a `.paperclip/seed-empty` marker before writing the instance config.
+The CLI and managed runtime provisioner honor it even when a registered source
+instance is present. An explicit successful `worktree reseed`, or a replacement
+`worktree init --force` without `--empty`, clears the choice.
+While that marker exists, startup uses the instance's saved JWT and tool-action
+signing keys even if the shell inherited another instance's keys. Better Auth
+uses its saved key or the fresh instance JWT key. Missing saved keys stop startup.
 
 Seeded worktree instances quarantine copied live execution by default for both `minimal` and `full` seeds. During restore, Paperclip disables copied agent timer heartbeats, resets copied `running` agents to `idle`, blocks and unassigns copied agent-owned `in_progress` issues, and unassigns copied agent-owned `todo`/`in_review` issues. This keeps a freshly booted worktree from starting agents for work already owned by the source instance. Pass `--preserve-live-work` only when you intentionally want the isolated worktree to resume copied assignments.
 
@@ -1019,7 +1042,8 @@ The workspace UI surfaces `Provisioning database`, `Validating clone`, `Ready`, 
 | `--server-port <port>` | Preferred server port |
 | `--db-port <port>` | Preferred embedded Postgres port |
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
-| `--no-seed` | Skip database seeding from the source instance |
+| `--no-seed` | Defer database copying until first use |
+| `--empty` | Create an empty instance with fresh signing secrets and disable automatic copying |
 | `--force` | Replace existing repo-local config and isolated instance data |
 
 Examples:
@@ -1120,7 +1144,8 @@ Managed workspace repair uses this same verified full-reseed contract through `P
 | `--server-port <port>` | Preferred server port |
 | `--db-port <port>` | Preferred embedded Postgres port |
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
-| `--no-seed` | Skip database seeding from the source instance |
+| `--no-seed` | Defer database copying until first use |
+| `--empty` | Create an empty instance with fresh signing secrets and disable automatic copying |
 | `--force` | Replace existing repo-local config and isolated instance data |
 
 Examples:
@@ -1270,6 +1295,15 @@ agent workspace. The host `HOME` itself, a directory that contains it, a
 filesystem root, a `CODEX_HOME` overlap, or a canonical path outside the
 assigned workspace is rejected before provider startup.
 
+Fresh remote Codex Runner runs recover from a supported image CLI that is too old
+for the selected model. Preparation selects the closest compatible older model
+of the same class, then the stable Runner default. The task shows a warning with
+the requested model, effective model, and CLI version. Agent and task settings
+stay unchanged. Update the image CLI to restore the requested model on later
+runs. Explicit `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` and
+`PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` settings take precedence. See
+[execution semantics](execution-semantics.md#remote-codex-model-compatibility).
+
 ### Sandbox ACP input delivery
 
 The legacy sandbox process bridge retries recognized Daytona and Cloudflare
@@ -1345,6 +1379,14 @@ provider session identities across server restarts. A coordinated hot restart
 registers a correlated recovery request before it signals the dev supervisor.
 An uncoordinated server restart uses the same durable recovery classifier
 without trusting a handoff marker.
+
+Recovery retains each run's saved execution prompt, revision, and context
+digest across server upgrades. The shared parser validates the saved prompt's
+SHA-256 and aggregate context digest. The revision is non-empty metadata; it
+does not need to match the current release or a catalog of past prompts. New
+runs use the current prompt. Do not rewrite saved execution inputs to the latest
+prompt. Existing execution-schema, ownership, checkpoint, and permission checks
+still determine whether recovery can proceed.
 
 Startup binds the HTTP and PRP listener before it classifies native runs. Public
 health reports a startup state until every candidate is reattached, dispatched

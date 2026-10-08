@@ -206,3 +206,6 @@ translate the intent into Apps v2:
 Do not add new work to the retired v1 branch. If an old ticket still describes a
 valid product gap, retarget it to an active Apps v2 issue or close it as
 superseded with a link to the replacement.
+
+For Slack chat bot creation, installation, recovery, and live qualification, see
+[Automatic Slack app setup](SLACK-AUTOMATIC-SETUP.md).

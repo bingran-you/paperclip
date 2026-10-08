@@ -5,6 +5,9 @@ export type AgentPaletteId = typeof AGENT_PALETTE_IDS[number];
 export type CharacterPaletteId = AgentPaletteId | "muted-dream";
 export const AGENT_AVATAR_SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512] as const;
 export type AgentAvatarSize = typeof AGENT_AVATAR_SIZES[number];
+export type AgentAvatarBackground = "transparent" | "paperclip-dark";
+/** sRGB PNG equivalent of index.css .dark --background: oklch(0.205 0 0). */
+export const PAPERCLIP_DARK_AVATAR_BACKGROUND = "#171717";
 export const CHARACTER_STATES = ["rest", "idle", "listening", "thinking", "working", "success", "confused", "sleepy", "loading"] as const;
 export type CharacterState = typeof CHARACTER_STATES[number];
 export const agentAppearanceSchema = z.object({
@@ -35,8 +38,8 @@ export function resolveAgentAppearance(appearance: unknown, id = "agent"): Agent
   const parsed = agentAppearanceSchema.safeParse(appearance);
   return parsed.success ? parsed.data : legacyAgentAppearance(id);
 }
-export function agentAvatarUrl(appearance: AgentAppearance, size: AgentAvatarSize = 512, scale: 1 | 2 = 1, pose: CharacterState = "rest", muted = false): string {
-  return `/api/agent-avatars/${appearance.characterVersion}/${muted ? "muted-dream" : appearance.paletteId}/${pose}.png?size=${size}&scale=${scale}`;
+export function agentAvatarUrl(appearance: AgentAppearance, size: AgentAvatarSize = 512, scale: 1 | 2 = 1, pose: CharacterState = "rest", muted = false, background: AgentAvatarBackground = "transparent"): string {
+  return `/api/agent-avatars/${appearance.characterVersion}/${muted ? "muted-dream" : appearance.paletteId}/${pose}.png?size=${size}&scale=${scale}${background === "paperclip-dark" ? "&background=paperclip-dark" : ""}`;
 }
 export function characterStateForAgent(status: string): CharacterState {
   if (status === "running") return "working";
