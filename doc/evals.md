@@ -391,6 +391,11 @@ The 26 native `first-task` cells exercise onboarding before native selection
 becomes the UI default. Live results and semantic answer reviews must accompany
 any qualification claim; catalog presence alone is not a pass.
 
+The explicit-only [native question/resume qualification](../tests/runner-e2e/README.md#task-continuation)
+separates a completed two-answer user journey from semantic-tool documentation
+qualification. It verifies the exact provider-pause or semantic-response-wake
+binding for each answer and preserves prior grades when the definition changes.
+
 ## Lifecycle behavior baseline
 
 The credential-free [lifecycle baseline](../tests/lifecycle-baseline/README.md)

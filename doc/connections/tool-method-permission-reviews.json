@@ -508,6 +508,40 @@
       "keyPermissions": "Use an API key for an account with write access to the meetings your agents need to share, rename, move or turn into soundbites. Paperclip cannot increase the key\u2019s permissions."
     },
     {
+      "app": "gauge",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "mcp"
+      ],
+      "capability": "write",
+      "supportedActions": "Read AI visibility, mentions, citations, answers and competitor data; browse and curate tracked topics and prompts (create, generate, move, tag, and replace keyword lists); pull SEO keyword, GA4, Search Console, PostHog and Google Ads/OpenAI Ads reports; run the content pipeline from brief to article and publish to a connected CMS as a draft, to staging or live; read and edit organization memory files and skills; create, assign and update Action Center items; ask Ask Gauge questions. Access is limited to the organization chosen during consent.",
+      "evidence": [
+        "https://docs.withgauge.com/help/mcp",
+        "https://app.withgauge.com/.well-known/oauth-protected-resource",
+        "https://app.withgauge.com/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-08",
+      "liveProof": "not-run"
+    },
+    {
+      "app": "gauge",
+      "method": "mcp-api-key",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "provider-controlled",
+      "supportedActions": "Read AI visibility, mentions, citations, answers and competitor data; browse and curate tracked topics and prompts (create, generate, move, tag, and replace keyword lists); pull SEO keyword, GA4, Search Console, PostHog and Google Ads/OpenAI Ads reports; run the content pipeline from brief to article and publish to a connected CMS as a draft, to staging or live; read and edit organization memory files and skills; create, assign and update Action Center items; ask Ask Gauge questions.",
+      "evidence": [
+        "https://docs.withgauge.com/help/mcp",
+        "https://app.withgauge.com/.well-known/oauth-protected-resource"
+      ],
+      "reviewedAt": "2026-10-08",
+      "liveProof": "not-run",
+      "keyPermissions": "Gauge API keys are not scoped: a key reaches every MCP tool in the organization that created it, including publishing to a connected CMS, and requests are attributed to the organization rather than a user. Generate a separate key for Paperclip so it can be deleted independently, and set publish actions to Ask first before agents run unattended. Paperclip cannot narrow an existing key."
+    },
+    {
       "app": "github",
       "method": "managed",
       "auth": "oauth",

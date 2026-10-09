@@ -12,7 +12,7 @@ import { apiResponseReadingTask } from "./api-response-reading.js";
 import { taskTitleTasks, taskTitleDefinitionDigest, TASK_TITLE_BUDGET_CENTS } from "./task-titles.js";
 import { blockerTasks, blockerProfile } from "./blocker-cases.js";
 import { accountingTasks } from "./accounting-cases.js";
-import { continuationTasks } from "./continuation-cases.js";
+import { continuationTasks, questionResumeTask } from "./continuation-cases.js";
 import { contextIntegrityTasks, paperclipDocumentTask } from "./context-integrity-cases.js";
 import { productionDefaultHireProfile, stockHarnessSourceDigest, stockHarnessSkillSources } from "./stock-harness.js";
 import { lifecycleLiveTasks, lifecycleLiveDefinitionDigest } from "./lifecycle-live-cases.js";
@@ -1260,7 +1260,17 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       ...connectionReviewSuite.tasks],
     expectedMatrixSize: 46,
     excludedExecutionIds: ["neutral", "challenge"].map(variant => `lifecycle-baseline.runner-codex.local.lifecycle-repair-${variant}`),
-    definitionMetadata: { version: 4, clarificationGrading: "wrapped-information-fields-list", narrativeDigest: lifecycleLiveDefinitionDigest, grading: "durable-state-and-attributed-narrative", scheduling: "explicit-only" },
+    definitionMetadata: { version: 5, clarificationGrading: "wrapped-information-fields-list", narrativeDigest: lifecycleLiveDefinitionDigest, grading: "durable-state-and-attributed-narrative", scheduling: "explicit-only" },
+  },
+  {
+    id: "question-resume", label: "Native question and answer continuation", manualOnly: true,
+    description: "Two real UI answers, exact provider-pause or semantic-wake identity, and one saved document.",
+    groups: ["native", "local"], environments: [localEnvironment],
+    profiles: runnerProfiles.filter(p => ["runner-codex", "runner-acpx-claude"].includes(p.id)).map(productionStoryProfile),
+    tasks: [questionResumeTask], expectedMatrixSize: 2,
+    definitionMetadata: { version: 1, grading: "bound-question-path-and-two-durable-answers", instructions: "unchanged-production",
+      scheduling: "explicit-only", automaticRetryPolicy: "single_attempt", companyAndAgentBudgetCents: 1_000,
+      providerRuns: "1-3; each semantic answer starts one exactly bound wake; provider answers retain their paused run" },
   },
   {
     id: "continuation", label: "Task continuation",
@@ -1272,7 +1282,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       ...["legacy-codex", "legacy-claude"].map(profile => `continuation.${profile}.local.question-tool-documentation`),
       ...["legacy-codex", "legacy-claude", "runner-codex"].map(profile => `continuation.${profile}.local.provider-question-bridge`),
     ],
-    definitionMetadata: { version: 4, grading: "durable-state-and-approval-boundaries", instructions: "production" },
+    definitionMetadata: { version: 5, grading: "durable-wait-owner-and-all-answer-identities", instructions: "production", automaticRetryPolicy: "single_attempt", companyAndAgentBudgetCents: 1_000 },
   },
   {
     id: CONNECTION_GUIDANCE_SUITE, label: "Native connection guidance", manualOnly: true,
@@ -1668,6 +1678,7 @@ export function validateRunnerCatalog(): MatrixExecution[] {
     ...accountingTasks,
     ...lifecycleLiveTasks,
     ...continuationTasks,
+    questionResumeTask,
     ...everydayTasks,
     ...taskTitleTasks,
     ...runnerTasks,

@@ -2854,3 +2854,7 @@ export * from "./connection-instructions.js";
 export * from "./customer-success.js";
 export * from "./decision-models.js";
 export { updatePrimaryAgentSchema, type UpdatePrimaryAgent, type PrimaryAgentPreference } from "./primary-agent.js";
+
+export * from "./agent-avatar-upload.js";
+
+export type { DotBinding, DotInvitation, DotConnection, DotPairing } from "./dot-invitations.js";

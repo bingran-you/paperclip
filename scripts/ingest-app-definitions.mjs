@@ -1017,6 +1017,7 @@ const categoryBySlug = {
   egnyte: "content",
   embat: "commerce",
   fireflies: "productivity",
+  gauge: "analytics",
   "hugging-face": "ai",
   jira: "productivity",
   kernel: "developer",
@@ -1100,6 +1101,7 @@ const apiKeySpec = {
     prefix: "Bearer ",
     placeholder: "Paste your Coda API token",
   },
+  gauge: { name: "Authorization", prefix: "Bearer ", placeholder: "Paste your Gauge API key" },
   kernel: {
     name: "X-API-Key",
     prefix: null,
@@ -1229,6 +1231,34 @@ const specialMethodsFor = (entry) => {
       }] } : {}),
     }),
   ];
+  // Gauge's sign-in picks one organization during consent; an API key is bound
+  // to the organization that created it and carries no user identity.
+  if (entry.slug === "gauge") {
+    const warning =
+      "Gauge content tools can publish to your connected CMS, including live. Set publish actions to Ask first before agents run unattended.";
+    // The access step renders the capability profile before sign-in, so the
+    // publish warning is visible on the default browser path too.
+    const capabilityProfile = {
+      key: "write",
+      label: "Read and write",
+      description: `Read AI visibility, SEO and traffic data, and run content workflows. ${warning}`,
+    };
+    return [
+      oauthMethodFor(entry, "mcp-oauth", entry.serverUrl, {
+        guidanceMd:
+          "Connect Gauge in the browser and choose the organization this connection may use. Write tools start enabled and remain governed by Paperclip's action policies.",
+        warnings: [entry.prerequisite, warning],
+        capabilityProfile,
+      }),
+      apiKeyMethodFor(entry, "mcp-api-key", entry.serverUrl, {
+        whenToUse: "Use a Gauge organization API key when browser sign-in is not suitable.",
+        guidanceMd:
+          "In Gauge, open Settings → Integrations → API Keys, generate a key for Paperclip, and paste it below.",
+        warnings: [entry.prerequisite, warning],
+        capabilityProfile,
+      }),
+    ];
+  }
   // Superagent's hosted server advertises protected-resource metadata, but its
   // authorization server publishes no OAuth metadata, so organization API keys
   // are the only working credential.
@@ -1750,7 +1780,7 @@ for (const entry of researchManifest.entries) {
     schemaVersion: 1,
     slug: entry.slug,
     name: entry.name,
-    description: ({ neon: "Manage Postgres projects and branches, run SQL, and inspect schemas in Neon.", superagent: "Review security findings, start red-team reports, and score content and packages before agents trust them.", mem0: "Remember preferences, conversations, events, and agent state.", zep: "Retrieve temporal graph memory and authorized business context.", supermemory: "Search and save shared memories, documents, and profiles.", honcho: "Remember conversations and retrieve context about peers.", telem: "Search the web and read pages across many search providers with one API key." })[entry.slug] ?? (entry.slug === "fireflies"
+    description: ({ neon: "Manage Postgres projects and branches, run SQL, and inspect schemas in Neon.", gauge: "Track how AI answers mention your brand, research keywords and traffic, and run content workflows.", superagent: "Review security findings, start red-team reports, and score content and packages before agents trust them.", mem0: "Remember preferences, conversations, events, and agent state.", zep: "Retrieve temporal graph memory and authorized business context.", supermemory: "Search and save shared memories, documents, and profiles.", honcho: "Remember conversations and retrieve context about peers.", telem: "Search the web and read pages across many search providers with one API key." })[entry.slug] ?? (entry.slug === "fireflies"
       ? "Search meeting transcripts, read summaries and action items, and connect meeting-ready routines."
       : `Connect ${entry.name}'s provider-hosted MCP server.`),
     categories: [categoryBySlug[entry.slug] ?? "other"],

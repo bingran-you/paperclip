@@ -1,3 +1,5 @@
+import { AnimatedDialogContent } from "@/components/AnimatedDialogContent";
+import { ExternalAgentPresetPicker, DotConnectionChecks } from "@/components/new-agent/ExternalAgentInviteContent";
 import { AgentMailApiKeyField } from "@/features/connections/AgentMailApiKeyField";
 import { TaskBrowserFooter } from "@/components/task-side-panel/TaskBrowserFooter";
 import { TaskBrowserActivity } from "@/components/task-side-panel/TaskBrowserActivity";
@@ -2302,9 +2304,20 @@ export function DesignGuide() {
         <SavedProviderKeySelect options={[]} value="" onChange={() => {}} loading={false} error />
       </Section>
 
+      <Section title="External agent invitation">
+        <p className="text-sm text-muted-foreground">Match the harness picker with provider cards. Connection checks reflect confirmed server evidence. AnimatedDialogContent resizes to its content using motion tokens and respects reduced motion.</p>
+        <ExternalAgentPresetPicker onSelect={() => {}} />
+        <DotConnectionChecks state={{ phase: "testing" }} />
+        <Dialog><DialogTrigger asChild><Button variant="outline">Preview invitation modal</Button></DialogTrigger>
+          <AnimatedDialogContent><div className="space-y-4 p-6"><DialogTitle>Invite an external agent</DialogTitle><DialogDescription>Choose an agent you already use.</DialogDescription><ExternalAgentPresetPicker onSelect={() => {}} /></div></AnimatedDialogContent>
+        </Dialog>
+      </Section>
+
       <Section title="Browser setup prompt">
         <p className="text-sm text-muted-foreground">Use AgentSetupPrompt for prompts handed to an external agent: connections, webhook setup, onboarding, and task handoffs. One click copies the complete prompt, opens its preview, and confirms success inline; clipboard failures offer selectable text.</p>
         <SetupPrompt prompt="Design guide example. This is a preview, not a real provider setup request." />
+        <p className="text-sm text-muted-foreground">For a named recipient, pass the optional agent name and logo. The same copy feedback, preview, and manual clipboard recovery apply.</p>
+        <SetupPrompt prompt="Design guide example for Dot. No live pairing code." label="Copy setup prompt" title="Connect your Dot" agent={{ name: "Dot", src: "/brands/adapters/openai-dot.svg" }} />
       </Section>
 
       <Section title="Connection Intent">

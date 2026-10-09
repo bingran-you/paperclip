@@ -1240,6 +1240,21 @@ checkpoint and matcher; private `continuation-run-evidence.json` contains the
 recorded provider logs and events. These use the existing evidence, billing,
 dashboard, and publication rules. Raw logs remain private.
 
+Continuation cells have one attempt and verify 1,000-cent company and agent
+budget hard stops before creating the task. No automatic reroll is admitted.
+At every recorded wait, the lifecycle oracle requires the same task and assignee,
+an actionable pending interaction, and no scheduled retry, recovery or monitor.
+A settled turn must leave the task in review with its execution lock released.
+A provider-native question can instead retain a running native run and lock when
+the pending runtime request identifies that exact run. All intermediate run IDs
+and all pending question identities must survive to the final snapshot; every
+question must be answered exactly once in the retained interaction list.
+Checkpoint activity records support inspection of successful persisted mutations.
+They do not count failed API/tool attempts or establish a general no-duplicate-write
+guarantee. See the [waiting/resume ownership audit](../../doc/plans/2026-10-08-wait-resume-ownership.md)
+for boundaries and remaining instruction decisions. Historical results keep their
+original grades when these assertions change.
+
 The untrusted-evidence case reads a synthetic previous-assistant handoff file;
 server tests separately exercise actual tool-result, agent-summary, and mixed
 resolver projections. This is a regression sample, not an exhaustive injection
@@ -1255,6 +1270,30 @@ question section and detailed tool-format instructions must be absent. Server
 contract tests separately verify that the advertised tool carries the documentation
 for fresh and resumed native executions. This tests the current documentation
 placement; it is not a statistical comparison with the former prompt arrangement.
+
+The separate explicit-only `question-resume` suite uses the same neutral two-question
+request on native Codex and ACPX Claude. It qualifies the user journey through
+either the provider's built-in question or Paperclip's semantic question tool.
+It does not replace or regrade `question-tool-documentation`.
+
+The oracle classifies each wait from its exact task/agent/run identity. Provider
+questions require the server-generated request key and retain the paused run.
+Semantic questions require an applied `request_human_input` receipt and one new
+response wake bound to that interaction and source run. Only a verified provider
+choice may carry the adapter's optional Other field. A second substantive question
+is still rejected; the subsequent reference question must be text-only. Both real
+board answers must remain bound to unchanged forms, and one saved document must
+include both answers. Existing lifecycle, ownership, premature-output, terminal
+state and no-extra-task checks apply. Three checkpoints are required even when
+both answers resume one run; missing native inputs or unexplained runs fail.
+
+Select `question-resume.runner-acpx-claude.local.question-answer-resume` for the
+bounded Claude qualification. The suite is excluded from `--all`; it allows one
+attempt, one to three actual runs, a ten-minute cell deadline and verified
+1,000-cent company/agent hard stops. The historical failure where the optional
+Other field stopped the driver before any answer remains a FAIL. A new behavior
+pass does not establish semantic-tool selection, documentation placement, default
+hiring behavior or general reliability.
 
 Continuation screenshots wait for the correct task heading and fully revealed
 conversation before capture. A loading screen or wrong task fails capture.

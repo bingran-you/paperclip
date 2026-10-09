@@ -3083,6 +3083,16 @@ function readAgentSkillRefs(frontmatter: Record<string, unknown>) {
   ));
 }
 
+/** Uploaded avatars belong to one company/agent; portable packages retain the preset fallback. */
+function portableAgentAppearance(value: unknown, warnings: string[], slug: string) {
+  const appearance = agentAppearanceSchema.parse(value);
+  if (appearance.customAvatarAssetId) {
+    delete appearance.customAvatarAssetId;
+    warnings.push(`Agent ${slug} uploaded avatar was omitted because image assets are instance-local. Upload it again after import.`);
+  }
+  return appearance;
+}
+
 function buildManifestFromPackageFiles(
   files: Record<string, CompanyPortabilityFileEntry>,
   opts?: { sourceLabel?: { companyId: string; companyName: string } | null },
@@ -3241,7 +3251,7 @@ function buildManifestFromPackageFiles(
       role: asString(extension.role) ?? asString(frontmatter.role) ?? "agent",
       title,
       icon: asString(extension.icon),
-      appearance: extension.appearance == null ? undefined : agentAppearanceSchema.parse(extension.appearance),
+      appearance: extension.appearance == null ? undefined : portableAgentAppearance(extension.appearance, warnings, slug),
       capabilities: asString(extension.capabilities),
       reportsToSlug: asString(frontmatter.reportsTo) ?? asString(extension.reportsTo),
       reportsToExistingAgentId: asString(extension.reportsToExistingAgentId),
@@ -4262,7 +4272,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         const extension = stripEmptyValues({
           role: agent.role !== "agent" ? agent.role : undefined,
           icon: agent.icon ?? null,
-          appearance: agent.appearance,
+          appearance: agent.appearance == null ? undefined : portableAgentAppearance(agent.appearance, warnings, slug),
           capabilities: agent.capabilities ?? null,
           adapter: {
             type: agent.adapterType,
@@ -5609,7 +5619,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             role: manifestAgent.role,
             title: manifestAgent.title,
             icon: manifestAgent.icon,
-            ...(manifestAgent.appearance ? { appearance: manifestAgent.appearance } : {}),
+            ...(manifestAgent.appearance ? { appearance: portableAgentAppearance(manifestAgent.appearance, warnings, manifestAgent.slug) } : {}),
             capabilities: manifestAgent.capabilities,
             reportsTo: null,
             adapterType: normalizedAdapter.adapterType,

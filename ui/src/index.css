@@ -3357,6 +3357,10 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   height: var(--agent-setup-logo-size);
   margin-left: auto;
 }
+
+.agent-setup-trigger-logos[data-single="true"] {
+  width: var(--agent-setup-logo-size);
+}
 .agent-setup-logos { display: inline-flex; isolation: isolate; }
 .agent-setup-logos[data-hidden="true"] { visibility: hidden; }
 .agent-setup-logo-slot { display: inline-flex; position: relative; }

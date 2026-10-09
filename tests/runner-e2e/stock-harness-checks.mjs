@@ -33,10 +33,12 @@ export const stockHarnessGates = [
     "packages/adapters/opencode-local/src/server/execute.test.ts",
     "packages/adapters/cursor-cloud/src/server/execute.test.ts",
     "server/src/__tests__/codex-local-execute.test.ts",
+    "server/src/__tests__/paperclip-issue-update-helper.test.ts",
   ], required: ["keeps task and chat defaults to identity and connection guidance",
     "does not restore generic procedures on resume or with the legacy opt-in",
     "integrates the env-free store", "advertises folded routing metadata", "bounds routing descriptions",
-    "loads an old env-bearing file with rotated credentials", "drops a skill that fails to materialize"] },
+    "loads an old env-bearing file with rotated credentials", "drops a skill that fails to materialize", "exits 0 and prints the issue JSON when the server echoes the requested status",
+    "fails an empty 2xx body instead of treating it as success"] },
   // Hermes is not in the root Vitest project list. Run its package config so
   // the requested file cannot silently disappear from discovery.
   { id: "SH-3-hermes", name: "Hermes shared-prompt delivery", cwd: "packages/adapters/hermes",
@@ -113,11 +115,13 @@ export function sourceFingerprint() {
   const sourceErrors = [];
   sources.add("skills/paperclip/SKILL.md");
   sources.add("skills/paperclip/references/issue-documents.md");
+  sources.add("scripts/paperclip-issue-update.sh");
+  sources.add("skills/paperclip/scripts/paperclip-issue-update.sh");
   for (const source of [...sources].sort()) {
     hash.update(source);
     try { hash.update("present\0").update(readFileSync(join(root, source))); }
     catch (error) {
-      if (source === "skills/paperclip/references/issue-documents.md" && error.code === "ENOENT") hash.update("absent\0");
+      if ((source === "skills/paperclip/references/issue-documents.md" || source === "skills/paperclip/scripts/paperclip-issue-update.sh") && error.code === "ENOENT") hash.update("absent\0");
       else sourceErrors.push(source);
     }
   }

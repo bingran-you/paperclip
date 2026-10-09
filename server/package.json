@@ -55,7 +55,7 @@
     "@chat-adapter/telegram": "4.39.0",
     "@discordjs/ws": "1.2.3",
     "@grpc/grpc-js": "1.14.5",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@opentelemetry/api": "^1.9.0",
     "@paperclipai/adapter-claude-local": "workspace:*",
     "@paperclipai/adapter-codex-local": "workspace:*",
@@ -171,5 +171,10 @@
   },
   "engines": {
     "node": ">=24.11.0"
+  },
+  "optionalDependencies": {
+    "@github/copilot-darwin-arm64": "1.0.88",
+    "@github/copilot-darwin-x64": "1.0.88",
+    "@github/copilot-linux-x64": "1.0.88"
   }
 }

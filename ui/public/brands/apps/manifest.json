@@ -141,6 +141,12 @@
       "localAsset": "/brands/apps/executor.png"
     },
     {
+      "slug": "gauge",
+      "provider": "Gauge",
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/gauge.png"
+    },
+    {
       "slug": "github",
       "provider": "GitHub",
       "catalogVisible": true,

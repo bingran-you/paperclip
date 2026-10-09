@@ -126,7 +126,8 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
     const refresh = grant.scopes.includes("offline_access") ? secret("pcmcp_rt_") : null;
     await tx.insert(mcpOauthTokens).values([
       { grantId: grant.id, tokenHash: hashMcpSecret(access), kind: "access", expiresAt: new Date(Date.now() + accessLifetime) },
-      ...(refresh ? [{ grantId: grant.id, tokenHash: hashMcpSecret(refresh), kind: "refresh" as const, expiresAt: new Date(Date.now() + refreshLifetime) }] : []),
+      ...(refresh ? [{ grantId: grant.id, tokenHash: hashMcpSecret(refresh), kind: "refresh" as const,
+        expiresAt: agentConnection && grant.purpose === "agent" ? null : new Date(Date.now() + refreshLifetime) }] : []),
     ]);
     return {
       access_token: access, token_type: "Bearer", expires_in: accessLifetime / 1000,
@@ -440,7 +441,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
         if (!access.user || !membership || membership.membershipRole === "viewer" || !company || company.status === "archived") throw invalidGrant();
         return { company: { id: company.id, name: company.name }, agent: { id: agent.id, name: agent.name },
           permissions: "Start and accept work as this agent, coordinate permitted tasks and people, read assigned skills, and use assigned app tools. Reading assigned task attachment contents sends those contents to OpenAI and requires the agent’s separate attachment setting. Workspace files and sandboxed commands require the agent’s separate workspace setting. No board account or other-company access.",
-          accessDuration: "Ongoing until revoked. Reconnect after 30 days without refreshing the connection.",
+          accessDuration: "Ongoing until revoked. This connection does not expire from inactivity.",
           pairingExpiresAt: binding.pairingExpiresAt!.toISOString() };
       });
     },
@@ -515,7 +516,9 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
             });
             return null;
           }
-          if (token.expiresAt <= new Date()) return null;
+          // Only agent connections support refresh tokens without an inactivity limit.
+          // Access tokens still expire, refresh still rotates, and replay still revokes.
+          if (token.expiresAt ? token.expiresAt <= new Date() : !agentConnection || grant.purpose !== "agent") return null;
           await actorForGrant(grant, tx as unknown as Db);
           if (input.scope !== undefined && input.scope !== grant.scopes.join(" ")) {
             throw new McpOAuthError("invalid_scope", "Refresh cannot change the consented scopes; reconnect instead.");
