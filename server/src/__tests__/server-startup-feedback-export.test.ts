@@ -44,11 +44,17 @@ const {
   const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
     locals: {
+      deliveryWork: {
+        register: (_queue: string, task: { run: () => Promise<unknown> }) => ({
+          ready: task.run().catch(() => undefined), wake: vi.fn(),
+        }),
+        stop: vi.fn(async () => {}),
+      },
       toolGateway: {
         sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
         cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
       },
-      toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+      toolActionDeliveries: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
     },
   }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
@@ -133,6 +139,7 @@ const {
   };
   const routineServiceFactoryMock = vi.fn(() => routineServiceMock);
   const feedbackExportServiceMock = {
+    hasPendingFeedbackTraces: vi.fn(async () => false),
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
@@ -363,16 +370,18 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
-vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }) }));
+vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
 
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
+    hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
   })),
 }));
 
 vi.mock("../services/question-response-delivery.js", () => ({
   questionResponseDeliveryService: vi.fn(() => ({
+    hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({
       scanned: 0,
       steered: 0,
@@ -673,6 +682,22 @@ describe("startServer feedback export wiring", () => {
     const { startServer } = await import("../index.js");
     await expect(startServer()).resolves.toBeDefined();
     expect(completionSweepMock).toHaveBeenCalled();
+  });
+
+  it("keeps activity-driven completion scans scoped to the changed task", async () => {
+    await startServer();
+    completionSweepMock.mockClear();
+    const { publishLiveEvent } = await import("../services/live-events.js");
+    publishLiveEvent({ companyId: "company-one", type: "activity.logged", payload: {
+      action: "issue.updated", entityId: "task-one",
+    } });
+    expect(completionSweepMock).toHaveBeenCalled();
+    for (const args of completionSweepMock.mock.calls) {
+      expect(args).toEqual([{ companyId: "company-one", taskId: "task-one" }]);
+    }
+    completionSweepMock.mockClear();
+    publishLiveEvent({ companyId: "company-two", type: "activity.logged", payload: { action: "issue.updated" } });
+    expect(completionSweepMock).not.toHaveBeenCalled();
   });
 
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {

@@ -1,3 +1,4 @@
+import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * `definePlugin` — the top-level helper for authoring a Paperclip plugin.
@@ -352,14 +353,22 @@ export interface PluginDefinition {
   ): Promise<DetectExternalObjectsResult>;
 
   /**
+   * Complete required work for the committed agent lifecycle phase.
+   * Requires manifest `agentLifecycle: true` and `agents.lifecycle.manage`.
+   * Echo operationId/version; return pending until the effect finishes.
+   * Calls can repeat. Fence older versions and make external effects idempotent.
+   */
+  onAgentLifecycle?(params: AgentLifecycleRequest): Promise<AgentLifecycleResult>;
+
+  /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
+  onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
+
+  /**
    * Called when Paperclip needs the current normalized status for one external
    * object owned by a manifest-declared provider.
    *
    * Requires `external.objects.read`.
    */
-  /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
-  onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
-
   onResolveExternalObject?(
     params: ResolveExternalObjectParams,
   ): Promise<PluginExternalObjectResolveResult>;

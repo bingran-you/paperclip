@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "@/api/access";
 import { dotInvitationsApi, type DotInvitation, type DotPairing } from "@/api/dotInvitations";
 import { instanceSettingsApi } from "@/api/instanceSettings";
-import { useCloudInstance } from "@/hooks/useCloudInstance";
 import { useCompany } from "@/context/CompanyContext";
 import { queryKeys } from "@/lib/queryKeys";
 import { buildAgentOnboardingPrompt } from "@/lib/agent-onboarding-prompt";
@@ -19,7 +18,6 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
   onBack: () => void;
 }) {
   const cache = useQueryClient();
-  const cloud = Boolean(useCloudInstance());
   const { selectedCompany } = useCompany();
   const [preset, setPreset] = useState<ExternalAgentPreset | null>(null);
   const [invitation, setInvitation] = useState<DotInvitation | null>(null);
@@ -30,7 +28,6 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
   const experimental = useQuery({ queryKey: queryKeys.instance.experimentalSettings, queryFn: instanceSettingsApi.getExperimental });
   const dotDisabledReason = experimental.isPending ? "Loading available agents…"
     : experimental.error ? "Unable to load experimental settings. Try again after refreshing."
-    : cloud ? "Dot cloud execution is not available yet. Hermes and Other use the existing external agent invitation."
     : !experimental.data?.enableOpenAiDot || !experimental.data.enablePublicMcp
       ? "Enable OpenAI Dot and Assistant connections (MCP) in experimental settings." : undefined;
   const key = ["dot-binding", companyId, invitation?.agent.id];
@@ -39,7 +36,8 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
     enabled: preset === "dot" && !!invitation,
     retry: false,
     staleTime: 0,
-    refetchInterval: query => query.state.error ? false : query.state.data?.binding?.status === "ready" && query.state.data.binding.subscriptionVerified ? false : 2500,
+    refetchInterval: query => query.state.error ? false : query.state.data?.agentLifecycleState === "ready" && query.state.data.canConfigureConnection
+      && query.state.data.binding?.status === "ready" && query.state.data.binding.subscriptionVerified ? false : 2500,
   });
   const generate = useMutation({
     mutationFn: async (kind: ExternalAgentPreset) => {
@@ -74,7 +72,7 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
     onSuccess: () => { void cache.invalidateQueries({ queryKey: key }); } });
   const binding = state.data?.binding;
   const canPreparePairing = preset === "dot" && state.data?.enabled && !!state.data.resourceUrl
-    && !["pending_approval", "paused", "terminated"].includes(state.data.agentStatus)
+    && state.data.canConfigureConnection
     && (!binding || binding.status === "pairing");
   const preparePairing = canPreparePairing && !pairing && !state.error && !pair.isError
     && !attemptedAutomaticPairing.current
@@ -96,15 +94,20 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
     }, Math.max(0, Date.parse(pairing.expiresAt) - Date.now()));
     return () => window.clearTimeout(timer);
   }, [pairing]);
+  const checksReady = binding?.status === "ready" && binding.subscriptionVerified;
+  const agentReady = state.data?.agentLifecycleState === "ready" && state.data.canConfigureConnection;
+  const finishingSetup = ["preparing", "verifying"].includes(state.data?.agentLifecycleState ?? "")
+    && state.data?.canConfigureConnection;
   const connection: DotConnectionState = {
-    phase: binding?.status === "ready" && binding.subscriptionVerified && !["paused", "terminated", "pending_approval"].includes(state.data?.agentStatus ?? "") ? "ready"
+    phase: checksReady ? agentReady ? "ready" : finishingSetup ? "finishing" : "ready"
       : binding?.hasPendingChallenge ? "testing" : binding?.subscriptionVerified ? "subscribed" : binding?.connected ? "connected" : "waiting",
     problem: state.error ? "offline"
+      : checksReady && !agentReady && !finishingSetup ? "agent_unavailable"
       : binding?.status === "pairing" && !preparePairing && !pair.isPending && !state.isFetching && !pair.isError && pairing?.bindingId !== binding.id ? "prompt_unavailable"
       : binding?.challengeExpiresAt && !binding.hasPendingChallenge && binding.status !== "ready" ? "event_timeout" : undefined,
   };
   const pendingApproval = (state.data?.agentStatus ?? invitation?.agent.status) === "pending_approval";
-  const unavailable = state.data && ["paused", "terminated"].includes(state.data.agentStatus);
+  const unavailable = state.data && !state.data.canConfigureConnection && !pendingApproval;
   const prompt = preset === "dot" ? pairing && pairing.bindingId === binding?.id && state.data?.resourceUrl && invitation
     ? buildDotSetupPrompt({ companyId, agentId: invitation.agent.id, resourceUrl: state.data.resourceUrl, ...pairing }) : "" : genericPrompt;
   const error = (generate.variables === preset ? generate.error : null) ?? (preset === "dot" ? (binding?.connected ? null : pair.error) ?? test.error : null);
@@ -121,7 +124,7 @@ export function ExternalAgentInviteDialog({ companyId, onClose, onBack }: {
     <AnimatedDialogContent className="sm:max-w-(--sz-560px)">
       <ExternalAgentInviteContent preset={preset} prompt={prompt} companyName={selectedCompany?.name ?? "your organization"}
         connection={connection} dotDisabledReason={dotDisabledReason} busy={busy}
-        error={error?.message ?? (unavailable ? "Resume this agent before connecting Dot." : undefined)}
+        error={error?.message ?? (unavailable ? state.data?.agentLifecycleState === "terminated" ? "This agent was terminated. Invite another agent to connect Dot." : "Resume this agent before connecting Dot." : undefined)}
         approvalHref={pendingApproval && invitation?.approvalId ? `/approvals/${invitation.approvalId}` : undefined}
         onSelect={kind => { setPreset(kind); if (kind === "dot" ? !invitation : !genericPrompt) generate.mutate(kind); }}
         onBack={() => setPreset(null)} onClose={preset ? onClose : onBack} onCopied={() => { if (preset === "dot") void state.refetch(); }}

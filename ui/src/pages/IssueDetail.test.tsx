@@ -594,6 +594,7 @@ vi.mock("../components/Identity", () => ({
 }));
 
 vi.mock("@/components/ui/button", () => ({
+  buttonVariants: () => "",
   Button: ({
     children,
     disabled,
@@ -1420,6 +1421,26 @@ describe("IssueDetail", () => {
     mockLocation.state = null;
     mockRouteParams.issueId = "PAP-1";
     mockRouteParams.companyPrefix = "PAP";
+  });
+
+  it("clears only the monitor after confirmation and refreshes the task", async () => {
+    const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
+    const preservedPolicy = { mode: "normal", commentRequired: false, stages: [{ type: "review", approvalsNeeded: 1, participants: [{ type: "user", userId: "reviewer-1" }] }], maxReviewRounds: 4, authorizationPolicy: { assignmentPolicy: { mode: "protected" } } };
+    const policy = { ...preservedPolicy, monitor: { nextCheckAt, scheduledBy: "board", notes: "Check deployment" } } as Issue["executionPolicy"];
+    const monitored = createIssue({ status: "in_progress", executionPolicy: policy, executionState: { monitor: { status: "scheduled", nextCheckAt, attemptCount: 1 } } as Issue["executionState"] });
+    const cleared = createIssue({ status: "in_progress", executionPolicy: preservedPolicy as Issue["executionPolicy"] });
+    mockIssuesApi.get.mockResolvedValue(monitored);
+    mockIssuesApi.update.mockImplementation(async () => {
+      mockIssuesApi.get.mockResolvedValue(cleared);
+      return cleared;
+    });
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Cancel monitor"]')).not.toBeNull());
+    await act(async () => (container.querySelector('[aria-label="Cancel monitor"]') as HTMLButtonElement).click());
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+    await act(async () => Array.from(document.querySelectorAll("button")).find(b => b.textContent === "Cancel monitor")!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledWith(monitored.id, { expectedExecutionPolicy: policy, executionPolicy: preservedPolicy }));
+    await waitForAssertion(() => expect(container.querySelector('[aria-label="Cancel monitor"]')).toBeNull());
   });
 
   it.each([false, true])("keeps monitor errors on the checked task (late response: %s)", async (lateResponse) => {
@@ -2450,7 +2471,12 @@ describe("IssueDetail", () => {
 
   it("loads ancestors, subtask membership and created work independently and refreshes on issue activity", async () => {
     const ancestors = [{ id: "parent-task", identifier: "PAP-0", title: "Parent task", status: "in_progress" }] as Issue["ancestors"];
-    const source = createIssue({ ancestors });
+    const createdFrom: Issue["createdFrom"] = {
+      issue: { id: "origin-task", identifier: "PAP-168", title: "Origin task", status: "in_progress" },
+      run: { id: "run-1", agentId: "qa-agent" },
+      agent: { id: "qa-agent", name: "Paperclip QA" },
+    };
+    const source = createIssue({ ancestors, createdFrom });
     const child = createIssue({ id: "manual-child", parentId: source.id, title: "Manual child" });
     const created = createIssue({ id: "created-task", parentId: null, title: "Created elsewhere" });
     mockIssuesApi.get.mockResolvedValue(source);
@@ -2464,7 +2490,8 @@ describe("IssueDetail", () => {
     expect(taskProjection()?.content.props.subtasks.map((row: Issue) => row.id)).toEqual([child.id]);
     expect(taskProjection()?.content.props.createdTasks.map((row: Issue) => row.id)).toEqual([created.id]);
     expect(taskProjection()?.content.props.ancestors).toEqual(ancestors);
-    expect(taskProjection()?.count).toBe(3);
+    expect(taskProjection()?.content.props.createdFrom).toEqual(createdFrom);
+    expect(taskProjection()?.count).toBe(4);
 
     const next = createIssue({ id: "new-created-task", parentId: source.id });
     mockIssuesApi.list.mockImplementation((_companyId, filters?: { descendantOf?: string; createdFromIssueId?: string }) =>
@@ -2472,7 +2499,7 @@ describe("IssueDetail", () => {
     );
     await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(source.companyId) }); });
     await flushReact();
-    expect(taskProjection()?.count).toBe(4);
+    expect(taskProjection()?.count).toBe(5);
     expect(taskProjection()?.content.props.createdTasks.map((row: Issue) => row.id)).toContain(next.id);
   });
 

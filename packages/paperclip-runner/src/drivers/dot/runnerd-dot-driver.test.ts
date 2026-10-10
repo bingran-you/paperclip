@@ -78,7 +78,10 @@ it("admits the heartbeat descriptor with the real Dot capabilities and no broker
   } finally { spawnSpy.mockRestore(); }
 });
 
-it.each(["shutdown", "unexpected exit"] as const)("classifies a real Rust %s before the next command poll", async kind => {
+it.each([
+  { kind: "shutdown", remote: false }, { kind: "unexpected exit", remote: false },
+  { kind: "shutdown", remote: true }, { kind: "unexpected exit", remote: true },
+])("classifies a real Rust $kind before the next command poll (remote=$remote)", async ({ kind, remote }) => {
   const root = await mkdtemp(join(tmpdir(), "dot-driver-exit-"));
   await writeFile(join(root, "AGENTS.md"), "Use only the synthetic counter.");
   const input = execution(root);
@@ -86,7 +89,9 @@ it.each(["shutdown", "unexpected exit"] as const)("classifies a real Rust %s bef
   let exited = false;
   const spawn = controlPlane.spawnRunner;
   const spawnSpy = vi.spyOn(controlPlane, "spawnRunner").mockImplementation(options => {
-    handle = spawn(options);
+    const process = spawn(options);
+    // Managed monitors preserve process identity but have no OS exit status.
+    handle = remote ? { ...process, completion: process.completion.then(result => ({ ...result, code: null })) } : process;
     void handle.completion.then(() => { exited = true; });
     return handle;
   });
@@ -111,7 +116,7 @@ it.each(["shutdown", "unexpected exit"] as const)("classifies a real Rust %s bef
     if (kind === "shutdown") {
       await expect(session.close({ reason: "Test complete" })).resolves.toBeUndefined();
       expect(exited).toBe(true);
-      expect((await handle!.completion).code).toBe(0);
+      expect((await handle!.completion).code).toBe(remote ? null : 0);
     } else {
       handle!.child.kill("SIGTERM");
       await handle!.completion;

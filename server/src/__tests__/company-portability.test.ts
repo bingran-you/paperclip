@@ -122,6 +122,13 @@ vi.mock("../services/agents.js", () => ({
   agentService: () => agentSvc,
 }));
 
+vi.mock("../services/agent-lifecycle.js", () => ({
+  createAgentLifecycle: () => ({
+    requestHire: (...args: unknown[]) => agentSvc.create(...args),
+    pauseAgent: vi.fn(),
+  }),
+}));
+
 vi.mock("../services/access.js", () => ({
   accessService: () => accessSvc,
 }));

@@ -21,7 +21,7 @@ export type {
 } from "@paperclipai/shared";
 
 export type ChatProvider =
-  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "agentmail" | "imessage-photon";
+  "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "agentmail" | "imessage-photon" | "speko";
 export type ChatEndpointStatus =
   | "draft"
   | "verifying"
@@ -118,6 +118,7 @@ export interface ChatEndpoint {
   botExternalId?: string | null;
   photonAllocation?: "dedicated" | "shared";
   allowDirectMessages?: boolean;
+  requireAtMention?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople: boolean;
   replyMode?: "subscribed" | "mention_each_reply" | null;

@@ -55,6 +55,18 @@ Historical Everyday cases and production prompts are preserved.
 
 ## Selecting a family
 
+Pi's explicit-only `pi-controls` Product suite tests Stop while native permission
+is unanswered and browser-originated same-turn steering, locally and on Daytona.
+Its [fixture contract](../tests/runner-e2e/FIXTURES.md#pi-active-controls) separates
+control acknowledgment, actual message consumption and owned process retirement.
+The current Pi matrix has 26 explicit cells (13 local and 13 Daytona), including
+these four controls, pending-native-question controller restart, and a Daytona-only
+exact-Pi-child provider-death journey. Provider death must expire the original
+unanswered card and reject stale replies without a replacement run; any durable
+fallback is distinct from restoration. File editing
+also requires native edit/validation events and a registered artifact download.
+All remain unqualified until measured on the exact candidate runtime and harness.
+
 Use **Runner Evals** for a runner protocol, adapter, transport, native session,
 tool grant, or one-turn provider qualification question. The workflow checks
 out an exact `paperclip-evals` revision, builds the Runner and viewer, runs a
@@ -428,6 +440,10 @@ Copilot and Pi ACP profiles on local and Daytona. See the
 The private Runner Evals campaign of the same name provides complementary
 semantic protocol cases; catalog membership is not live qualification.
 
+The explicit local [Copilot protection fixtures](../tests/runner-e2e/FIXTURES.md#copilot-native-protection)
+exercise native permission denial with operator cancellation and bounded attached
+command settlement. Their registration remains separate from paid qualification;
+source/pack provenance and complete persisted evidence are required.
 The explicit-only Product E2E `confirmation-replies` suite tests conversational
 approval and rejection, persisted message provenance, approval before execution,
 ambiguous proposals, and the existing card-click path with native Claude/Codex.

@@ -1,3 +1,5 @@
+import { readWorkspaceBaseRefDiagnostic } from "./workspace-base-ref-diagnostics.js";
+import { getEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
 import type { heartbeatRuns } from "@paperclipai/db";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readProcessLossDiagnostic } from "./process-loss-diagnostics.js";
@@ -148,6 +150,15 @@ export function collectRunFailureDiagnostics(run: Run, options: RunFailureReport
     if (Number.isFinite(durationMs) && durationMs >= 0) execution.durationMs = durationMs;
   }
   const result = run.resultJson;
+  const configuration = read(result, "configurationIncomplete");
+  if (run.errorCode === "configuration_incomplete" && read(configuration, "reason") === "workspace_base_ref_unresolved") {
+    const diagnostic = readWorkspaceBaseRefDiagnostic(read(configuration, "baseRefDiagnostic"));
+    if (diagnostic) {
+      for (const [key, value] of Object.entries(diagnostic)) {
+        if (key !== "schemaVersion") execution[`workspaceBaseRef${key[0]!.toUpperCase()}${key.slice(1)}`] = value;
+      }
+    }
+  }
   const workspaceValidation = read(result, "workspaceValidation");
   if (run.errorCode === "workspace_validation_failed" && read(workspaceValidation, "reason") === "git_worktree_not_reusable") {
     execution.workspaceValidationReason = "git_worktree_not_reusable";
@@ -239,6 +250,13 @@ export function collectRunFailureDiagnostics(run: Run, options: RunFailureReport
       break;
     }
     if (typeof error !== "object") break;
+    const acquisition = options.phase === "setup" && run.errorCode === "setup_failed"
+      ? getEnvironmentAcquisitionDiagnostic(error, run) : null;
+    if (acquisition && execution.environmentAcquisitionPhase === undefined) {
+      execution.environmentAcquisitionPhase = acquisition.phase;
+      execution.environmentAcquisitionElapsedMs = acquisition.elapsedMs;
+      execution.environmentAcquisitionBudgetMs = acquisition.budgetMs;
+    }
     if (execution.restoreLockOwnerState === undefined && read(error, "code") === "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT") {
       const lock = read(error, "workspaceRestoreLock");
       const operation = read(lock, "operation");

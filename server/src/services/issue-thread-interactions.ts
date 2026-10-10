@@ -1,3 +1,5 @@
+import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
+import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
   currentContinuationOrigins,
@@ -24,6 +26,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  chatVoiceSessions,
   authUsers,
   companySecretProposals,
   companies,
@@ -1667,6 +1670,7 @@ function resolveRequestItemVerdictSubmissions(args: {
 
 function normalizeQuestionAnswers(args: {
   questions: AskUserQuestionsInteraction["payload"]["questions"];
+  textQuestionIds?: ReadonlySet<string>;
   answers: RespondIssueThreadInteraction["answers"];
 }) {
   const questionById = new Map(
@@ -1701,7 +1705,11 @@ function normalizeQuestionAnswers(args: {
       );
     }
 
-    const otherText = answer.otherText?.trim() ?? "";
+    // Canonical text fields may contain code or intentional whitespace. The
+    // legacy custom-answer path keeps its historical newline/trim behavior.
+    const otherText = args.textQuestionIds?.has(answer.questionId)
+      ? answer.otherText ?? ""
+      : normalizeEscapedLineBreaks(answer.otherText ?? "").trim();
     answerByQuestionId.set(answer.questionId, {
       questionId: answer.questionId,
       optionIds: uniqueOptionIds,
@@ -1713,7 +1721,7 @@ function normalizeQuestionAnswers(args: {
     const answer = answerByQuestionId.get(question.id);
     if (
       question.required &&
-      (!answer || (answer.optionIds.length === 0 && !answer.otherText))
+      (!answer || (answer.optionIds.length === 0 && !answer.otherText?.trim()))
     ) {
       throw unprocessable(`Question ${question.id} requires an answer`);
     }
@@ -2823,6 +2831,7 @@ export function issueThreadInteractionService(
         .returning();
         if (!row) throw interactionAlreadyResolvedError();
         if (status === "accepted" || status === "rejected") {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           await tx.insert(connectionIntentDeliveries).values({ interactionId, companyId: issue.companyId }).onConflictDoNothing();
         }
         return row;
@@ -3665,6 +3674,15 @@ export function issueThreadInteractionService(
               target: data.payload.target ?? null,
               lockForUpdate: true,
             });
+          }
+          // An unverified phone caller has no authenticated human identity.
+          // Their clarifications use the ordinary task-comment/follow-up queue;
+          // a protected native question would otherwise wait indefinitely.
+          if (data.kind === "ask_user_questions" && !actor.userId) {
+            const [guest] = await tx.select({id: chatVoiceSessions.id}).from(chatVoiceSessions)
+              .where(and(eq(chatVoiceSessions.companyId, issue.companyId), eq(chatVoiceSessions.issueId, issue.id),
+                eq(chatVoiceSessions.callerAuthority, "guest_intake"))).limit(1);
+            if (guest) throw unprocessable("Ask this unverified caller a clarification in a task comment; submit_request will deliver their spoken follow-up. Protected human-input questions require authenticated access.", {code: "voice_guest_use_task_comment"});
           }
           const [row] = await tx
             .insert(issueThreadInteractions)
@@ -4957,6 +4975,9 @@ export function issueThreadInteractionService(
       ) as AskUserQuestionsInteraction;
       const normalizedAnswers = normalizeQuestionAnswers({
         questions: interaction.payload.questions,
+        textQuestionIds: new Set((interaction.payload.questionSet?.questions ?? [])
+          .filter((question) => question.answerMode === "text")
+          .map((question) => question.id)),
         answers: input.answers,
       });
       if (interaction.payload.questionSet) {
@@ -5017,6 +5038,7 @@ export function issueThreadInteractionService(
         // This answer updates conversation history only. It must not resume
         // the completed source run or enqueue new work for the closed task.
         if (!historicalAnswer) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.question);
           await tx
             .insert(issueQuestionResponseDeliveries)
             .values(questionResponseDeliveryValues(answered));

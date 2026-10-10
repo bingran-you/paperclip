@@ -138,12 +138,14 @@ class RunnerdDotSession implements HarnessSession {
     signal?.throwIfAborted();
     if (!o.adoptExistingRunner) {
       this.#process = spawnRunner({
-        processLauncher: o.runnerProcessLauncher, connectUrl: registration?.connectUrl ?? core.connectUrl,
+        processLauncher: o.runnerProcessLauncher, connectUrl: registration?.connectUrl ?? (registration?.connection ? undefined : core.connectUrl),
         connection: registration?.connection, stateDirectory: runnerState, identity: o.identity,
         ticket: core.issueBootstrapTicket(60_000), runnerBinaryPath: binary,
         runnerVersion: artifact.version, runnerDigest: artifact.digest,
         maxOutboxBytes: 16 * 1024 * 1024, p0ReserveBytes: 1024 * 1024,
-        maxRuntimeMs: 0, reconnectGraceMs: 60_000,
+        // A managed controller rollout can outlast a minute. Task authority
+        // remains gated by the current controller lease throughout the gap.
+        maxRuntimeMs: 0, reconnectGraceMs: o.runnerProcessLauncher ? 300_000 : 60_000,
         // No agent, OAuth, ChatGPT or provider API credentials are inherited.
         environment: { PATH: process.env.PATH },
       });
@@ -154,11 +156,13 @@ class RunnerdDotSession implements HarnessSession {
         if (this.#closed) return;
         // Rust exits after the authenticated shutdown receipt is committed and
         // ACKed. That exit can precede the SDK's next command poll.
-        if (result.code === 0 && core.getCommand("dot_shutdown")?.status === "completed") return;
+        // Remote monitors do not report an exit code. The authenticated,
+        // persisted receipt is the evidence of shutdown, for either launcher.
+        if (core.getCommand("dot_shutdown")?.status === "completed") return;
         this.#failure ??= new Error(`dot_runner_process_exited_recovery_required: code=${result.code} signal=${result.signal}`);
         this.#wake();
       }, () => {
-        if (this.#closed) return;
+        if (this.#closed || core.getCommand("dot_shutdown")?.status === "completed") return;
         this.#failure ??= new Error("dot_runner_process_exited_recovery_required");
         this.#wake();
       });
@@ -169,6 +173,9 @@ class RunnerdDotSession implements HarnessSession {
       if (!this.#closed) { this.#failure = error instanceof Error ? error : new Error("dot_runner_transport_failed"); this.#wake(); }
     });
     const checkpoint = await readProviderCheckpoint(o);
+    if (!checkpoint && this.#events.some(event => event.eventType === "external_provider.dispatch_requested")) {
+      throw new Error("dot_provider_checkpoint_missing_reconciliation_required");
+    }
     if (checkpoint && (checkpoint.schema !== "paperclip.runner.dot-provider-state.v1"
       || checkpoint.runId !== o.identity.runId || checkpoint.sessionId !== o.identity.normalizedSessionId
       || checkpoint.turnId !== o.identity.turnId)) throw new Error("dot_runner_checkpoint_authority_mismatch");
@@ -223,6 +230,11 @@ class RunnerdDotSession implements HarnessSession {
   async interrupt() { await this.#command("run.cancel", {}, "dot_cancel"); }
   async snapshot(): Promise<PersistedHarnessSession> {
     const state = await this.read();
+    // Target-owned state is authoritative. Also retain the controller's recovery
+    // evidence through the supplied reader after this authenticated snapshot.
+    if (this.options.readProviderState && !await readProviderCheckpoint(this.options)) {
+      throw new Error("dot_provider_checkpoint_missing_reconciliation_required");
+    }
     const proposed = this.#events.findLast(event => event.eventType === "run.result.proposed");
     const result = proposed ? validatePrpStructuredRunResult(proposed.payload) : null;
     const terminal = this.#events.findLast(event => event.eventType === "run.terminal");

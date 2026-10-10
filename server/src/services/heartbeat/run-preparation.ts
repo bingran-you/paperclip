@@ -1,3 +1,5 @@
+import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
+import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
 import { ASSIGNED_MCP_SERVER_NAME } from "../mcp-tool-names.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -724,6 +726,7 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
   db: Db;
   companyId: string;
   issueId: string | null;
+  commentIds?: string[];
 }): Promise<string[]> {
   if (!input.issueId) return [];
 
@@ -739,21 +742,51 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
     .then((rows) => rows[0] ?? null);
   if (!issue) return [];
 
-  const comments = await input.db
-    .select({ body: issueComments.body })
-    .from(issueComments)
-    .where(
-      and(
+  let sources: string[];
+  const githubConversations = await input.db.select({ id: chatConversations.id })
+    .from(chatConversations)
+    .innerJoin(chatEndpoints, and(
+      eq(chatEndpoints.companyId, chatConversations.companyId),
+      eq(chatEndpoints.id, chatConversations.endpointId),
+    ))
+    .where(and(
+      eq(chatConversations.companyId, input.companyId),
+      eq(chatConversations.issueId, input.issueId),
+      eq(chatEndpoints.provider, "github"),
+    ));
+  if (githubConversations.length) {
+    const binding = and(
+      eq(chatDeliveries.companyId, input.companyId),
+      inArray(chatDeliveries.conversationId, githubConversations.map((row) => row.id)),
+      eq(chatDeliveries.state, "processed"),
+    );
+    const admitted = () => input.db.select({ event: chatDeliveries.normalizedEvent })
+      .from(chatDeliveries)
+      .innerJoin(chatMessageLinks, and(
+        eq(chatMessageLinks.companyId, chatDeliveries.companyId),
+        eq(chatMessageLinks.endpointId, chatDeliveries.endpointId),
+        eq(chatMessageLinks.deliveryId, chatDeliveries.id),
+        eq(chatMessageLinks.conversationId, chatDeliveries.conversationId),
+        eq(chatMessageLinks.direction, "inbound"),
+      ));
+    const forComments = input.commentIds?.length
+      ? await admitted().where(and(binding, inArray(chatMessageLinks.commentId, input.commentIds)))
+      : [];
+    // Interaction continuations and board wakes have no inbound comment id.
+    // Retain the latest admitted configuration, never provider-derived text.
+    const rows = forComments.length ? forComments : await admitted().where(binding)
+      .orderBy(desc(chatDeliveries.createdAt), desc(chatDeliveries.id)).limit(1);
+    sources = rows.flatMap((row) => githubConfiguredInstructionSources(row.event));
+  } else {
+    const comments = await input.db.select({ body: issueComments.body }).from(issueComments)
+      .where(and(
         eq(issueComments.issueId, input.issueId),
         eq(issueComments.companyId, input.companyId),
         isNull(issueComments.deletedAt),
-      ),
-    );
-  const mentionedSkillIds = extractMentionedSkillIdsFromSources([
-    issue.title,
-    issue.description ?? "",
-    ...comments.map((comment) => comment.body),
-  ]);
+      ));
+    sources = [issue.title, issue.description ?? "", ...comments.map((comment) => comment.body)];
+  }
+  const mentionedSkillIds = extractMentionedSkillIdsFromSources(sources);
   if (mentionedSkillIds.length === 0) return [];
 
   const skillRows = await input.db
@@ -773,6 +806,7 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
     .map((skillId) => skillKeyById.get(skillId) ?? null)
     .filter((skillKey): skillKey is string => Boolean(skillKey));
 }
+
 
 export interface WakeupOptions {
   /** Set only by authenticated board wake routes; never copied from caller payloads. */
@@ -884,6 +918,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   );
   const [runIdentity] = await input.db
     .select({
+      contextSnapshot: heartbeatRuns.contextSnapshot,
       responsibleUserId: heartbeatRuns.responsibleUserId,
       activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
     })
@@ -941,6 +976,15 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .map(({ id, name }) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const githubBotConnectionIds = await githubBotConnectionIdsForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const spekoConnectionIds = effective.installedConnections.some(connection => connection.transport === "voice")
+    ? new Set((await spekoToolsForSession(input.db, {
+        companyId: input.agent.companyId,
+        agentId: input.agent.id,
+        runId: input.runId,
+        issueId: readNonEmptyString(runIdentity?.contextSnapshot?.issueId ?? runIdentity?.contextSnapshot?.taskId),
+        identityContextId: runIdentity?.activeIdentityContextId,
+      })).map(tool => tool.connectionId))
+    : new Set<string>();
   const assignedConnections = resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
@@ -952,7 +996,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         connection.credentialPolicy === "per_user" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
       (connection.transport === "mcp_remote" ||
-        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id)),
+        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id)),
   );
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
@@ -2821,8 +2865,9 @@ export function createHeartbeatRunPreparation(db: Db) {
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
+        chatProvider: chatEndpoints.provider,
         // Select only the public command, never the rest of setup state.
-        chatSlackCommand: sql<string | null>`case when ${chatEndpoints.status} in ('active', 'verifying') then ${chatEndpoints.setup}->>'command' end`,
+        chatSlackCommand: sql<string | null>`case when ${chatEndpoints.provider} = 'slack' and ${chatEndpoints.status} in ('active', 'verifying') then ${chatEndpoints.setup}->>'command' end`,
         externalConversationState: externalConversationStateSql(),
         conversationAgentId: issues.conversationAgentId,
         conversationUserId: issues.conversationUserId,
@@ -2865,7 +2910,6 @@ export function createHeartbeatRunPreparation(db: Db) {
       .leftJoin(chatEndpoints, and(
         eq(chatEndpoints.companyId, chatConversations.companyId),
         eq(chatEndpoints.id, chatConversations.endpointId),
-        eq(chatEndpoints.provider, "slack"),
       ))
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
       .then((rows) => rows[0] ?? null);

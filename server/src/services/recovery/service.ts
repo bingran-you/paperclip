@@ -1,8 +1,11 @@
+import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
+import { isIssueReviewPathRecoveryRun } from "./review-path-recovery.js";
+import { escalateExhaustedIssueReviewPathRecovery } from "./review-path-recovery-escalation.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
@@ -2552,7 +2555,9 @@ export function recoveryService(
                       ? "Board operator: repair the project workspace repository URL or clone access, or configure a local checkout cwd, then explicitly retry or reassign."
                       : "Board operator: repair the source task workspace link, project workspace cwd, or git checkout, then explicitly retry or reassign."
                   : recoveryCause === "configuration_incomplete"
-                    ? readConfigurationIncompletePayload(input.latestRun)?.reason === "ai_connection_unavailable"
+                    ? readConfigurationIncompletePayload(input.latestRun)?.reason === "workspace_base_ref_unresolved"
+                      ? "Check the starting branch and repository access, then repair the task’s branch and retry the original assignee."
+                      : readConfigurationIncompletePayload(input.latestRun)?.reason === "ai_connection_unavailable"
                       ? "Reconnect the selected AI account or choose an available connection, then continue the task."
                       : readConfigurationIncompletePayload(input.latestRun)
                         ?.reason === SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON
@@ -3452,6 +3457,7 @@ export function recoveryService(
       // provider already did. Only execution reconciliation can clear this hold.
       if (requiresExecutionReconciliation(action.cause)
         || isNativeWorkspaceExportRepairCause(action.cause)
+        || action.cause === "native_workspace_finalization_owner_unverified"
         || action.cause === "native_workspace_sync_out_unsafe_archive") {
         // A queued wake or healthy child does not export this accepted result.
         // Only its native finalizer or an explicit board disposition can settle it.
@@ -4072,10 +4078,14 @@ export function recoveryService(
         .then((rows) =>
           rows.some(
             (row) =>
-              noticeMetadataReferencesRecoveryAction(
+              (noticeMetadataReferencesRecoveryAction(
                 row.metadata,
                 recoveryAction.id,
-              ) || (row.body ?? "").includes(escalationCommentMarker),
+              ) || (row.body ?? "").includes(escalationCommentMarker))
+              // Task threads attach notices to runs. A reused incident needs
+              // one notice for each failed run so its latest repair stays visible.
+              && (readConfigurationIncompletePayload(input.latestRun)?.reason !== "workspace_base_ref_unresolved"
+                || row.metadata?.sourceRunId === input.latestRun?.id),
           ),
         );
 
@@ -4464,6 +4474,21 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Terminal run/wake rows survive a restart even if finalization never
+      // reached the escalation transaction. Retry that idempotent disposition
+      // before the participant-only review branch can skip pathless reviews.
+      if (issue.status === "in_review" && latestRun
+        && isTerminalIssueRun(latestRun)
+        && isIssueReviewPathRecoveryRun(latestRun.contextSnapshot)) {
+        const [repairRun] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, latestRun.id),
+        ));
+        if (repairRun && await escalateExhaustedIssueReviewPathRecovery(db, { run: repairRun, issueId: issue.id })) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+      }
       // A native chat can finish between the earlier settlement read and this
       // fresh run read, before its response is materialized. Its trusted
       // finalizer owns that settlement; generic productive-work recovery must
@@ -4494,6 +4519,10 @@ export function recoveryService(
       }
 
       const agent = await getAgent(agentId);
+      if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
+        result.skipped += 1;
+        continue;
+      }
       const agentInvokable =
         agent && agent.companyId === issue.companyId
           ? await isAgentInvokable(agent)

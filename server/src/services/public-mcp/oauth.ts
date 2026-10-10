@@ -1,5 +1,7 @@
+import { updateAgentConfigurationInTransaction } from "../agent-configuration-transaction.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { createHash, randomBytes } from "node:crypto";
+import { canConfigureAgentConnection } from "../../modules/agent-lifecycle/index.js";
 import { and, eq, gt, inArray, isNull, lt, lte, notExists, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Request } from "express";
@@ -7,7 +9,6 @@ import {
   type Db, activityLog, agents, authUsers, companies, companyLogos, dotAgentBindings, mcpOauthClients, mcpOauthGrants, mcpOauthRequests, mcpOauthTokens, mcpOauthDeviceRequests, mcpOauthMetadataAdmissions,
 } from "@paperclipai/db";
 import { DOT_RUNNER_MCP_PATH, DOT_RUNNER_MCP_SCOPES, PUBLIC_MCP_PATH, PUBLIC_MCP_SCOPES, type McpConnectionRequest, type McpDotPairingPreview } from "@paperclipai/shared";
-import { agentService } from "../agents.js";
 import { boardAuthService } from "../board-auth.js";
 import { logActivity } from "../activity-log.js";
 import { createClientMetadataResolver, mcpRedirectMatches, validMcpRedirect as validRedirect, type MetadataFetch } from "./client-metadata.js";
@@ -274,7 +275,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
     if (!binding || binding.status !== "pairing" || binding.grantId || !binding.pairingExpiresAt || binding.pairingExpiresAt <= new Date()) throw invalidGrant();
     if (request.requestedCompanyId && request.requestedCompanyId !== binding.companyId) throw invalidGrant();
     const [agent] = await queryDb.select().from(agents).where(and(eq(agents.id, binding.agentId), eq(agents.companyId, binding.companyId))).for("update");
-    if (!agent || agent.adapterType !== "paperclip_runner" || ["paused", "terminated", "pending_approval"].includes(agent.status)) throw invalidGrant();
+    if (!agent || agent.adapterType !== "paperclip_runner" || !canConfigureAgentConnection(agent)) throw invalidGrant();
     return { request, binding, agent };
   }
 
@@ -382,7 +383,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
           state: p.state ?? null, challenge: p.code_challenge, expiresAt: new Date(now.getTime() + 10 * minute),
         });
       });
-      return authorizationOrigin + "/mcp-connect/" + id;
+      return authorizationOrigin + (agentConnection ? "/dot-connect/" : "/mcp-connect/") + id;
     },
     async describeRequest(id: string, actor: Request["actor"], setupUrl: string | null): Promise<McpConnectionRequest> {
       await assertEnabled();
@@ -459,7 +460,7 @@ export function createPublicMcpOAuth(db: Db, config: PublicMcpConfig, options: {
         await tx.update(mcpOauthGrants).set({ agentId: binding.agentId }).where(eq(mcpOauthGrants.id, grant.id));
         await tx.update(dotAgentBindings).set({ grantId: grant.id, status: "connected", pairingCodeHash: null,
           pairingExpiresAt: null, updatedAt: new Date() }).where(eq(dotAgentBindings.id, binding.id));
-        await agentService(tx as unknown as Db).update(agent.id, { adapterConfig: { ...agent.adapterConfig, dotBindingId: binding.id } },
+        await updateAgentConfigurationInTransaction(tx as unknown as Db, agent.id, { adapterConfig: { ...agent.adapterConfig, dotBindingId: binding.id } },
           { recordRevision: { createdByUserId: binding.operatorId, source: "dot-pairing" } });
         await logActivity(tx as unknown as Db, { companyId: binding.companyId, actorType: "user", actorId: binding.operatorId,
           action: "dot.paired", entityType: "agent", entityId: binding.agentId,

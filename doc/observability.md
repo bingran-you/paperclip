@@ -48,8 +48,9 @@ There are no custom attributes, identifiers, content, or exception messages.
 The closed phase names in `server/src/services/issue-read-timing.ts` are:
 `lookup`, `authorization`, `project_goal`, `ancestors`, `mentions`, `documents`,
 `relations`, `blockers`, `review`, `references`, `handoff`, `retry`, `recovery`,
-`cases`, `inbox`, `channel`, `workspace`, `work_products`, `execution_blocker`,
-`relation_recovery`, `revalidate_recovery`, and `mentioned_projects`.
+`cases`, `inbox`, `channel`, `workspace`, `work_products`, `created_from`,
+`execution_blocker`, `relation_recovery`, `revalidate_recovery`, and
+`mentioned_projects`.
 Without an OTLP endpoint, spans remain no-ops. This adds no first-party
 Telemetry events or run-log events.
 
@@ -445,8 +446,12 @@ recovery, credentials, or execution policy.
 
 AI account selection also stays local when the selection service proves a
 missing responsible user, personal default, or selected connection; an
-incompatible selection; or an account that needs reconnection. The service marks
-the original error, and setup preserves its closed `selectionFailure` reason.
+incompatible selection; an account that needs reconnection; or an active
+responsible user who lacks the selected credential's human sharing permission.
+The sharing rejection keeps its existing HTTP 403 and does not grant access.
+Other permission denials, including absent identity and inactive membership,
+remain outside this sharing classification. The service marks the original error,
+and setup preserves its closed `selectionFailure` reason.
 The same failed/preparing/setup/bootstrap checks apply, and resumed native runs
 with persisted provider input remain reportable. The generic
 `ai_connection_unavailable` wrapper alone is insufficient: database, credential
@@ -579,6 +584,27 @@ and native runs:
 - `run_exception_0` through `run_exception_3`: exception names, codes, HTTP
   statuses, and request IDs for a caught exception and up to three causes.
 
+When a Daytona acquisition fails with pending allocation cleanup, the immediate
+setup-failure report can include `environmentAcquisitionPhase`,
+`environmentAcquisitionElapsedMs`, and `environmentAcquisitionBudgetMs` in
+`run_execution`. The phase is one of `create`, `workspace`, `shell`, `expiry`,
+or `sentinel`. It records the first acquisition failure observation, before
+inline cleanup, not the cause of the failure. Elapsed time measures acquisition
+start to that observation; if cleanup later consumes the deadline, this time
+still describes the earlier failure. The overall error message is unchanged.
+Elapsed time is bounded to seven days, and the budget to one day. Unknown or
+malformed optional values are omitted without invalidating cleanup ownership.
+
+These fields cross the existing creation-cleanup RPC envelope only for lease
+acquisition. The host accepts them only from an actual RPC error with matching
+company, environment, and run ownership. A private receipt binds the report to
+that run; arbitrary error fields and saved result JSON do not supply evidence.
+Raw provider causes, output, paths, URLs, and cleanup ownership identifiers are
+not copied into these diagnostic fields. This does not change timeout budgets,
+commands, cleanup, retries, task status, or Sentry filtering. The receipt is
+process-local: post-restart reports without the original error cannot recover
+these observations. Existing saved runs and leases are not backfilled.
+
 The orphan reaper records a bounded `processLossDiagnostic` before status writes
 or cleanup. For `process_lost` failures, `run_execution` includes
 `processLossPidRecorded`, `processLossGroupRecorded`, and `processLossLocalCheck`
@@ -602,7 +628,7 @@ pending. Recent events do not prove useful progress. These fields contain only
 numbers and a boolean, never tool names, IDs, arguments, or event content, and
 do not change the execution timeout, cancellation, or recovery policy.
 
-ACP results retain the adapter's resolved wall-clock timeout as
+ACP and legacy OpenCode results retain the adapter's resolved wall-clock timeout as
 `adapterExecutionTimeout` in the instance run result. Finalization uses it for
 `effectiveTimeoutSec`, `timeoutSource`, and `timeoutConfigured`. Sources are
 `configured`, `sandbox_default`, or `unlimited`; `timeoutConfigured` identifies an
@@ -610,6 +636,12 @@ explicit override, including a negative value that disables the timer. An untouc
 sandbox value of zero reports the four-hour default, while a local zero reports
 unlimited. Older adapters without a valid resolution retain the config-based
 metadata fallback. This does not change timers, Stop acknowledgement, or recovery.
+Legacy OpenCode reports a generic timeout message because a provider or output
+observation timeout can occur before the configured execution deadline. The
+resolved policy describes the configured limit, not proof that its timer fired;
+`timeoutFired` retains the existing terminal timeout classification. Provider
+stderr remains in the instance run log and is not used as the timeout exception
+message. An earlier provider timeout does not establish its upstream cause.
 
 When settlement records a workspace restore failure, `run_execution` also
 includes `workspaceRestoreFailure` with one of the shared, path-free codes:
@@ -617,6 +649,20 @@ includes `workspaceRestoreFailure` with one of the shared, path-free codes:
 or `restore_failed`. Unknown values are omitted. Workspace paths and arbitrary
 pre-restore result data are not included. A later successful run does not, by
 itself, establish that an earlier failed restore recovered the workspace files.
+
+For `configuration_incomplete` with `workspace_base_ref_unresolved`,
+`run_execution` includes `workspaceBaseRefRemoteLookup`, `workspaceBaseRefAuthLookup`,
+`workspaceBaseRefFetch`, and `workspaceBaseRefRefResolution` when producer evidence
+is available. These closed outcomes distinguish skipped operations, auth lookup
+failure, and failed or completed Git commands. Optional `workspaceBaseRefFetchExitCode`
+and `workspaceBaseRefRefExitCode` are integers from 0 through 255.
+`workspaceBaseRefFetchFailureKind` is a coarse, bounded Git diagnostic category;
+unknown, mixed, truncated, or oversized command output remains `unknown`.
+A failed fetch that prints “remote ref not found” is an observation, not
+authoritative proof of user error. These failures remain reportable. The fields
+add no Git calls and do not change authentication, retries, task blocking,
+recovery actions, or Sentry filtering. They never contain repository URLs,
+configured refs, command output, paths, or credentials.
 
 For `workspace_validation_failed` with `git_worktree_not_reusable`, `run_execution`
 includes `workspaceValidationReason` and an allowlisted `workspaceValidationReasonCode`:

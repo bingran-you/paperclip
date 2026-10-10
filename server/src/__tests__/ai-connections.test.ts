@@ -2,6 +2,9 @@ import { connectionIntentService } from "../services/connection-intents.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
+// Background plan observations have their own provider-fixture coverage. Runtime
+// auth tests must not send the selected fixture credentials to a real provider.
+vi.mock("../services/subscription-refresh.js", () => ({ refreshSubscriptionConnection: vi.fn().mockResolvedValue(undefined) }));
 import * as localCredentials from "../services/local-ai-credentials.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createHash, randomUUID } from "node:crypto";
@@ -1230,7 +1233,10 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
   it("uses human access for every selection; an agent delegation cannot override Just me", async () => {
     const personal = await service.select({ ...input, userId: "alice" });
     const delegated = { ...binding, mode: "delegated" as const, connectionId: personal.connection.id, grantId: personal.grant.id };
-    await expect(service.select({ ...input, userId: "bob", binding: delegated })).rejects.toThrow("not shared");
+    const rejection = await service.select({ ...input, userId: "bob", binding: delegated }).catch(error => error);
+    expect(rejection).toMatchObject({ status: 403, message: "This credential is not shared with the responsible user" });
+    expect(rejection.details).toBeUndefined();
+    expect(readAiConnectionConfigurationFailure(rejection)).toBe("ai_connection_credential_not_shared");
     // Existing delegation records no longer confer an independent AI permission.
     await db.insert(connectionGrantDelegations).values({ companyId, grantId: personal.grant.id, agentId, createdByUserId: "alice" });
     await expect(service.select({ ...input, userId: "bob", binding: delegated })).rejects.toThrow("not shared");
@@ -1243,7 +1249,9 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const sharedBinding = { ...binding, mode: "shared" as const, ...shared };
     const tools = toolAccessService(db);
     await tools.replaceConnectionGrantMembers(shared.connectionId, shared.grantId, ["alice"], { userId: "alice" });
-    await expect(service.select({ ...input, userId: "bob", binding: sharedBinding })).rejects.toThrow("not shared");
+    const rejection = await service.select({ ...input, userId: "bob", binding: sharedBinding }).catch(error => error);
+    expect(rejection).toMatchObject({ status: 403, message: "This credential is not shared with the responsible user" });
+    expect(readAiConnectionConfigurationFailure(rejection)).toBe("ai_connection_credential_not_shared");
     expect((await service.list(companyId, "bob", agentId)).some(account => account.id === shared.connectionId)).toBe(false);
     await tools.replaceConnectionGrantMembers(shared.connectionId, shared.grantId, ["bob"], { userId: "alice" });
     expect((await service.select({ ...input, userId: "bob", binding: sharedBinding })).grant.id).toBe(shared.grantId);
@@ -1253,12 +1261,43 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     for (const userId of ["alice", "bob"]) {
       expect((await service.select({ ...input, userId, binding: sharedBinding })).grant.id).toBe(shared.grantId);
     }
-    await expect(service.select({ ...input, userId: null, binding: sharedBinding })).rejects.toThrow("not shared");
+    const missingIdentity = await service.select({ ...input, userId: null, binding: sharedBinding }).catch(error => error);
+    expect(missingIdentity).toMatchObject({ status: 403, message: "This credential is not shared with the responsible user" });
+    expect(readAiConnectionConfigurationFailure(missingIdentity)).toBeNull();
+    const inactiveMember = await service.select({ ...input, userId: "inactive-user", binding: sharedBinding }).catch(error => error);
+    expect(inactiveMember).toMatchObject({ status: 403, message: "The responsible user is not an active company member" });
+    expect(readAiConnectionConfigurationFailure(inactiveMember)).toBeNull();
     // Human permission still cannot bypass the separate agent-access setting.
     await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, shared.connectionId));
-    await expect(service.select({ ...input, userId: "bob", binding: sharedBinding })).rejects.toThrow("not permitted for this agent");
+    const missingAgentPermission = await service.select({ ...input, userId: "bob", binding: sharedBinding }).catch(error => error);
+    expect(missingAgentPermission).toMatchObject({ status: 403 });
+    expect(missingAgentPermission.message).toContain("not permitted for this agent");
+    expect(readAiConnectionConfigurationFailure(missingAgentPermission)).toBeNull();
     expect(sharedBinding).toEqual({ ...binding, mode: "shared", ...shared });
   });
+  it.each(["inactive_owner", "wrong_binding_kind", "wrong_company_membership"] as const)(
+    "does not classify other credential authorization denials as sharing configuration: %s", async (cause) => {
+      const owner = `sharing-${cause}-owner`;
+      await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+      const account = await create(owner, "Sharing permission fixture");
+      const selected = { ...binding, mode: cause === "wrong_binding_kind" ? "shared" as const : "delegated" as const, ...account };
+      let userId = "bob";
+      if (cause === "inactive_owner") {
+        await db.update(companyMemberships).set({ status: "inactive" }).where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, owner)));
+      }
+      if (cause === "wrong_company_membership") {
+        userId = "other-company-sharing-user";
+        await db.insert(companyMemberships).values({ companyId: otherCompanyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+      }
+      const error = await service.select({ ...input, userId, binding: selected }).catch(error => error);
+      expect(error).toMatchObject({ status: 403, message: cause === "inactive_owner"
+        ? "The account owner is no longer an active company member"
+        : cause === "wrong_binding_kind" ? "Select a company-shared account"
+        : "The responsible user is not an active company member" });
+      expect(readAiConnectionConfigurationFailure(error)).toBeNull();
+    },
+  );
+
   it("isolates concurrent homes and overrides ambient credentials without changing the model", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "ambient-never-use");
     const config = { model: "unchanged-model", env: { ANTHROPIC_API_KEY: "project-never-use" } };
@@ -1371,6 +1410,9 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     try {
       expect(child.identity).toBe(parent.identity);
       expect(child.attribution.grantId).toBe(account.grantId);
+      expect(parent.attribution.subscriptionId).toEqual(expect.any(String));
+      expect(child.attribution.subscriptionId).toBe(parent.attribution.subscriptionId);
+      expect(child.config.managedAiConnection).toMatchObject({ subscriptionId: parent.attribution.subscriptionId });
     } finally {
       await Promise.all([parent.cleanup(), child.cleanup()]);
     }
@@ -1513,6 +1555,10 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "rest_api", config: { provider: "agentmail" } }).success).toBe(true);
     expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "rest_api", config: { provider: "slack" } }).success).toBe(false);
     expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "runtime_auth", config: { provider: "agentmail" } }).success).toBe(false);
+    expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "voice", config: { provider: "speko" } }).success).toBe(true);
+    expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "voice", config: { provider: "slack" } }).success).toBe(false);
+    expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "channel", transport: "chat_sdk", config: { provider: "speko" } }).success).toBe(false);
+    expect(connectionPurposeTransportSchema.safeParse({ connectionPurpose: "tool", transport: "voice", config: { provider: "speko" } }).success).toBe(false);
     expect(aiConnectionBindingSchema.safeParse({ provider: "anthropic", mode: "responsible_user" }).success).toBe(false);
     expect(aiConnectionBindingSchema.safeParse({ provider: "anthropic", mode: "shared", connectionId: randomUUID(), grantId: randomUUID() }).success).toBe(false);
     expect(isAiConnectionCompatible({ provider: "anthropic", method: "api_key", mode: "responsible_user" }, "paperclip_runner", "same-model", "acpx", "claude")).toBe(true);
