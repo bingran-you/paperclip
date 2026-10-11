@@ -2,8 +2,20 @@ import { signalDatabaseWork, subscribeDatabaseWork } from "@paperclipai/db";
 
 /** Topics for existing durable queues; register intent before their writes. */
 export const DELIVERY_QUEUES = {
+  chatBoardMessages: "chat-board-messages",
+  chatTaskStarts: "chat-task-starts",
+  chatReceiptReactions: "chat-receipt-reactions",
+  chatSessionStops: "chat-session-stops",
+  chatProviderEffects: "chat-provider-effects",
+  chatGitHubIngress: "chat-github-ingress",
+  chatSessionSyncs: "chat-session-syncs",
+  chatVerification: "chat-verification",
+  chatInbound: "chat-inbound",
+  chatPublications: "chat-publications",
+  chatReceipts: "chat-slack-receipts",
   browser: "browser-use",
   email: "email-channels",
+  fastResponse: "fast-responses",
   feedback: "feedback-exports",
   chatCompletion: "chat-completions",
   connection: "connection-continuations",
