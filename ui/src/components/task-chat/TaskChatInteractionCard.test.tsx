@@ -370,6 +370,95 @@ describe("TaskChatInteractionCard", () => {
     ).toBeNull();
   });
 
+  it("stacks the confirmation prompt full-width and hides unlabeled custom target keys", () => {
+    const render = (target: RequestConfirmationInteraction["payload"]["target"]) =>
+      flushSync(() => {
+        root.render(
+          <TooltipProvider>
+            <ThemeProvider>
+              <TaskChatInteractionCard
+                item={interactionItem(
+                  createRequestConfirmation({
+                    payload: {
+                      version: 1,
+                      prompt: "The change is open as PR #16.\n\nMay the PR merge?",
+                      target,
+                    },
+                  }),
+                )}
+                presentation="takeover"
+              />
+            </ThemeProvider>
+          </TooltipProvider>,
+        );
+      });
+
+    render({ type: "custom", key: "github:paperclipai/paperclip-desktop:pull:16" });
+    expect(container.textContent).not.toContain("github:paperclipai");
+    const prompt = Array.from(container.querySelectorAll("p")).find((node) =>
+      node.textContent?.startsWith("The change is open"),
+    );
+    expect(prompt?.className).not.toContain("flex-1");
+    expect(prompt?.className).toContain("whitespace-pre-line");
+    expect(prompt?.parentElement?.className).not.toContain("justify-between");
+
+    render({
+      type: "custom",
+      key: "github:paperclipai/paperclip-desktop:pull:16",
+      label: "PR #16",
+      href: "https://github.com/paperclipai/paperclip-desktop/pull/16",
+    });
+    const link = container.querySelector(
+      'a[href="https://github.com/paperclipai/paperclip-desktop/pull/16"]',
+    );
+    expect(link?.textContent).toBe("PR #16");
+    expect(container.textContent).not.toContain("github:paperclipai");
+  });
+
+  it("stacks the checkbox confirmation prompt full-width and hides unlabeled custom target keys", () => {
+    const render = (target: RequestConfirmationInteraction["payload"]["target"]) =>
+      flushSync(() => {
+        root.render(
+          <TooltipProvider>
+            <ThemeProvider>
+              <TaskChatInteractionCard
+                item={interactionItem({
+                  ...pendingRequestCheckboxConfirmationInteraction,
+                  payload: {
+                    ...pendingRequestCheckboxConfirmationInteraction.payload,
+                    prompt: "Pick the drafts to delete.\n\nUnchecked drafts stay.",
+                    target,
+                  },
+                })}
+                presentation="takeover"
+              />
+            </ThemeProvider>
+          </TooltipProvider>,
+        );
+      });
+
+    render({ type: "custom", key: "github:paperclipai/paperclip-desktop:pull:16" });
+    expect(container.textContent).not.toContain("github:paperclipai");
+    const prompt = Array.from(container.querySelectorAll("p")).find((node) =>
+      node.textContent?.startsWith("Pick the drafts"),
+    );
+    expect(prompt?.className).not.toContain("flex-1");
+    expect(prompt?.className).toContain("whitespace-pre-line");
+    expect(prompt?.parentElement?.className).not.toContain("justify-between");
+
+    render({
+      type: "custom",
+      key: "github:paperclipai/paperclip-desktop:pull:16",
+      label: "PR #16",
+      href: "https://github.com/paperclipai/paperclip-desktop/pull/16",
+    });
+    const link = container.querySelector(
+      'a[href="https://github.com/paperclipai/paperclip-desktop/pull/16"]',
+    );
+    expect(link?.textContent).toBe("PR #16");
+    expect(container.textContent).not.toContain("github:paperclipai");
+  });
+
   it("keeps the plan revision in the header and hides the prompt while requesting changes", async () => {
     const interaction = createRequestConfirmation({
       sourceRunId: "run-plan",

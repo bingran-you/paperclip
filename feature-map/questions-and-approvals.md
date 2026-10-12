@@ -148,7 +148,7 @@ Real provider and model checks follow [Task reviews](../doc/connections/TASK-REV
 
 ### `skill-test`
 
-Automated: [read-only interaction contract](../server/src/__tests__/issue-interactions-read-only-contract.test.ts)
+Automated: [read-only interaction contract](../server/src/__tests__/issue-thread-interaction-routes.test.ts)
 checks that fetching interactions does not mutate them. Shared card suites cover
 rendering. Neither proves the complete Skill Studio host or its permission matrix.
 

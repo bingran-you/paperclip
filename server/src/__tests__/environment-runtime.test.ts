@@ -3822,6 +3822,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       cwd: "/workspace",
       env: {},
       timeoutMs: 1000,
+      commandTimeoutMs: 900,
+      forceSession: true,
     });
 
     await environmentService(db).update(environment.id, {
@@ -3835,7 +3837,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(released[0]?.lease.status).toBe("released");
     // The execute call carries the optional log sink as the fifth argument; it
     // is undefined when the caller passes no sink.
-    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.anything(), 31000, undefined);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.objectContaining({
+      timeoutMs: 1000,
+      commandTimeoutMs: 900,
+      bypassSession: false,
+    }), 31000, undefined);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.anything(), 31234);
   });
 

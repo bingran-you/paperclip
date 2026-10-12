@@ -11,7 +11,7 @@ import { SkillStudio } from "@/pages/SkillStudio";
 import { PluginLauncherProvider } from "@/plugins/launchers";
 import { Link, Route, Routes, useNavigate } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
-import { candidates, COMPANY_ID, COMMIT, installFixtures, SOURCE_ID } from "../fixtures/githubSkillSources";
+import { COMPANY_ID, COMMIT, installFixtures, repositoryCandidates, repositoryFixture, SOURCE_ID } from "../fixtures/githubSkillSources";
 
 type Step = "start" | "repository" | "selection" | "imported" | "library" | "detail" | "agents" | "assigned" | "refresh" | "new-skills" | "scanning" | "saving";
 const routes: Record<Step, string> = {
@@ -36,24 +36,25 @@ function OutsideJourney() {
   </div>;
 }
 
-function GitHubSkillsJourney({ step = "start" }: { step?: Step }) {
+export function GitHubSkillsJourney({ step = "start", packageScenario }: { step?: Step; packageScenario?: "ready" | "warnings" | "missing" | "setup" }) {
   const client = useQueryClient();
   const navigate = useNavigate();
   const initialNavigate = useRef(navigate);
   const [ready, setReady] = useState(false);
   useEffect(() => {
     const empty = ["start", "repository", "selection", "scanning", "saving"].includes(step);
-    const cleanup = installFixtures(empty, false, { journey: true, scan: step === "scanning" ? "large" : undefined, saving: step === "saving", refreshed: step === "new-skills", assigned: step === "assigned" });
+    const cleanup = installFixtures(empty, false, { journey: true, packageScenario, scan: step === "scanning" ? "large" : undefined, saving: step === "saving", refreshed: step === "new-skills", assigned: step === "assigned" });
     const draftKeys = ["new", SOURCE_ID].map(id => `paperclip.skill-source-draft:${COMPANY_ID}:${id}`);
     const previousDrafts = draftKeys.map(key => sessionStorage.getItem(key));
     draftKeys.forEach(key => sessionStorage.removeItem(key));
     if (step === "scanning") sessionStorage.setItem(draftKeys[0]!, JSON.stringify({ repositoryUrl: "https://github.com/acme/team-skills" }));
     if (step === "selection" || step === "saving") {
-      const discovered = candidates.filter(candidate => !candidate.path.includes("/security/"));
+      const discovered = repositoryCandidates(packageScenario).filter(candidate => packageScenario || !candidate.path.includes("/security/"));
       sessionStorage.setItem(draftKeys[0]!, JSON.stringify({
         repositoryUrl: "https://github.com/acme/team-skills", trackingRef: "main", connectionId: "github-storybook",
+        packageMode: "repository",
         selectedPaths: discovered.map(candidate => candidate.path), excludedFolders: [],
-        discovery: { repositoryId: "123456", repositoryUrl: "https://github.com/acme/team-skills", fullName: "acme/team-skills", trackingRef: "main", commitSha: COMMIT, candidates: discovered, warnings: [] },
+        discovery: { repositoryId: "123456", repositoryUrl: "https://github.com/acme/team-skills", fullName: "acme/team-skills", trackingRef: "main", commitSha: COMMIT, candidates: discovered, warnings: [], packageMode: "repository", repositoryPackage: repositoryFixture(packageScenario) },
       }));
     }
     client.setQueryData(queryKeys.apps.gallery(COMPANY_ID), {
@@ -72,7 +73,7 @@ function GitHubSkillsJourney({ step = "start" }: { step?: Step }) {
         else sessionStorage.setItem(key, previous);
       });
     };
-  }, [client, step]);
+  }, [client, step, packageScenario]);
   if (!ready) return null;
   return <PluginLauncherProvider>
     <Routes>
@@ -106,14 +107,14 @@ export const ScanRepository: Story = { name: '02a · Watch skills arrive', args:
 };
 export const SelectSkills: Story = { name: "03 · Review and select skills", args: { step: "selection" } };
 export const InspectPackage: Story = {
-  name: '03a · Inspect a complete skill package', args: { step: 'selection' },
+  name: '03a · Inspect repository files', args: { step: 'selection' },
   play: async ({ canvasElement }) => {
     const page = within(canvasElement.ownerDocument.body);
-    await userEvent.click(await page.findByRole('button', { name: 'Inspect Code review' }));
+    await userEvent.click(await page.findByRole('button', { name: /View \d+ files?/ }));
   },
 };
-export const SaveSnapshots: Story = { name: '03b · Import complete packages', args: { step: 'saving' },
-  play: async ({ canvasElement }) => { await userEvent.click(await within(canvasElement.ownerDocument.body).findByRole('button', { name: 'Import 3 skills' })); },
+export const SaveSnapshots: Story = { name: '03b · Import repository', args: { step: 'saving' },
+  play: async ({ canvasElement }) => { await userEvent.click(await within(canvasElement.ownerDocument.body).findByRole('button', { name: 'Import repository' })); },
 };
 export const ImportedSource: Story = { name: "04 · Repository is now a source", args: { step: "imported" } };
 export const InstalledLibrary: Story = { name: "05 · Find imported skills in the library", args: { step: "library" } };

@@ -39,7 +39,20 @@ export function ExecutionBlockerNotice({ companyId, issueId, blocker, onRetried,
       <div className="min-w-0 flex-1 break-words">
         <p>{modelRejected ? "Model unavailable." : "Recovery needed."}{blocker.runError ? ` ${blocker.runError}` : ""}</p>
         {modelRejected && <p>Choose a supported model or clear the task's model override, then retry.</p>}
-        <p>{blocker.nextAction}</p>
+        {blocker.workspaceRepairRequired ? (
+          <>
+            {/* The stored next action is an operator runbook step; lead with what happened. This hold also covers
+                unsafe archives and local runs, so do not claim retries or a retained sandbox here. */}
+            <p>
+              Paperclip could not restore the agent's workspace files after its last run. A board operator must
+              recover the files before the agent can continue.
+            </p>
+            <details>
+              <summary className="cursor-pointer">Technical details</summary>
+              <p>{blocker.nextAction}</p>
+            </details>
+          </>
+        ) : <p>{blocker.nextAction}</p>}
         {Boolean(blocker.savedMessageCount) && (
           <p>{blocker.savedMessageCount} saved {blocker.savedMessageCount === 1 ? "message is" : "messages are"} waiting for recovery.</p>
         )}

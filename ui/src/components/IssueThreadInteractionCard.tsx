@@ -1478,6 +1478,15 @@ function AskUserQuestionsCard({
   );
 }
 
+/** A custom target key is a machine identifier (e.g. `github:org/repo:pull:16`),
+ * not display copy, so unlabeled custom targets render no chip. */
+function isDisplayableRequestConfirmationTarget(
+  target: RequestConfirmationTarget | null | undefined,
+): target is RequestConfirmationTarget {
+  if (!target) return false;
+  return target.type !== "custom" || Boolean(target.label);
+}
+
 function requestConfirmationTargetLabel(target: RequestConfirmationTarget) {
   if (target.label) return target.label;
   const revision = target.revisionNumber ? ` v${target.revisionNumber}` : "";
@@ -1511,7 +1520,7 @@ function RequestConfirmationTargetChip({
   target: RequestConfirmationTarget | null | undefined;
   tone?: "default" | "subtle";
 }) {
-  if (!target) return null;
+  if (!isDisplayableRequestConfirmationTarget(target)) return null;
 
   const href = requestConfirmationTargetHref({ interaction, target });
   const className = cn(
@@ -1652,7 +1661,8 @@ function RequestConfirmationResolution({
               target={staleTarget}
               tone="subtle"
             />
-            {staleTarget && target ? (
+            {isDisplayableRequestConfirmationTarget(staleTarget)
+            && isDisplayableRequestConfirmationTarget(target) ? (
               <ChevronRight className="h-3.5 w-3.5 text-amber-700" />
             ) : null}
             <RequestConfirmationTargetChip interaction={interaction} target={target} />

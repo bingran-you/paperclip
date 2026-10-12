@@ -94,6 +94,14 @@ git push -u origin <descriptive-name>
 git push origin --delete <old-name>
 ```
 
+### Keep Screenshots Out of the Repo
+
+Screenshots, screen recordings, and other review evidence belong in the PR description or a PR comment, not in the repository. Do **not** commit them (for example under `docs/pr-screenshots/`). Committed review images land on `master` permanently and make every clone bigger, even though nobody needs them after the PR merges.
+
+To show a visual change, drag the image into the PR description or a comment on GitHub, which hosts the file for you. If your tooling cannot upload to GitHub, leave the images out and describe what you checked under **Verification**.
+
+Images that are part of the product documentation itself, such as a screenshot embedded in a guide under `doc/`, are fine to commit.
+
 ### Model Used (Required)
 
 Every PR must include a **Model Used** section specifying which AI model produced or assisted with the change. Include the provider, exact model ID/version, context window size, and any relevant capability details (e.g., reasoning mode, tool use). If no AI was used, write "None — human-authored". This applies to all contributors — human and AI alike.

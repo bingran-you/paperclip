@@ -3640,6 +3640,11 @@ rl.on("line", (line) => {
         .from(toolInvocations)
         .where(eq(toolInvocations.id, approvalRequest.invocationId));
       expect(approvalInvocation).toMatchObject({
+        companyId: company.id,
+        actorType: "agent",
+        agentId: agent.id,
+        runId: run.id,
+        issueId: issue.id,
         status: "awaiting_approval",
         policyDecision: "require_approval",
         connectionId: approvalTool.connection.id,
@@ -3647,6 +3652,14 @@ rl.on("line", (line) => {
         applicationKey: "shopify",
         upstreamToolName: "kv_set",
       });
+
+      // Matching persisted company/connection rows must still be hidden from
+      // the Test tab when a real agent run owns the approval.
+      await expect(gateway.getTestCallStatus({
+        companyId: company.id,
+        connectionId: approvalTool.connection.id,
+        actionRequestId: approvalRequest.id,
+      })).rejects.toMatchObject({ status: 404, reasonCode: "action_request_not_found" });
 
       await db
         .update(issueThreadInteractions)

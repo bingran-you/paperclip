@@ -1601,6 +1601,26 @@ Validation:
 Read-time aggregate queries are acceptable for V1.
 Materialized rollups can be added later if query latency exceeds targets.
 
+The Costs overview distinguishes unknown billing categories, missing model/price
+data, and terminal runs awaiting final receipts. Bounded, company-scoped details
+load on demand at `GET /companies/:companyId/costs/data-quality`. Entries link to
+the run and, where applicable, agent configuration for future usage. Normal
+credits and fixed billing are not unknown billing warnings. Unavailable historic
+prices require no cleanup and must not be presented as zero-cost receipts.
+
+`POST /companies/:companyId/costs/retry-accounting` accepts a run ID, requires a
+board cost reader with a non-viewer membership, and uses the existing audited,
+idempotent accounting service. It never executes an agent. The UI offers retry
+only when the saved run is eligible to record costs. Missing final usage changes
+its display label after fifteen minutes; elapsed time never settles the debt or
+discards a late receipt. Raw provider errors and credentials are excluded from
+cost details. ACP usage retains the runtime-selected model, including defaults;
+conflicting before/after model IDs do not authorize a single-model estimate.
+Remote OpenCode billing uses only credentials forwarded to the execution target.
+Cost detail reads use company-scoped partial indexes matching their filters and
+sort order. Provider and biller cards retain estimate and missing-price labels;
+an accounting retry confirmation survives removal of the resolved cost gap.
+
 ## 14. UI Requirements (Board App)
 
 V1 UI routes:
@@ -2022,7 +2042,28 @@ unavailable. Preserve current ownership and newer-work fences. See
   and declared `compatibility` requirements with source entries. Preview reads reauthorize
   the current caller and audit the requested package at the scanned immutable commit;
   discovery and source metadata contain no file contents. Reference checks are advisory,
-  do not establish complete runtime dependencies, and never expand package boundaries.
+  do not establish complete runtime dependencies, and never expand package boundaries automatically.
+- New UI imports use `packageMode: repository` to preserve supported repository files
+  in one company-scoped immutable snapshot. Selected entrypoints become library skills;
+  other skills remain supporting files. The root `paperclip.skills.json` may declare
+  version 1, validated `skills` paths and `requirements` text. Invalid manifests fall
+  back to discovery. The dialog shows every skill and containing folder, selects all
+  discovered skills, and collapses package files. There is no import-mode chooser;
+  existing directory-mode sources and API callers remain compatible.
+  Unsupported links, oversized files and files rejected for unsafe execution or
+  secret disclosure are omitted with persistent warnings. Malformed entrypoints
+  stay selected with Needs setup warnings; usable selected skills still publish.
+  Limits are 9,990 repository entries, 1 MiB per file and 61 MiB total. The dialog
+  exposes included files and setup requirements without repair choices or another
+  confirmation. Installed file views read saved repository bytes and resolve links
+  from each instruction file's original directory.
+- Each repository-backed version references its snapshot and original entrypoint path.
+  Runtime materialization adds a discovery wrapper and preserves the original tree under
+  `.paperclip-repository/`, including binaries, modes and credits. Original instructions
+  are unchanged. `agents/openai.yaml` discovery policy is retained beside the wrapper.
+  Existing adapters carry self-contained copies, so multiple entrypoints may duplicate
+  runtime bytes. Shared-file changes version all selected skills; pinned runs remain
+  on their snapshot. Importing does not install dependencies or configure host tools.
 - Stage and audit complete packages before publishing. Scripts are allowed through
   the existing content audit and never run on import. Persist binary bytes and executable
   flags in immutable version inventories (legacy entries default to UTF-8/non-executable).

@@ -8,10 +8,12 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { materializePublishManifest, prepareBundledPackage } from './prepare-bundled-package.mjs';
+import { packConcurrency, packStagedPackages, packTimings } from './pack-staged-packages.mjs';
+import { materializePublishManifest } from './prepare-bundled-package.mjs';
 import { GROK_PUBLIC_INSTALL_IMAGE, GROK_PUBLIC_INSTALL_LIFECYCLE, assertNoBundledCodexPayloads, grokConsumerDockerArgs, installedCodexProbeSource } from './grok-public-install-sandbox.mjs';
 import { startPrefetch, stopPrefetches } from './prefetch-child.mjs';
 import { retainRunnerQualificationPackages } from './retain-runner-qualification-packages.mjs';
+import { bundledInstallTimings, startBundledInstalls } from './stage-bundled-packages.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 assert.equal(process.platform, 'linux', 'Run this verification on disposable EC2 Linux, not a developer host');
 const root = mkdtempSync(join(tmpdir(), 'paperclip-grok-public-install-'));
@@ -28,13 +30,18 @@ const releaseVersion = `0.0.0-grok-verify.${sourceRevision.slice(0, 12)}`;
 // `native/grok` path that the post-install assertion inspects.
 const prefetched = join(root, 'prefetch'); mkdirSync(prefetched);
 const stagedGrok = join(prefetched, 'grok');
+// Every background child, downloads and bundled-dependency installs alike, is
+// stopped in `finally`; `downloads` is the subset the timing line reports as
+// prefetches.
 const prefetches = [];
+const downloads = [];
 const timing = {};
 // A prefetch failure surfaces where its result is awaited, never as an
 // unhandled rejection that would mask an earlier staging error.
 const prefetch = (name, cmd, args) => {
   const handle = startPrefetch({ name, cmd, args, cwd: root, env, logPath: join(prefetched, `${name}.log`) });
   prefetches.push(handle);
+  downloads.push(handle);
   return handle.done;
 };
 let phaseStarted = performance.now();
@@ -57,15 +64,47 @@ try {
   }
   visit('@paperclipai/server');
   visit('paperclipai');
+  // release.sh also builds the standalone public packages (the sandbox-provider
+  // plugins outside the pnpm workspace) before it stages anything, because it
+  // publishes them. Nothing staged here reaches them: `needed` is closed under
+  // `workspace:` specs, so every package staged below is a workspace package
+  // that `pnpm build` already built, and that build would only cost one
+  // network install and compile per plugin whose output no tarball reads.
+  // Canary Dry Run still runs it through release.sh. The one path that does
+  // read a standalone build is qualification-package retention at the end:
+  // it packs the Daytona plugin from its `dist`, which only this build
+  // produces, so the build runs when retention is requested and nowhere else.
+  const retainQualificationPackages = Boolean(process.env.PAPERCLIP_RUNNER_QUALIFICATION_PACKAGES_DIR);
+  if (retainQualificationPackages) {
+    const standaloneStarted = performance.now();
+    run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo);
+    timing.stage_standalone_build_ms = Math.round(performance.now() - standaloneStarted);
+  }
+  // The server's `ui-dist` payload is prepared here; with the reuse flag set
+  // above, that copies the `ui/dist` that `pnpm build` produced instead of
+  // building the UI again.
+  const uiDistStarted = performance.now();
+  run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo);
+  timing.stage_ui_dist_ms = Math.round(performance.now() - uiDistStarted);
   // Match release.sh's unified versioning in temporary staging directories.
   // Source manifests remain untouched, including independently versioned SDKs.
-  run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo);
-  run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo);
-  const tarballs = [];
-  for (const [index, name] of [...needed].entries()) {
+  // Each package's published files are staged into `source-<index>` and its
+  // pack input into `package-<index>`, with <index> in dependency order so the
+  // tarball list keeps matching `needed`. The packages that bundle dependencies
+  // each need a host-side `npm install` of their bundled closure; those installs
+  // write only their own `package-<index>` and read nothing another package
+  // produces, so they start first and run together while the other packages
+  // are copied, instead of one after another inside one loop. Packing is a
+  // Node start-up plus CPU-bound gzip per package that reads only the package's
+  // own directory, so the packs also run together, each into its own
+  // `pack-<index>`, and the tarballs are checked in order once all are made.
+  const entries = [...needed].map((name, index) => {
     const { dir, manifest } = packages.get(name);
-    const target = join(root, `package-${index}`); mkdirSync(target);
-    const stagedSource = join(root, `source-${index}`); mkdirSync(stagedSource);
+    const bundled = (manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length > 0;
+    return { name, index, dir, manifest, bundled, target: join(root, `package-${index}`), stagedSource: join(root, `source-${index}`), destination: join(root, `pack-${index}`) };
+  });
+  const stageSource = ({ dir, manifest, stagedSource }) => {
+    mkdirSync(stagedSource);
     for (const file of manifest.files ?? ['dist']) {
       // release.sh stages runtime skills into these public packages before pack.
       const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
@@ -76,19 +115,37 @@ try {
     }
     const releaseManifest = { ...manifest, version: releaseVersion };
     writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
-    if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) {
-      prepareBundledPackage(stagedSource, target);
-    } else {
-      cpSync(stagedSource, target, { recursive: true });
-      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest)));
-    }
-    run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
-    const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));
-    assert.equal(packed.length, 1);
-    const tarball = join(root, packed[0]);
-    assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball]).toString().trim().split('\n'));
-    tarballs.push(tarball);
+    return releaseManifest;
+  };
+  const sourcesStarted = performance.now();
+  for (const entry of entries.filter(entry => entry.bundled)) stageSource(entry);
+  const installsStarted = performance.now();
+  const installs = startBundledInstalls(entries.filter(entry => entry.bundled), { logDir: prefetched, cwd: repo });
+  prefetches.push(...installs.map(({ handle }) => handle));
+  for (const entry of entries.filter(entry => !entry.bundled)) {
+    const releaseManifest = stageSource(entry);
+    mkdirSync(entry.target);
+    cpSync(entry.stagedSource, entry.target, { recursive: true });
+    writeFileSync(join(entry.target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest)));
   }
+  timing.stage_sources_ms = Math.round(performance.now() - sourcesStarted);
+  await awaited('bundled', Promise.all(installs.map(({ handle }) => handle.done)));
+  timing.stage_bundled_ms = Math.round(performance.now() - installsStarted);
+  const packStarted = performance.now();
+  // The bundled packages make the largest tarballs, so they are launched first
+  // and the short packs fill the remaining slots behind them. Each pack is
+  // registered for cleanup as it starts, so a failure stops the ones still
+  // running before the scratch root is removed. The results are put back into
+  // dependency order before the tarballs are checked and copied.
+  const concurrency = packConcurrency();
+  const packs = await packStagedPackages([...entries].sort((a, b) => Number(b.bundled) - Number(a.bundled)), { logDir: prefetched, env, concurrency, register: handle => prefetches.push(handle) });
+  packs.sort((a, b) => a.index - b.index);
+  const checksStarted = performance.now();
+  const tarballs = packs.map(({ tarball }) => tarball);
+  for (const tarball of tarballs) assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball]).toString().trim().split('\n'));
+  timing.stage_pack_check_ms = Math.round(performance.now() - checksStarted);
+  timing.stage_pack_ms = Math.round(performance.now() - packStarted);
+  Object.assign(timing, packTimings(packs, concurrency));
   const assets = join(root, 'assets'); mkdirSync(assets, { mode: 0o755 });
   const consumer = join(root, 'consumer'); mkdirSync(consumer);
   const cache = join(root, 'cache'); mkdirSync(cache);
@@ -184,9 +241,13 @@ try {
   // without re-running it. `*_prefetch_ms` runs from a download's start to its
   // last output, and `*_wait_ms` is how long the main flow waited for a
   // prefetch that had not finished yet; zero means the overlap hid it entirely.
-  const downloads = Object.fromEntries(prefetches.map(({ name, durationMs }) => [`${name}_prefetch_ms`, durationMs]));
-  console.log(JSON.stringify({ schema: 'paperclip.public-npm-install.timing.v1', ...timing, ...downloads }));
-  if (process.env.PAPERCLIP_RUNNER_QUALIFICATION_PACKAGES_DIR) {
+  // `stage_ui_dist_ms`, `stage_sources_ms`, `stage_bundled_ms` and
+  // `stage_pack_ms` split the staging phase, and `stage_bundled_<package>_ms`
+  // is each concurrent install. `stage_standalone_build_ms` appears only when
+  // qualification-package retention made the standalone build necessary.
+  const downloaded = Object.fromEntries(downloads.map(({ name, durationMs }) => [`${name}_prefetch_ms`, durationMs]));
+  console.log(JSON.stringify({ schema: 'paperclip.public-npm-install.timing.v1', ...timing, ...downloaded, ...bundledInstallTimings(installs) }));
+  if (retainQualificationPackages) {
     const retained = retainRunnerQualificationPackages({ repo, output: process.env.PAPERCLIP_RUNNER_QUALIFICATION_PACKAGES_DIR, sourceRevision, releaseVersion, env,
       publicArchives: [...needed].map((name, index) => ({ name, file: tarballs[index] })),
     });

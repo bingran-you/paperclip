@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { isWorkspacePackage, parseWorkspaceEntries } from '../build-standalone-public-packages.mjs';
 import { GROK_PUBLIC_INSTALL_IMAGE, GROK_PUBLIC_INSTALL_LIFECYCLE, assertInstalledCodexPlatformProvenance, assertNoBundledCodexPayloads, grokConsumerDockerArgs, installedCodexProbeSource } from '../grok-public-install-sandbox.mjs';
 
 const paths = { assets: '/private/staging/assets', consumer: '/private/staging/consumer', cache: '/private/staging/cache', uid: 1001, gid: 1001 };
@@ -108,6 +110,87 @@ test('the image and Grok downloads start before staging and join without weakeni
   assert.ok(source.includes("import { startPrefetch, stopPrefetches } from './prefetch-child.mjs'"));
   assert.ok(position('await stopPrefetches(prefetches)') < position('rmSync(root, { recursive: true, force: true })'));
   assert.equal(source.match(/rmSync\(root/g).length, 1);
+});
+
+test('the bundled-dependency installs run together while the other packages are copied, and pack in order', () => {
+  const source = readFileSync(new URL('../verify-grok-npm-install.mjs', import.meta.url), 'utf8');
+  const position = fragment => { const index = source.indexOf(fragment); assert.notEqual(index, -1, `verifier must contain ${fragment}`); return index; };
+  // The installs are children of the script's own CLI entry through the helper
+  // covered by stage-bundled-packages.test.mjs, never in-process calls.
+  assert.doesNotMatch(source, /prepareBundledPackage/);
+  assert.ok(source.includes("import { bundledInstallTimings, startBundledInstalls } from './stage-bundled-packages.mjs'"));
+  // Only the bundled packages' sources are staged before the installs start;
+  // the installs are registered for cleanup at once, before anything else can
+  // fail; the other packages are copied while the installs run; the join comes
+  // before the packs start; and the packs run through the helper covered by
+  // pack-staged-packages.test.mjs, bundled packages first, each registered for
+  // cleanup as it starts, with the results put back into dependency order
+  // before every tarball is checked.
+  const bundledSources = position('for (const entry of entries.filter(entry => entry.bundled)) stageSource(entry)');
+  const start = position("startBundledInstalls(entries.filter(entry => entry.bundled), { logDir: prefetched, cwd: repo })");
+  const registered = position('prefetches.push(...installs.map(({ handle }) => handle))');
+  const otherSources = position('for (const entry of entries.filter(entry => !entry.bundled))');
+  const join = position("await awaited('bundled', Promise.all(installs.map(({ handle }) => handle.done)))");
+  assert.ok(source.includes("import { packConcurrency, packStagedPackages, packTimings } from './pack-staged-packages.mjs'"));
+  const packs = position("await packStagedPackages([...entries].sort((a, b) => Number(b.bundled) - Number(a.bundled)), { logDir: prefetched, env, concurrency, register: handle => prefetches.push(handle) })");
+  const reordered = position('packs.sort((a, b) => a.index - b.index)');
+  const checks = position("for (const tarball of tarballs) assertNoBundledCodexPayloads(run('tar', ['-tzf', tarball])");
+  const copied = position('for (const tarball of tarballs) {');
+  assert.ok(bundledSources < start && start < registered && registered < otherSources && otherSources < join && join < packs && packs < reordered && reordered < checks && checks < copied);
+  assert.equal(source.match(/run\('npm', \['pack'/g).length, 1, 'only the lifecycle sentinel is packed in-process');
+  assert.ok(source.includes("destination: join(root, `pack-${index}`)"), 'each pack writes into its own directory');
+  // The timing line reports the split staging phase, each install, and the
+  // pack step with what the packs would have cost one after another.
+  for (const key of ['stage_ui_dist_ms', 'stage_sources_ms', 'stage_bundled_ms', 'stage_pack_ms', 'stage_pack_check_ms']) assert.ok(source.includes(`timing.${key} =`));
+  assert.ok(source.includes('...bundledInstallTimings(installs)'));
+  assert.ok(source.includes('Object.assign(timing, packTimings(packs, concurrency))'));
+});
+
+test('the verifier stages only workspace packages, so it skips the standalone build release.sh needs', () => {
+  const source = readFileSync(new URL('../verify-grok-npm-install.mjs', import.meta.url), 'utf8');
+  const position = fragment => { const index = source.indexOf(fragment); assert.notEqual(index, -1, `verifier must contain ${fragment}`); return index; };
+  // The standalone public packages are the ones outside the pnpm workspace
+  // (the sandbox-provider plugins). release.sh builds them because it publishes
+  // them; the verifier packs only the closure of the server and the CLI under
+  // `workspace:` specs, and a `workspace:` spec can only name a workspace
+  // package, so no tarball here ever contains or depends on a standalone build.
+  // The one reader of that build is qualification-package retention, which
+  // packs the Daytona plugin from its `dist`, so the build runs exactly when
+  // retention is requested: the single reference sits inside that gate, and
+  // the same flag is what later decides whether retention runs at all.
+  const standaloneBuild = "run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo)";
+  assert.equal(source.split('build-standalone-public-packages').length - 1, 1, 'the standalone build is referenced once, inside the retention gate');
+  const gate = position("const retainQualificationPackages = Boolean(process.env.PAPERCLIP_RUNNER_QUALIFICATION_PACKAGES_DIR);\n  if (retainQualificationPackages) {\n    const standaloneStarted = performance.now();\n    " + standaloneBuild);
+  assert.ok(source.includes('timing.stage_standalone_build_ms ='), 'the gated build is timed under its own key');
+  assert.ok(source.includes('if (retainQualificationPackages) {\n    const retained = retainRunnerQualificationPackages({'), 'retention is gated by the same flag as the build');
+  assert.doesNotMatch(source, /if \(process\.env\.PAPERCLIP_RUNNER_QUALIFICATION_PACKAGES_DIR\)/, 'no second reading of the retention flag can diverge from the build gate');
+  const retention = readFileSync(new URL('../retain-runner-qualification-packages.mjs', import.meta.url), 'utf8');
+  assert.ok(retention.includes("const pluginRelative = 'packages/plugins/sandbox-providers/daytona';") && retention.includes("cpSync(join(repo, pluginRelative, 'dist'), join(plugin, 'dist'), { recursive: true })"), 'retention still packs the Daytona plugin from its dist, which is why the gated build exists');
+  const repo = new URL('../../', import.meta.url);
+  const listing = spawnSync(process.execPath, [fileURLToPath(new URL('scripts/release-package-map.mjs', repo)), 'list'], { cwd: fileURLToPath(repo), encoding: 'utf8' });
+  assert.equal(listing.status, 0, listing.stderr);
+  const packages = new Map(listing.stdout.trim().split('\n').map(line => line.split('\t')).map(([dir, name]) => [name, { dir, manifest: JSON.parse(readFileSync(new URL(`${dir}/package.json`, repo), 'utf8')) }]));
+  const needed = new Set();
+  const visit = name => {
+    if (needed.has(name)) return;
+    const entry = packages.get(name); assert.ok(entry, `missing public workspace dependency ${name}`); needed.add(name);
+    for (const [dep, spec] of Object.entries({ ...entry.manifest.dependencies, ...entry.manifest.optionalDependencies })) if (spec.startsWith('workspace:')) visit(dep);
+  };
+  assert.ok(source.includes("visit('@paperclipai/server');\n  visit('paperclipai');"));
+  visit('@paperclipai/server'); visit('paperclipai');
+  const workspace = parseWorkspaceEntries(readFileSync(new URL('pnpm-workspace.yaml', repo), 'utf8'));
+  const standalone = [...packages.values()].filter(({ dir }) => !isWorkspacePackage(dir, workspace)).map(({ dir }) => dir);
+  assert.ok(standalone.length > 0, 'the public package map must still carry standalone packages for this check to mean anything');
+  assert.ok(standalone.includes('packages/plugins/sandbox-providers/daytona'), 'the Daytona plugin retention packs is a standalone package, so pnpm build alone cannot produce its dist');
+  for (const name of needed) assert.ok(isWorkspacePackage(packages.get(name).dir, workspace), `${name} is staged by the verifier but is not a workspace package`);
+  // The server publishes `ui-dist`, so that copy stays, before any package is
+  // staged, reusing the UI that `pnpm build` produced, and it is timed. The
+  // gated standalone build keeps release.sh's order: after the closure is
+  // known and before the UI copy and any staged source.
+  assert.deepEqual(JSON.parse(readFileSync(new URL('server/package.json', repo), 'utf8')).files, ['dist', 'ui-dist', 'skills']);
+  assert.ok(source.includes("PAPERCLIP_RELEASE_REUSE_UI_DIST: '1'"));
+  const uiDist = position("run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo)");
+  assert.ok(position("visit('paperclipai')") < gate && gate < uiDist && uiDist < position('timing.stage_ui_dist_ms =') && uiDist < position('const stageSource = '));
 });
 
 test('the installed Codex probe exercises the public export and rejects incomplete or mismatched packages', () => {

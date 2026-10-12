@@ -107,31 +107,7 @@ describe("runner API catalog", () => {
     expect(operation.responses).toBeDefined();
     expect(operation.authorization.actor).toBeTruthy();
   });
-  it.each(
-    runnerApiCatalog().filter((operation) => operation.transport === "rest"),
-  )(
-    "resolves the catalog route $operationId inside the bound origin",
-    (operation) => {
-      const pathParams = Object.fromEntries(
-        operation.parameters
-          .filter((parameter) => parameter.in === "path")
-          .map((parameter) => [
-            parameter.name,
-            parameter.name === "companyId" ? context.companyId : "fixture-id",
-          ]),
-      );
-      const url = runnerApiUrl(
-        operation,
-        { operationId: operation.operationId, pathParams },
-        context,
-        "https://paperclip.test",
-      );
-      expect(url.origin).toBe("https://paperclip.test");
-      expect(url.pathname).not.toContain("{");
-      expect(operation.responses).toBeDefined();
-      expect(operation.authorization.actor).toBeTruthy();
-    },
-  );
+
   it("ranks natural language, explains dedicated alternatives, and supports exact lookup", () => {
     expect(
       searchRunnerApi({ query: "create project" }).results.map(

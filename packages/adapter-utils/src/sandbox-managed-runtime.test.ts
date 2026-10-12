@@ -664,6 +664,7 @@ describe("sandbox managed runtime", () => {
       },
     };
     const runtimeStatuses: string[] = [];
+    const run = vi.spyOn(client, "run");
 
     attachFallbackSyncIn(client);
     const prepared = await prepareSandboxManagedRuntime({
@@ -720,6 +721,7 @@ describe("sandbox managed runtime", () => {
       expect.stringMatching(/^restore:Restoring workspace from environment: 100% \(\d+\.\d\/\d+\.\d MB\)$/),
     ]));
     expect(runtimeStatuses.at(-1)).toBe("finalize:Finalizing workspace");
+    expect(run.mock.calls.some(([command]) => command.includes("workspace-download.tar"))).toBe(true);
   });
 
   it("falls back to the host-known byte count when the provider reports 0 for inbound workspace sync", async () => {
@@ -1057,6 +1059,7 @@ describe("sandbox managed runtime", () => {
     await expect(readFile(path.join(localWorkspaceDir, "deleted.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(localWorkspaceDir, "node_modules", "cache.bin"), "utf8")).resolves.toBe("do not upload\n");
 
+    expect(runtimeStatuses.at(-1)?.phase).toBe("finalize");
     expect(downloadedTars).toHaveLength(1);
     const downloadMembers = await listTarMembers(rootDir, "workspace-download-list.tar", downloadedTars[0]!.bytes);
     expect(downloadMembers.some((entry) => entry === ".git" || entry.startsWith(".git/"))).toBe(false);
@@ -4096,6 +4099,26 @@ describe("sandbox managed runtime outbound coordinator", () => {
     expect(control.settled).toEqual(expect.arrayContaining(["workspace", "home", "private-asset"]));
   });
 
+  it("restores non-git workspace bytes through native syncOut without a fallback tar", async () => {
+    const { workspaceDir, remoteWorkspaceDir } = await makeOutboundDirs([]);
+    const client = makeGatedOutboundClient(false, async (_label, run) => run());
+    const syncOut = vi.spyOn(client, "syncOut");
+    const run = vi.spyOn(client, "run");
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: makeSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: workspaceDir,
+    });
+    await writeFile(path.join(remoteWorkspaceDir, "file.txt"), "updated native bytes\n", "utf8");
+    await writeFile(path.join(remoteWorkspaceDir, "remote-only.txt"), "native sync\n", "utf8");
+    await prepared.restoreWorkspace();
+    expect(syncOut).toHaveBeenCalledTimes(1);
+    expect(syncOut.mock.calls[0]?.[0].flatMap((operation) => operation.files)).toEqual([
+      expect.objectContaining({ kind: "directory", sourcePath: remoteWorkspaceDir }),
+    ]);
+    await expect(readFile(path.join(workspaceDir, "file.txt"), "utf8")).resolves.toBe("updated native bytes\n");
+    await expect(readFile(path.join(workspaceDir, "remote-only.txt"), "utf8")).resolves.toBe("native sync\n");
+    expect(run.mock.calls.some(([command]) => command.includes("workspace-download.tar"))).toBe(false);
+  });
+
   it("with concurrency permitted, an asset restore starts while the workspace restore is held open", async () => {
     const { workspaceDir, remoteWorkspaceDir, dirOf } = await makeOutboundDirs(["home"]);
     const { control, gate } = makeOutboundControl();
@@ -4456,12 +4479,14 @@ describe("sandbox git-bundle export transport", () => {
     const client = makeTransportClient(step !== "workspace_extract", { syncOutOperations: [], readFilePaths: [] });
     const prepared = await prepareSandboxManagedRuntime({
       spec: gitSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: localWorkspaceDir,
+      workspaceRestoreRetryDelaysMs: [0, 0],
     });
     await commitInSandbox(remoteWorkspaceDir);
     const failure = Object.assign(new Error("private-restore-command /private-restore-path"), { code: 7, stderr: "private-restore-stderr" });
+    // Failures before the first host write are retried, so they must persist.
     if (step === "git_export") client.run = async () => { throw failure; };
-    if (step === "git_import") vi.spyOn(gitSync, "fetchGitBundleIntoLocalRef").mockRejectedValueOnce(failure);
-    if (step === "directory_merge") vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValueOnce(failure);
+    if (step === "git_import") vi.spyOn(gitSync, "fetchGitBundleIntoLocalRef").mockRejectedValue(failure);
+    if (step === "directory_merge") vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValue(failure);
     if (step === "git_integration") vi.spyOn(gitSync, "integrateImportedGitHead").mockRejectedValueOnce(failure);
     if (step === "index_reset") vi.spyOn(gitSync, "resetLocalGitIndexToHead").mockRejectedValueOnce(failure);
     if (step === "git_ref_cleanup") vi.spyOn(gitSync, "deleteLocalGitRef").mockRejectedValueOnce(failure);
@@ -4487,6 +4512,111 @@ describe("sandbox git-bundle export transport", () => {
       const diagnostics = lines.filter((line) => line.includes("Workspace restore diagnostic:"));
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]).not.toContain("private-restore-");
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it.each([
+    ["a dropped transfer", Object.assign(new Error("transfer reset"), { code: "ECONNRESET" })],
+    ["a busy merge lock", Object.assign(new Error("lock busy"), { code: restoreMerge.WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE })],
+  ])("retries the copy-back after %s before any host write", async (_label, failure) => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await setupGitBackedWorkspace("paperclip-restore-retry-");
+    const client = makeTransportClient(true, { syncOutOperations: [], readFilePaths: [] });
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: gitSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: localWorkspaceDir,
+      workspaceRestoreRetryDelaysMs: [0, 0],
+    });
+    await commitInSandbox(remoteWorkspaceDir);
+    let directoryTransfers = 0;
+    const syncOut = client.syncOut!;
+    client.syncOut = async (operations) => {
+      const directory = operations.some((operation) => operation.files.some((file) => file.kind === "directory"));
+      if (directory && ++directoryTransfers === 1 && failure.code === "ECONNRESET") throw failure;
+      return syncOut(operations);
+    };
+    if (failure.code !== "ECONNRESET") vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValueOnce(failure);
+    try {
+      await prepared.restoreWorkspace();
+      expect(directoryTransfers).toBe(2);
+      expect(await git(localWorkspaceDir, ["log", "-1", "--pretty=%s"])).toBe("sandbox update");
+      await expect(readFile(path.join(localWorkspaceDir, "remote-only.txt"), "utf8")).resolves.toBe("from sandbox\n");
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it("gives up after three copy-back attempts", async () => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await setupGitBackedWorkspace("paperclip-restore-retry-limit-");
+    const client = makeTransportClient(true, { syncOutOperations: [], readFilePaths: [] });
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: gitSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: localWorkspaceDir,
+      workspaceRestoreRetryDelaysMs: [0, 0],
+    });
+    await commitInSandbox(remoteWorkspaceDir);
+    const failure = new Error("sandbox unreachable");
+    let directoryTransfers = 0;
+    const syncOut = client.syncOut!;
+    client.syncOut = async (operations) => {
+      if (!operations.some((operation) => operation.files.some((file) => file.kind === "directory"))) return syncOut(operations);
+      directoryTransfers++;
+      throw failure;
+    };
+    await expect(prepared.restoreWorkspace()).rejects.toBe(failure);
+    expect(directoryTransfers).toBe(3);
+  });
+
+  it.each([
+    ["an unsafe archive", Object.assign(new Error("unsafe"), { code: "WORKSPACE_RESTORE_UNSAFE_ARCHIVE" }), "directory_merge"],
+    ["a permission failure", Object.assign(new Error("denied"), { code: "EACCES" }), "directory_merge"],
+    ["a failure after the merge started writing", new Error("integration failed"), "git_integration"],
+  ] as const)("does not retry %s", async (_label, failure, step) => {
+    const { localWorkspaceDir, remoteWorkspaceDir } = await setupGitBackedWorkspace("paperclip-restore-no-retry-");
+    const client = makeTransportClient(true, { syncOutOperations: [], readFilePaths: [] });
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: gitSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: localWorkspaceDir,
+      workspaceRestoreRetryDelaysMs: [0, 0],
+    });
+    await commitInSandbox(remoteWorkspaceDir);
+    const spy = step === "directory_merge"
+      ? vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline").mockRejectedValue(failure)
+      : vi.spyOn(gitSync, "integrateImportedGitHead").mockRejectedValue(failure);
+    try {
+      await expect(prepared.restoreWorkspace()).rejects.toBe(failure);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it("does not retry a non-Git copy-back that failed after writing a host file", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-partial-"));
+    cleanupDirs.push(rootDir);
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "base.txt"), "base\n", "utf8");
+    const client = makeTransportClient(true, { syncOutOperations: [], readFilePaths: [] });
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: gitSpec(remoteWorkspaceDir), adapterKey: "test-adapter", client, workspaceLocalDir: localWorkspaceDir,
+      workspaceRestoreRetryDelaysMs: [0, 0],
+    });
+    await writeFile(path.join(remoteWorkspaceDir, "a-first.txt"), "first\n", "utf8");
+    await writeFile(path.join(remoteWorkspaceDir, "z-later.txt"), "later\n", "utf8");
+    let directoryTransfers = 0;
+    const syncOut = client.syncOut!;
+    client.syncOut = async (operations) => {
+      if (operations.some((operation) => operation.files.some((file) => file.kind === "directory"))) directoryTransfers++;
+      return syncOut(operations);
+    };
+    // The merge copies entries in path order, so the first file lands before the
+    // later copy fails with an otherwise retryable I/O error.
+    const failure = Object.assign(new Error("i/o error"), { code: "EIO" });
+    const copyFile = fsPromises.copyFile.bind(fsPromises);
+    vi.spyOn(fsPromises, "copyFile").mockImplementation(async (source, target, mode) => {
+      if (path.basename(String(source)) === "z-later.txt") throw failure;
+      return copyFile(source, target, mode);
+    });
+    const merge = vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline");
+    try {
+      await expect(prepared.restoreWorkspace()).rejects.toBe(failure);
+      await expect(readFile(path.join(localWorkspaceDir, "a-first.txt"), "utf8")).resolves.toBe("first\n");
+      expect(directoryTransfers).toBe(1);
+      expect(merge).toHaveBeenCalledTimes(1);
     } finally { vi.restoreAllMocks(); }
   });
 

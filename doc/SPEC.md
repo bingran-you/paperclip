@@ -715,7 +715,15 @@ A source tracks repository identity, branch, selected paths, and installed commi
 an existing GitHub connection supplies caller-authorized reads. Manual refresh publishes
 complete local immutable versions, preserving skill identity and assignments. Selection
 operates on whole skill packages, with inspectable included files, declared runtime
-requirements, and advisory warnings for missing or external references. New
+requirements, and advisory warnings for missing or external references. A repository
+package retains supported source files while the user selects which skill entrypoints
+appear in the library. Authored content remains unchanged and shared files travel to
+the runtime. A declarative manifest can suggest public entrypoints and setup requirements;
+new imports keep repository files together and select all discovered skills. Missing
+references, setup problems and omitted files produce persistent warnings. Files rejected
+for unsafe execution or secret disclosure are excluded without blocking other files.
+The installed file viewer exposes saved repository dependencies. Importing never runs
+setup or configures host tools. New
 upstream skills require reviewed selection; removed or deselected skills remain
 installed. Editing starts with an independent copy. Write-back and PR publication
 are a later milestone; exact path and commit provenance provide their base.

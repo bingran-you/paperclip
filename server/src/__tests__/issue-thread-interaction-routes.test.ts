@@ -629,18 +629,21 @@ describe("issue thread interaction routes", () => {
     }), expect.anything());
   });
 
-  it("does not run historical-comment catch-up or queue recovery from the interaction read path", async () => {
+  it.each(["in_review", "done"])("keeps interaction reads free of expiry, activity writes, and recovery while %s", async (status) => {
     mockIssueService.getById.mockResolvedValue(createIssue({
-      status: "in_review",
+      status,
       assigneeAgentId: ASSIGNEE_AGENT_ID,
     }));
     mockInteractionService.listForIssue.mockResolvedValue([]);
 
     await request(await createApp())
       .get("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
-      .expect(200);
+      .expect(200, []);
 
+    expect(mockInteractionService.listForIssue).toHaveBeenCalledExactlyOnceWith(ISSUE_ID);
     expect(mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments).not.toHaveBeenCalled();
+    expect(mockInteractionService.expirePendingInteractionsForTerminalIssue).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 

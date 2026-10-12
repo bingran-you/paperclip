@@ -6,12 +6,14 @@ import type { SkillSourceScanProgress } from '@paperclipai/shared';
 import { parseGitHubSkillRepositoryUrl } from '@paperclipai/shared';
 import { unprocessable } from '../errors.js';
 import { buildGitAuthInvocation } from './git-credentials.js';
+import { MAX_REPOSITORY_BYTES, MAX_REPOSITORY_FILES } from './skill-repository-package.js';
 
 export type GitSkillTreeEntry = { path: string; type: string; mode: string; sha: string; size?: number };
 export interface GitSkillSnapshot {
   commitSha: string;
   entries: GitSkillTreeEntry[];
   readBlob: (entry: GitSkillTreeEntry, signal?: AbortSignal) => Promise<Buffer>;
+  readBlobs?: (entries: GitSkillTreeEntry[], signal?: AbortSignal) => Promise<Map<string, Buffer>>;
   release: () => Promise<void>;
 }
 export interface GitSkillSnapshotOptions {
@@ -69,12 +71,12 @@ async function directoryBytes(directory: string): Promise<number> {
   return size;
 }
 
-async function runGit(directory: string, args: string[], token: string, options: GitSkillSnapshotOptions & { download?: boolean; maxOutput?: number } = {}): Promise<Buffer> {
+async function runGit(directory: string, args: string[], token: string, options: GitSkillSnapshotOptions & { download?: boolean; maxOutput?: number; input?: string } = {}): Promise<Buffer> {
   options.signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn('git', ['-c', `core.hooksPath=${os.devNull}`, '-c', 'init.templateDir=', '-c', 'protocol.allow=never',
       '-c', 'protocol.https.allow=always', '-c', 'http.followRedirects=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args],
-    { cwd: directory, env: gitEnvironment(token), stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    { cwd: directory, env: gitEnvironment(token), stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
     const chunks: Buffer[] = [];
     let bytes = 0, stderr = '', unfinishedLine = '';
     let failure: unknown;
@@ -116,12 +118,12 @@ async function runGit(directory: string, args: string[], token: string, options:
         }
       })().catch(stop).finally(() => { reporting = null; if (latest && !failure && !closed) report(); });
     };
-    child.stdout.on('data', (chunk: Buffer) => {
+    child.stdout!.on('data', (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > (options.maxOutput ?? MAX_TREE_BYTES)) stop(unprocessable('Repository contents exceed the scan limit. Use a smaller skills repository.'));
       else chunks.push(chunk);
     });
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr!.on('data', (chunk: Buffer) => {
       stderr = (stderr + chunk.toString('utf8')).slice(-8192);
       const lines = (unfinishedLine + chunk.toString('utf8')).split(/[\r\n]/);
       unfinishedLine = lines.pop()!.slice(-4096);
@@ -151,6 +153,10 @@ async function runGit(directory: string, args: string[], token: string, options:
       }
       resolve(Buffer.concat(chunks));
     });
+    if (options.input !== undefined) {
+      child.stdin!.on('error', () => stop(unprocessable('Could not read repository files. Try again.')));
+      child.stdin!.end(options.input);
+    }
   });
 }
 
@@ -182,6 +188,37 @@ function acquire(cached: NonNullable<ReturnType<typeof snapshots.get>>, key: str
     readBlob: async (entry, signal) => {
       if (released || !/^[a-f0-9]{40}$/.test(entry.sha) || entry.type !== 'blob' || (entry.size ?? Infinity) > 1024 * 1024) throw unprocessable('Invalid snapshot file.');
       return runGit(cached.directory, ['cat-file', 'blob', entry.sha], '', { signal, maxOutput: 1024 * 1024 });
+    },
+    readBlobs: async (entries, signal) => {
+      signal?.throwIfAborted();
+      if (released || entries.length > MAX_REPOSITORY_FILES) throw unprocessable('Invalid repository file batch.');
+      let declaredBytes = 0;
+      for (const entry of entries) {
+        if (!/^[a-f0-9]{40}$/.test(entry.sha) || entry.type !== 'blob' || !['100644', '100755'].includes(entry.mode)
+          || !Number.isSafeInteger(entry.size) || entry.size! < 0 || entry.size! > 1024 * 1024) throw unprocessable('Invalid snapshot file.');
+        declaredBytes += entry.size!;
+      }
+      if (declaredBytes > MAX_REPOSITORY_BYTES) throw unprocessable('Repository package exceeds the 61 MB runtime limit.');
+      const unique = [...new Map(entries.map(entry => [entry.sha, entry])).values()];
+      const blobs = new Map<string, Buffer>();
+      if (!unique.length) return blobs;
+      const bytes = await runGit(cached.directory, ['cat-file', '--batch'], '', {
+        signal, input: unique.map(entry => `${entry.sha}\n`).join(''),
+        maxOutput: MAX_REPOSITORY_BYTES + MAX_REPOSITORY_FILES * 80,
+      });
+      let offset = 0;
+      for (const entry of unique) {
+        const newline = bytes.indexOf(10, offset);
+        if (newline < offset || newline - offset > 80) throw unprocessable('Git returned an incomplete repository file batch.');
+        const header = bytes.subarray(offset, newline).toString('ascii');
+        if (header !== `${entry.sha} blob ${entry.size}`) throw unprocessable('Git returned an unexpected repository file.');
+        const start = newline + 1, end = start + entry.size!;
+        if (end >= bytes.length || bytes[end] !== 10) throw unprocessable('Git returned an incomplete repository file.');
+        blobs.set(entry.sha, bytes.subarray(start, end));
+        offset = end + 1;
+      }
+      if (offset !== bytes.length) throw unprocessable('Git returned unexpected repository file data.');
+      return blobs;
     },
     release: async () => {
       if (released) return;

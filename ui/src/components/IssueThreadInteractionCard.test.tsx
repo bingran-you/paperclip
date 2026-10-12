@@ -872,7 +872,72 @@ describe("IssueThreadInteractionCard", () => {
     expect(host.textContent).toContain("Plan v4");
     expect(targetLinks[0]?.getAttribute("href")).toContain("#document-plan");
     expect(targetLinks[1]?.getAttribute("href")).toContain("#document-plan");
+    expect(host.querySelector(".lucide-chevron-right")).not.toBeNull();
     expect(host.textContent).not.toContain("Approve plan");
+  });
+
+  describe("custom request confirmation targets", () => {
+    const prKey = (pull: number) => `github:paperclipai/paperclip-desktop:pull:${pull}`;
+    const unlabeled = (pull: number) => ({ type: "custom" as const, key: prKey(pull) });
+    const labeled = (pull: number) => ({
+      ...unlabeled(pull),
+      label: `PR #${pull}`,
+      href: `https://github.com/paperclipai/paperclip-desktop/pull/${pull}`,
+    });
+    const staleTargetChange = (
+      staleTarget: ReturnType<typeof unlabeled>,
+      target: ReturnType<typeof unlabeled>,
+    ) => ({
+      ...staleTargetRequestConfirmationInteraction,
+      payload: { ...staleTargetRequestConfirmationInteraction.payload, target },
+      result: { version: 1 as const, outcome: "stale_target" as const, staleTarget },
+    });
+
+    it("hides an unlabeled target key on a pending card", () => {
+      const host = renderCard({
+        interaction: {
+          ...pendingRequestConfirmationInteraction,
+          payload: { ...pendingRequestConfirmationInteraction.payload, target: unlabeled(16) },
+        },
+      });
+      expect(host.textContent).not.toContain("github:paperclipai");
+    });
+
+    it("links a labeled target on a pending card", () => {
+      const host = renderCard({
+        interaction: {
+          ...pendingRequestConfirmationInteraction,
+          payload: { ...pendingRequestConfirmationInteraction.payload, target: labeled(16) },
+        },
+      });
+      const link = host.querySelector(
+        'a[href="https://github.com/paperclipai/paperclip-desktop/pull/16"]',
+      );
+      expect(link?.textContent).toContain("PR #16");
+      expect(host.textContent).not.toContain("github:paperclipai");
+    });
+
+    it("shows no chips or chevron for an unlabeled stale-target change", () => {
+      const host = renderCard({ interaction: staleTargetChange(unlabeled(15), unlabeled(16)) });
+      expect(host.textContent).toContain("Expired by target change");
+      expect(host.textContent).not.toContain("github:paperclipai");
+      expect(host.querySelector(".lucide-chevron-right")).toBeNull();
+    });
+
+    it("links both labeled targets across a stale-target chevron", () => {
+      const host = renderCard({ interaction: staleTargetChange(labeled(15), labeled(16)) });
+      expect(host.textContent).toContain("PR #15");
+      expect(host.textContent).toContain("PR #16");
+      expect(host.textContent).not.toContain("github:paperclipai");
+      expect(host.querySelector(".lucide-chevron-right")).not.toBeNull();
+    });
+
+    it("drops the chevron when only one side of the stale-target change is labeled", () => {
+      const host = renderCard({ interaction: staleTargetChange(unlabeled(15), labeled(16)) });
+      expect(host.textContent).toContain("PR #16");
+      expect(host.textContent).not.toContain("github:paperclipai");
+      expect(host.querySelector(".lucide-chevron-right")).toBeNull();
+    });
   });
 
   it("renders a jump link for confirmations expired by comment", () => {

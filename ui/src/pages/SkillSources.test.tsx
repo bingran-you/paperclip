@@ -148,20 +148,20 @@ describe('GitHub skill source import', () => {
     expect(document.querySelectorAll('[cmdk-item]')).toHaveLength(1);
     await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discoverStream).toHaveBeenCalledWith('company-1', { repositoryUrl: 'https://github.com/acme/design', connectionId: 'shared' }, expect.any(Function), expect.any(AbortSignal));
+    expect(skillSourcesApi.discoverStream).toHaveBeenCalledWith('company-1', { repositoryUrl: 'https://github.com/acme/design', packageMode: 'repository', trackingRef: undefined, connectionId: 'shared' }, expect.any(Function), expect.any(AbortSignal));
   });
   it('recognizes pasted branch URLs and does not reuse their branch or credentials for another repository', async () => {
     await mount();
     await act(async () => button('... or add public repo by URL').click());
     await input('input[placeholder="https://github.com/owner/repository"]', 'https://github.com/ACME/team-skills/tree/feature/new-skills');
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/ACME/team-skills/tree/feature/new-skills', connectionId: 'personal' }, expect.any(Function), expect.any(AbortSignal));
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/ACME/team-skills/tree/feature/new-skills', packageMode: 'repository', trackingRef: undefined, connectionId: 'personal' }, expect.any(Function), expect.any(AbortSignal));
     await flush();
     expect(document.body.textContent).toContain('feature/new-skills');
     await act(async () => button('Back').click());
     await input('input[placeholder="https://github.com/owner/repository"]', 'https://github.com/public/skills');
     await act(async () => button('Find skills').click());
-    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/public/skills', connectionId: null }, expect.any(Function), expect.any(AbortSignal));
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', { repositoryUrl: 'https://github.com/public/skills', packageMode: 'repository', trackingRef: undefined, connectionId: null }, expect.any(Function), expect.any(AbortSignal));
   });
   it('links empty repositories to standard GitHub setup in Apps while preserving the import draft', async () => {
     vi.mocked(skillSourcesApi.repositories).mockResolvedValue({ repositories: [], connections: [], connectionCount: 0, failedConnectionCount: 0 });
@@ -189,4 +189,56 @@ describe('GitHub skill source import', () => {
     expect([...document.querySelectorAll('a')].find(el => el.textContent === 'Manage connections')?.getAttribute('href')).toBe('/apps');
     expect(button('Try again')).toBeTruthy();
   });
+  it('defaults to the repository, selects every discovered skill without a packaging menu', async () => {
+    const main = { path: 'skills/main/SKILL.md', name: 'Main', description: 'Work', fileCount: 1, error: null, warnings: [] };
+    const helper = { ...main, path: 'automations/helper/SKILL.md', name: 'Helper' };
+    vi.mocked(skillSourcesApi.discoverStream).mockImplementation(async (_company, input) => ({ ...discovery, packageMode: input.packageMode,
+      candidates: [main, helper], ...(input.packageMode === 'repository' ? { repositoryPackage: {
+        files: [{ path: 'agents/worker.md', kind: 'markdown', encoding: 'utf8' as const, executable: false, sizeBytes: 10 }],
+        requirements: 'Bun for orchestration', error: null, warnings: [], skillPaths: [main.path],
+      } } : {}) }));
+    await mount();
+    await act(async () => (document.querySelector('[cmdk-item]') as HTMLElement).click());
+    await act(async () => button('Find skills').click()); await flush();
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', expect.objectContaining({ packageMode: 'repository' }), expect.any(Function), expect.any(AbortSignal));
+    expect(skillSourcesApi.discoverStream).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain('2 of 2 selected');
+    expect([...document.querySelectorAll('summary')].some(summary => summary.textContent?.includes('Choose skills'))).toBe(false);
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Import skills/main/SKILL.md"]')?.checked).toBe(true);
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Import automations/helper/SKILL.md"]')?.checked).toBe(true);
+    expect(document.body.textContent).not.toContain('Select whole skill packages.');
+    expect(document.body.textContent).not.toContain('The full repository travels');
+    expect(document.body.textContent).not.toContain('Importing does not install');
+    expect(button('View 1 file')).toBeTruthy();
+    expect(button('Import repository').disabled).toBe(false);
+    const draft = JSON.parse(sessionStorage.getItem('paperclip.skill-source-draft:company-1:new')!);
+    expect(draft.packageMode).toBe('repository'); expect(draft.selectedPaths).toEqual([main.path, helper.path]);
+    expect(document.querySelector('[aria-label="More import options"]')).toBeNull();
+    expect(document.body.textContent).not.toContain('Import individual skills');
+  });
+  it('warns about omitted files while allowing import without a confirmation', async () => {
+    sessionStorage.setItem('paperclip.skill-source-draft:company-1:new', JSON.stringify({ packageMode: 'repository', selectedPaths: ['skills/main/SKILL.md'],
+      discovery: { ...discovery, packageMode: 'repository', repositoryPackage: { files: [], requirements: null, error: null, warnings: ['shared/tools — Symlink couldn’t be included.'] },
+        candidates: [{ path: 'skills/main/SKILL.md', name: 'Main', description: null, fileCount: 1, error: null, warnings: [] }] } }));
+    vi.mocked(skillSourcesApi.create).mockImplementation(() => new Promise(() => {}));
+    await mount();
+    expect(document.body.textContent).toContain('1 import warning');
+    expect(document.querySelector('[aria-label="Import warnings"]')?.hasAttribute('open')).toBe(false);
+    expect(button('Import repository').disabled).toBe(false);
+    await act(async () => button('Import repository').click());
+    expect(skillSourcesApi.create).toHaveBeenCalledWith('company-1', expect.objectContaining({ packageMode: 'repository', selectedPaths: ['skills/main/SKILL.md'] }));
+  });
+  it('uses repository packaging when returning to an old individual-import draft', async () => {
+    sessionStorage.setItem('paperclip.skill-source-draft:company-1:new', JSON.stringify({ packageMode: 'skills', repositoryUrl: discovery.repositoryUrl }));
+    const candidate = { path: 'skills/main/SKILL.md', name: 'Main', description: 'A useful skill', error: null, fileCount: 1, warnings: [],
+      inspection: { files: [], requirements: null, warnings: [], references: [{ fromPath: 'SKILL.md', target: '../../shared.md', resolvedPath: 'shared.md', kind: 'outside_package' as const }] } };
+    vi.mocked(skillSourcesApi.discoverStream).mockResolvedValueOnce({ ...discovery, packageMode: 'repository', candidates: [{ ...candidate, inspection: { ...candidate.inspection, references: [] } }], repositoryPackage: { files: [], requirements: null, warnings: [], error: null } });
+    await mount();
+    await act(async () => button('Find skills').click()); await flush();
+    expect(skillSourcesApi.discoverStream).toHaveBeenCalledTimes(1);
+    expect(skillSourcesApi.discoverStream).toHaveBeenLastCalledWith('company-1', expect.objectContaining({ packageMode: 'repository' }), expect.any(Function), expect.any(AbortSignal));
+    expect(button('Import repository').disabled).toBe(false);
+    expect(document.body.textContent).not.toContain('Include repository files');
+  });
+
 });

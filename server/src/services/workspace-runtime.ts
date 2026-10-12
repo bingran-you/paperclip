@@ -34,7 +34,7 @@ import {
 } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
-import { conflict } from "../errors.js";
+import { conflict, unprocessable } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
 import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
@@ -3055,6 +3055,19 @@ function resolveRepoManagedWorkspaceCommand(command: string, repoRoot: string) {
   return command;
 }
 
+/**
+ * A configured workspace command ran to completion but exited non-zero. The message carries the
+ * command's own output. The default `Error` name is kept so existing reports keep their grouping.
+ */
+export class WorkspaceCommandExitError extends Error {
+  readonly exitCode: number | null;
+
+  constructor(message: string, exitCode: number | null) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
+
 async function runWorkspaceCommand(input: {
   command: string;
   resolvedCommand?: string;
@@ -3075,10 +3088,11 @@ async function runWorkspaceCommand(input: {
   if (proc.code === 0) return;
 
   const details = [proc.stderr.trim(), proc.stdout.trim()].filter(Boolean).join("\n");
-  throw new Error(
+  throw new WorkspaceCommandExitError(
     details.length > 0
       ? `${input.label} failed: ${details}`
       : `${input.label} failed with exit code ${proc.code ?? -1}`,
+    proc.code,
   );
 }
 
@@ -3211,10 +3225,11 @@ async function recordWorkspaceCommandOperation(
   if (code === 0) return operation;
 
   const details = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
-  throw new Error(
+  throw new WorkspaceCommandExitError(
     details.length > 0
       ? `${input.label} failed: ${details}`
       : `${input.label} failed with exit code ${code ?? -1}`,
+    code,
   );
 }
 
@@ -5139,23 +5154,32 @@ export async function runWorkspaceJobForControl(input: {
     adapterEnv: input.adapterEnv ?? {},
   });
   if (!resolved.command) {
-    throw new Error(`Workspace job "${resolved.name}" is missing command`);
+    throw unprocessable(`Workspace job "${resolved.name}" is missing command`);
   }
 
   await ensureServerWorkspaceLinksCurrent(resolved.cwd);
-  return await recordWorkspaceCommandOperation(input.recorder, {
-    phase: "workspace_provision",
-    command: resolved.command,
-    cwd: resolved.cwd,
-    env: resolved.env,
-    label: `Workspace job "${resolved.name}"`,
-    metadata: {
-      workspaceCommandKind: "job",
-      workspaceCommandName: resolved.name,
-      ...(input.metadata ?? {}),
-    },
-    successMessage: `Completed workspace job "${resolved.name}"\n`,
-  });
+  try {
+    return await recordWorkspaceCommandOperation(input.recorder, {
+      phase: "workspace_provision",
+      command: resolved.command,
+      cwd: resolved.cwd,
+      env: resolved.env,
+      label: `Workspace job "${resolved.name}"`,
+      metadata: {
+        workspaceCommandKind: "job",
+        workspaceCommandName: resolved.name,
+        ...(input.metadata ?? {}),
+      },
+      successMessage: `Completed workspace job "${resolved.name}"\n`,
+    });
+  } catch (error) {
+    // A job is an operator-authored command: a non-zero exit is its result, already recorded on
+    // the operation, not a server fault.
+    if (error instanceof WorkspaceCommandExitError) {
+      throw unprocessable(error.message, { code: "workspace_job_failed", exitCode: error.exitCode });
+    }
+    throw error;
+  }
 }
 
 function resolveServiceScopeId(input: {

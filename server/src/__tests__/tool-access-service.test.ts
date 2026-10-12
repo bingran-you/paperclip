@@ -3619,6 +3619,49 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+
+    const gatewayAudit = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, company.id),
+          eq(activityLog.action, "tool_gateway.approval_requested"),
+        ),
+      );
+    expect(gatewayAudit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorType: "user",
+          actorId: userId,
+          agentId: agent.id,
+          details: expect.objectContaining({
+            source: "test",
+            actionRequestId: res.body.actionRequestId,
+            invocationId: res.body.invocationId,
+          }),
+        }),
+      ]),
+    );
+
+    const dedicatedAudit = await db
+      .select()
+      .from(toolAccessAuditEvents)
+      .where(eq(toolAccessAuditEvents.companyId, company.id));
+    expect(dedicatedAudit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actorType: "user",
+          actorId: userId,
+          details: expect.objectContaining({
+            source: "test",
+            agentId: agent.id,
+            actionRequestId: res.body.actionRequestId,
+            runId: null,
+          }),
+        }),
+      ]),
+    );
   });
 
   it("cancels an ask-first test request when approval signing is unavailable", async () => {
@@ -3672,77 +3715,6 @@ describeEmbeddedPostgres("tool access service", () => {
     });
   });
 
-  it("audits ask-first test calls with the real board actor and selected agent", async () => {
-    const company = await createCompany(db);
-    const userId = `tool-tester-${randomUUID()}`;
-    await grantBoardUser(db, company.id, userId, ["tools:use"]);
-    const agent = await createAgent(db, company.id);
-    const { connection } = await createRemoteToolFixture(db, company.id);
-    await db.insert(toolPolicies).values({
-      companyId: company.id,
-      name: `Ask first ${randomUUID()}`,
-      policyType: "require_approval",
-      priority: 100,
-      selectors: { connectionId: connection.id },
-    });
-    const app = createRouteApp(
-      db,
-      boardSessionActor(company.id, "operator", userId),
-      createToolGatewayService(db, { toolActionSigningSecret: "test-secret" }),
-    );
-
-    const res = await request(app)
-      .post(`/api/tool-connections/${connection.id}/test-calls`)
-      .send({
-        agentId: agent.id,
-        toolName: "send_email",
-        parameters: { to: "a@example.com" },
-      })
-      .expect(200);
-
-    const gatewayAudit = await db
-      .select()
-      .from(activityLog)
-      .where(
-        and(
-          eq(activityLog.companyId, company.id),
-          eq(activityLog.action, "tool_gateway.approval_requested"),
-        ),
-      );
-    expect(gatewayAudit).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          actorType: "user",
-          actorId: userId,
-          agentId: agent.id,
-          details: expect.objectContaining({
-            source: "test",
-            actionRequestId: res.body.actionRequestId,
-            invocationId: res.body.invocationId,
-          }),
-        }),
-      ]),
-    );
-
-    const dedicatedAudit = await db
-      .select()
-      .from(toolAccessAuditEvents)
-      .where(eq(toolAccessAuditEvents.companyId, company.id));
-    expect(dedicatedAudit).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          actorType: "user",
-          actorId: userId,
-          details: expect.objectContaining({
-            source: "test",
-            agentId: agent.id,
-            actionRequestId: res.body.actionRequestId,
-            runId: null,
-          }),
-        }),
-      ]),
-    );
-  });
 
   it("drives an ask-first test call through its live lifecycle (waiting → approved/done with the real result)", async () => {
     const company = await createCompany(db);
@@ -3777,6 +3749,10 @@ describeEmbeddedPostgres("tool access service", () => {
       .expect(200);
     const actionRequestId = created.body.actionRequestId as string;
     expect(actionRequestId).toEqual(expect.any(String));
+
+    await request(app)
+      .get(`/api/tool-connections/${connection.id}/test-calls/${randomUUID()}`)
+      .expect(404);
 
     // 2. Status starts as "waiting" and surfaces the redacted "Where" snapshot.
     const waiting = await request(app)
@@ -3949,24 +3925,6 @@ describeEmbeddedPostgres("tool access service", () => {
     });
   });
 
-  it("404s a single-id test-call status fetch for a non-test-origin action request", async () => {
-    const company = await createCompany(db);
-    const userId = `tool-tester-${randomUUID()}`;
-    await grantBoardUser(db, company.id, userId, ["tools:use"]);
-    const { connection } = await createRemoteToolFixture(db, company.id);
-    const gateway = createToolGatewayService(db, {
-      toolActionSigningSecret: "test-secret",
-    });
-    const app = createRouteApp(
-      db,
-      boardSessionActor(company.id, "operator", userId),
-      gateway,
-    );
-
-    await request(app)
-      .get(`/api/tool-connections/${connection.id}/test-calls/${randomUUID()}`)
-      .expect(404);
-  });
 
   it("returns off for blocked test calls without executing the remote tool", async () => {
     const company = await createCompany(db);
@@ -4014,35 +3972,6 @@ describeEmbeddedPostgres("tool access service", () => {
       agentId: agent.id,
       runId: null,
     });
-  });
-
-  it("audits blocked test calls with the real board actor and selected agent", async () => {
-    const company = await createCompany(db);
-    const userId = `tool-tester-${randomUUID()}`;
-    await grantBoardUser(db, company.id, userId, ["tools:use"]);
-    const agent = await createAgent(db, company.id);
-    const { connection } = await createRemoteToolFixture(db, company.id);
-    await db.insert(toolPolicies).values({
-      companyId: company.id,
-      name: `Block ${randomUUID()}`,
-      policyType: "block",
-      priority: 100,
-      selectors: { connectionId: connection.id },
-    });
-    const app = createRouteApp(
-      db,
-      boardSessionActor(company.id, "operator", userId),
-      createToolGatewayService(db, { toolActionSigningSecret: "test-secret" }),
-    );
-
-    const res = await request(app)
-      .post(`/api/tool-connections/${connection.id}/test-calls`)
-      .send({
-        agentId: agent.id,
-        toolName: "send_email",
-        parameters: { to: "a@example.com" },
-      })
-      .expect(200);
 
     const gatewayAudit = await db
       .select()
@@ -4088,6 +4017,7 @@ describeEmbeddedPostgres("tool access service", () => {
       ]),
     );
   });
+
 
   it("denies test calls through agents the board user cannot task", async () => {
     const company = await createCompany(db);
@@ -5533,7 +5463,6 @@ describeEmbeddedPostgres("tool access service", () => {
       false,
     );
   });
-
 
 
 

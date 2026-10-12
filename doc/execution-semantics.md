@@ -1136,7 +1136,24 @@ An interrupted conversation does not permanently block its task. For local conve
 
 Shutdown, process loss, and provider failure use the existing durable failure retry counter and delay. Ordinary failure recovery permits at most two automatic retries in a failure chain. Accepted-interaction infrastructure recovery retains its existing bounded policy. Repeated scheduler visits reuse the same successor; restarting the server does not reset the counter. After exhaustion, automatic attempts stop. A new explicit user message can start a fresh run and failure budget. Productive max-turn continuation and confirmed workspace waits keep their separate existing semantics.
 
+Graceful shutdown interrupts an owned legacy adapter through its cancellation
+control, then waits within one shared 30-second window for provider stop and
+adapter settlement across all affected runs. Before interruption becomes visible,
+it commits a settlement fence on the exact sandbox lease. Cleanup on this server
+or another server defers while that fence is pending. If the controller dies,
+cleanup records exact stop-only retention and a repair hold after the deadline,
+without claiming a successful restore. The shipped Compose services allow 90
+seconds for settlement and subsequent shutdown cleanup.
+The sandbox lease remains available during workspace export and instruction
+collection. Lease release and recovery classification follow settlement and use
+the current execution evidence. If settlement exceeds the deadline with an
+active sandbox source, shutdown records a restore failure and pins the exact
+source for stop and retention before cleanup. A later run must pass the normal
+workspace repair gate. Native runner ownership keeps its existing restart path.
+
 Real gates still apply: company and task ownership, active provider ownership, budget limits, agent availability, dependencies, pending approval/review paths, and explicit pause holds. Native runner reattachment and finalization retain their existing ownership protocol. Process, HTTP, and gateway adapters retain their recovery rules because invoking those adapters can itself repeat an external action rather than start a conversation turn.
+
+A source that already stopped and was released remains fenced until its export settles; restart reconciliation scans these released sources too. Both provider reuse and destruction check the physical allocation for a shutdown fence or file-repair pin, including historical lease rows.
 
 An operator Stop waits for provider termination. Remote sandbox providers may return a stopped/deleted receipt after their control-plane operation completes. Paperclip binds that receipt to the company, run, and exact lease; successful file cleanup, a terminal run row, or an in-sandbox shutdown event is not sufficient. Legacy conversational runs receive their cancellation acknowledgement after all remote leases have confirmed termination. Stop alone never creates a continuation. A user message queued during remote cleanup is reconsidered when the provider confirms termination; it still passes normal admission and adopts pending comment IDs in order. Once stopped, the next explicit wake uses the same queue. A compatible saved ACP session can resume, and an unavailable or incompatible session can start fresh with the full task context. Run credentials and scratch paths remain scoped to the new run. A subtree pause requires Resume; a message does not bypass it.
 
@@ -1601,6 +1618,29 @@ permission again or copy Connect / Not now into a generic question. A generic
 question does not start setup. The real connection card keeps user identity,
 access grants, the decision, and continuation together. This guidance does not
 approve a connection or bypass its normal user decision.
+
+An ordinary tool connection request becomes obsolete when an already authorized
+connection is usable by its requesting agent with the addressed user's identity.
+Startup and periodic connection delivery reconcile that condition, retire the
+card as expired, and record a system decision without a fabricated human approval.
+The saved continuation is delivered once after rechecking the same access. The
+scheduled retry gate also verifies this condition before the next sweep, so the
+obsolete card cannot cancel a valid retry. Missing, unhealthy, disabled, ambiguous,
+or unauthorized identities remain blocked. Requests for additional tool access,
+AI authentication, inbox setup, or an upstream aggregator service keep their normal
+approval paths. Task ownership, real questions, approvals, budgets, pauses, and
+workspace recovery checks still govern admission.
+
+New requests notify the connection worker so this reconciliation also starts after an idle startup scan. Readiness uses the gateway's runtime tool
+listing policy with issue, project, and run context. System-retired requests are
+rechecked against the next run's responsible user and current access, and saved
+continuations defer while another question or linked approval remains pending.
+Those checks run again during queued and final dispatch admission. An unstarted
+system continuation cancelled for a new response wait rearms its delivery in the
+same transaction. Verified absence of execution keeps that wait out of workspace
+repair incidents. Historical retirements do not bind all future retries to an
+old account; an already authorized replacement can refresh the system observation
+with its own audit record before delivery. Human decisions remain unchanged.
 
 ## Responses submitted during an active run
 
