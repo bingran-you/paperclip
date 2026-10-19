@@ -34,6 +34,7 @@ export interface HeartbeatTaskContextInput {
     taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId"> | null;
   };
   policy: {
+    recovering?: boolean;
     trustPreset: Pick<TrustPresetResolution, "kind">;
     experimentalInstanceSettings: { enableSimplifiedEnglishInteractions?: boolean };
   };
@@ -78,6 +79,16 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     };
   } else {
     delete context.paperclipContinuationSummary;
+  }
+  const admittedScope = parseObject(context.paperclipAgentJwtScope);
+  if (!input.policy.recovering || (admittedScope.kind !== "standard" && admittedScope.kind !== "skill_test")) {
+    const savedIssue = parseObject(context.paperclipIssue);
+    const skillTest = input.policy.recovering
+      ? savedIssue.workMode === "skill_test" || Boolean(context.paperclipSkillTest)
+      : issueRef?.workMode === "skill_test";
+    context.paperclipAgentJwtScope = skillTest && issueRef
+      ? { kind: "skill_test", issueId: issueRef.id }
+      : { kind: "standard" };
   }
   const pinnedSkillTestContext =
     issueRef?.workMode === "skill_test"

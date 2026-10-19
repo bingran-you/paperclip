@@ -12,6 +12,8 @@ describe("Gmail tool governance", () => {
     expect(isGmailToolPermanentlyBlocked({ name: "get_message" })).toBe(false);
     expect(classifyRisk({ name: "create_draft" }, "gmail")).toBe("write");
     expect(isGmailToolPermanentlyBlocked({ name: "create_draft" })).toBe(false);
+    expect(classifyRisk({ name: "unlabel_thread" }, "gmail")).toBe("destructive");
+    expect(isGmailToolPermanentlyBlocked({ name: "unlabel_thread" })).toBe(false);
 
     expect(isGmailToolPermanentlyBlocked({ name: "send_message" })).toBe(true);
     expect(isGmailToolPermanentlyBlocked({ name: "trash_thread" })).toBe(true);
@@ -28,6 +30,10 @@ describe("Google Workspace tool governance", () => {
 
     expect(isGoogleWorkspaceToolAllowed("gmail.draft", { name: "create_draft" })).toBe(true);
     expect(isGoogleWorkspaceToolAllowed("gmail.draft", { name: "send_message" })).toBe(false);
+    expect(isGoogleWorkspaceToolAllowed("gmail.archive", { name: "search_threads" })).toBe(true);
+    expect(isGoogleWorkspaceToolAllowed("gmail.archive", { name: "unlabel_thread" })).toBe(true);
+    expect(isGoogleWorkspaceToolAllowed("gmail.archive", { name: "label_thread" })).toBe(false);
+    expect(isGoogleWorkspaceToolAllowed("gmail.archive", { name: "send_message" })).toBe(false);
     expect(isGoogleWorkspaceToolAllowed("calendar.write", { name: "delete_event" })).toBe(true);
     expect(isGoogleWorkspaceToolAllowed("calendar.write", { name: "publish_calendar" })).toBe(false);
   });

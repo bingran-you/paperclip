@@ -1,5 +1,57 @@
 import { describe, expect, it, vi } from "vitest";
-import { prepareVerifiedRemoteProviderPack } from "./remote-provider-pack.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { prepareVerifiedRemoteProviderPack, runRemoteProviderVerification } from "./remote-provider-pack.js";
+
+describe("remote provider verification", () => {
+  const ok = { exitCode: 0, timedOut: false, stdout: "verified", stderr: "", signal: null };
+  it.each([
+    { ...ok, exitCode: null, timedOut: true },
+    { ...ok, exitCode: null },
+    { ...ok, exitCode: 137, signal: "SIGKILL" },
+  ])("retries an interrupted read without calling it incompatible: %j", async result => {
+    const execute = vi.fn().mockResolvedValueOnce(result).mockResolvedValueOnce(ok);
+    await expect(runRemoteProviderVerification(execute, "pack")).resolves.toEqual(ok);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it("exhausts its own read budget after two inconclusive reads, including empty stderr", async () => {
+    const execute = vi.fn().mockResolvedValue({ ...ok, exitCode: null, timedOut: true });
+    await expect(runRemoteProviderVerification(execute, "pack"))
+      .rejects.toThrow("runner_remote_provider_verification_unavailable: pack unavailable after 2 verification attempts (exitCode=null; timedOut=true");
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+  it.each(["", "manifest mismatch", "dist tree digest mismatch"])("fails closed without retrying a completed rejection: %s", async stderr => {
+    const execute = vi.fn().mockResolvedValue({ ...ok, exitCode: 1, stderr });
+    await expect(runRemoteProviderVerification(execute, "pack")).rejects.toThrow("runner_remote_provider_artifact_incompatible: pack failed (exitCode=1");
+    expect(execute).toHaveBeenCalledOnce();
+  });
+  it("recovers a transport exception and propagates cancellation", async () => {
+    const execute = vi.fn().mockRejectedValueOnce(new Error("connection unavailable")).mockResolvedValueOnce(ok);
+    await expect(runRemoteProviderVerification(execute, "pack")).resolves.toEqual(ok);
+    const abort = new DOMException("cancelled", "AbortError");
+    execute.mockReset().mockRejectedValue(abort);
+    await expect(runRemoteProviderVerification(execute, "pack")).rejects.toBe(abort);
+    expect(execute).toHaveBeenCalledOnce();
+  });
+  it("retries after a real timed-out subprocess exits while unrelated work remains responsive", async () => {
+    let attempts = 0;
+    let responsive = false;
+    const unrelated = new Promise<void>(resolve => setTimeout(() => { responsive = true; resolve(); }, 5));
+    const result = await runRemoteProviderVerification(async () => {
+      attempts += 1;
+      try {
+        const result = await promisify(execFile)(process.execPath, ["-e", attempts === 1 ? "setInterval(()=>{},1000)" : "process.stdout.write('verified')"], { timeout: attempts === 1 ? 100 : 2_000 });
+        return { ...ok, ...result };
+      } catch (error) {
+        const failure = error as Error & { killed: boolean; signal: string; stdout: string; stderr: string };
+        if (!failure.killed) throw error;
+        return { ...ok, exitCode: null, timedOut: true, signal: failure.signal, stderr: failure.stderr };
+      }
+    }, "pack");
+    await unrelated;
+    expect({ attempts, responsive, stdout: result.stdout }).toEqual({ attempts: 2, responsive: true, stdout: "verified" });
+  });
+});
 
 describe("remote provider pack reuse", () => {
   it("keeps a verified staged pack without consulting the image or uploading again", async () => {

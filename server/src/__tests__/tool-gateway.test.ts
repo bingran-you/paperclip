@@ -5856,7 +5856,7 @@ rl.on("line", (line) => {
     });
   });
 
-  it("wraps plugin tool discovery and execution behind the same gateway policy", async () => {
+  it.each([1, 2])("wraps plugin tool discovery and execution behind the same gateway policy (%i copies)", async copies => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run, project } = await createIssueAndRun(db, company.id, agent.id);
@@ -5864,15 +5864,13 @@ rl.on("line", (line) => {
     const dispatcher: PluginToolDispatcher = {
       initialize: async () => {},
       teardown: () => {},
-      listToolsForAgent: () => [
-        {
+      listToolsForAgent: () => Array.from({ length: copies }, () => ({
           name: "demo-plugin:read_status",
           displayName: "Read status",
           description: "Read status through a plugin tool.",
           parametersSchema: { type: "object" },
           pluginId: "demo-plugin",
-        },
-      ],
+        })),
       getTool: () => null,
       executeTool: async (tool, parameters, runContext) => {
         calls.push({ tool, parameters, runContext });
@@ -5905,6 +5903,10 @@ rl.on("line", (line) => {
     );
 
     await allowToolsForAgent(db, company.id, agent.id, ["demo-plugin:read_status"]);
+
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id });
+    expect((await gateway.listToolsForSession(session.token)).filter(tool => tool.pluginId === "demo-plugin"))
+      .toEqual([expect.objectContaining({ name: "demo-plugin:read_status" })]);
 
     await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id })).resolves.toEqual([
       expect.objectContaining({ name: "demo-plugin:read_status" }),

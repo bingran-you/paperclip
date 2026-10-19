@@ -268,9 +268,9 @@ it("wires exact-session recovery and guarded selected identity into heartbeat pe
     new URL("../heartbeat/runtime-selection.ts", import.meta.url),
     "utf8",
   );
-  expect(source).toContain("await findNativeSessionResumeRun(db,");
+  expect(source).toContain("findNativeSessionResumeRun(db,");
   expect(source).toContain(
-    "await prepareNativeSessionBootstrapPersistence(tx,",
+    "prepareNativeSessionBootstrapPersistence(tx,",
   );
   expect(source).toContain("nativeSessionId: persistedNativeSessionId,");
   expect(source).toContain("lockedProfile.sessionCheckpoint != null");

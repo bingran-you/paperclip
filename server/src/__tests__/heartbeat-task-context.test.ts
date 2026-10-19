@@ -89,6 +89,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
       wakeCommentId: commentId, wakeCommentIds: [commentId],
       paperclipTaskCommunicationGuidance: "FORGED caller guidance", paperclipSkillTest: { directive: "FORGED skill" },
       paperclipContinuationSummary: { body: "FORGED summary" },
+      paperclipAgentJwtScope: { kind: "skill_test", issueId: f.issueId },
     });
     expect(context.paperclipTaskMarkdown).toContain("Assignment description canary");
     expect(context.paperclipTaskMarkdown).toContain("Wake comment canary");
@@ -103,6 +104,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     }
     expect(context.paperclipTaskCommunicationGuidance).toBe(FAST_RESPONSE_AGENT_GUIDANCE);
     expect(context.paperclipSkillTest).toBeUndefined();
+    expect(context.paperclipAgentJwtScope).toEqual({ kind: "standard" });
     expect(context.paperclipContinuationSummary).toBeUndefined();
     const digest = (value: string) => createHash("sha256").update(value).digest("hex");
     expect(context.paperclipTurnContext).toMatchObject({

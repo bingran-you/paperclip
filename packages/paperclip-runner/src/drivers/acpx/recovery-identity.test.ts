@@ -31,6 +31,7 @@ describe("ACPX recovery identity", () => {
     ["copilot", "../../../test/fixtures/copilot-profile-v14-identity.json"],
     ["pi", "../../../test-fixtures/pi-acp/profile-v13-identity.json"],
     ["pi", "../../../test-fixtures/pi-acp/profile-v14-identity.json"],
+    ["pi", "../../../test-fixtures/pi-acp/profile-v22-identity.json"],
     ["cursor", "../../../test/fixtures/cursor-acp/profile-v7-identity.json"],
     ["cursor", "../../../test/fixtures/cursor-acp/profile-v8-identity.json"],
     ["cursor", "../../../test/fixtures/cursor-acp/profile-v9-identity.json"],
@@ -89,6 +90,21 @@ describe("ACPX recovery identity", () => {
     expect(() => verifyExpectedAcpxIdentity(expected, low, { ...persisted, piThinkingLevel: undefined })).toThrow(/persisted/);
     expect(() => verifyExpectedAcpxIdentity(expected, high, persisted)).toThrow(/immutable/);
     await expect(createAcpxRecoveryBinding({ ...input, piThinkingLevel: undefined })).rejects.toThrow(/explicit/);
+  });
+
+  it("fences changes to home mode or provider home without binding ownership to that home", async () => {
+    const fixture = await recoveryFixture();
+    const common = { runtimeDirectory: join(temporaryDirectories.at(-1)!, "runtime"), normalizedSessionId: "session-1",
+      workingDirectory: fixture.workspace, profile: resolveQualifiedAcpxProfile("codex", "gpt-5.6-sol"),
+      requestedModel: "gpt-5.6-sol", permissionMode: "approve-reads" as const };
+    const isolated = await createAcpxRecoveryBinding(common);
+    const first = await createAcpxRecoveryBinding({ ...common, homeBinding: { HOME: "/users/one" } });
+    const same = await createAcpxRecoveryBinding({ ...common, homeBinding: { HOME: "/users/one" } });
+    const other = await createAcpxRecoveryBinding({ ...common, homeBinding: { HOME: "/users/two" } });
+    expect(first.profileSessionKey).toBe(same.profileSessionKey);
+    expect(first.profileSessionKey).not.toBe(isolated.profileSessionKey);
+    expect(first.profileSessionKey).not.toBe(other.profileSessionKey);
+    expect(first.runtimeRoot).toBe(isolated.runtimeRoot);
   });
 
   it("derives one stable, filesystem-safe runtime directory name", () => {

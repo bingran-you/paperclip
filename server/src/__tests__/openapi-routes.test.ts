@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
+import { MUSE_ASSET_VERSION, MUSE_PUBLIC_ROUTES } from "@paperclipai/shared";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
@@ -45,15 +46,20 @@ const apiPrefixes: Record<string, string> = {
   "costs.ts": "/api",
   "dashboard.ts": "/api",
   "dot-runner.ts": "/api",
+  "muse.ts": "/api",
+  "muse-qualification.ts": "/api",
+  "grok-bot.ts": "/api",
   "decision-queues.ts": "/api",
   "decisions.ts": "/api",
   "decision-training.ts": "/api",
   "environments.ts": "/api",
   "execution-workspaces.ts": "/api",
+  "task-workspaces.ts": "/api",
   "file-resources.ts": "/api",
   "folders.ts": "/api",
   "goals.ts": "/api",
   "health.ts": "/api/health",
+  "liveness.ts": "/api/liveness",
   "inbox-agent-policy.ts": "/api",
   "inbox-dismissals.ts": "/api",
   "instance-database-backups.ts": "/api",
@@ -86,9 +92,9 @@ const apiPrefixes: Record<string, string> = {
 };
 
 const ROUTE_LITERAL_PATTERN =
-  /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
-const ROUTE_ARRAY_PATTERN = /router\.(get|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
-const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+  /router\.(get|head|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
+const ROUTE_ARRAY_PATTERN = /router\.(get|head|post|put|patch|delete)\(\s*\[([^\]]+)\]/g;
+const ROUTER_METHOD_PATTERN = /router\.(get|head|post|put|patch|delete)\(/;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -102,6 +108,10 @@ const HTTP_METHODS = new Set([
 const explicitOpenApiCoverageExclusions = new Set<string>();
 
 const explicitOpenApiOperationCoverageExclusions = new Set([
+  // Muse uses its closed, versioned receiver protocol and dedicated credentials,
+  // documented in doc/muse-personal-agent.md and the shared protocol contract.
+  // Board connection/qualification management remains in this OpenAPI document.
+  ...MUSE_PUBLIC_ROUTES.map(route => `${route.method} ${route.path}`),
   // Inspection uses its own versioned Cloud-permit/managed-run protocol,
   // documented in CUSTOMER-SUCCESS-INSPECTION.md and the shared contract.
   // Ordinary board sessions and agent API keys cannot invoke these endpoints.
@@ -182,7 +192,7 @@ function resolveMountedPath(file: string, prefix: string, routePath: string) {
   ) {
     return routePath;
   }
-  if ((file === "companies.ts" || file === "health.ts") && routePath === "/") {
+  if ((file === "companies.ts" || file === "health.ts" || file === "liveness.ts") && routePath === "/") {
     return prefix;
   }
   if (file === "companies.ts" || file === "health.ts") {
@@ -245,15 +255,20 @@ function loadActualRoutes() {
         }
       }
     }
-    if (file === "dot-runner.ts") {
-      for (const name of ["path", "invitePath"]) {
-        const basePath = new RegExp(`const ${name} = "([^"]+)"`).exec(source)?.[1];
-        if (!basePath) throw new Error(`Dot ${name} route prefix is missing`);
-        const methods = new RegExp(`router\\.(get|post|delete)\\(${name}(?: \\+ "([^"]+)")?`, "g");
-        for (const match of source.matchAll(methods)) {
-          routes.add(`${match[1].toUpperCase()} ${normalizeExpressPath(prefix + basePath + (match[2] ?? ""))}`);
-        }
+    const variablePaths = file === "dot-runner.ts" ? ["path", "invitePath"]
+      : file === "grok-bot.ts" ? ["path"]
+      : file === "muse.ts" ? ["path", "invite"]
+      : file === "muse-qualification.ts" ? ["path"] : [];
+    for (const name of variablePaths) {
+      const basePath = new RegExp(`\\b${name}\\s*=\\s*"([^"]+)"`).exec(source)?.[1];
+      if (!basePath) throw new Error(`${file} ${name} route prefix is missing`);
+      const methods = new RegExp(`router\\.(get|post|put|delete)\\(\\s*${name}(?:\\s*\\+\\s*"([^"]+)")?\\s*,`, "g");
+      for (const match of source.matchAll(methods)) {
+        routes.add(`${match[1].toUpperCase()} ${normalizeExpressPath(prefix + basePath + (match[2] ?? ""))}`);
       }
+    }
+    if (file === "muse.ts" && /for\s*\(const route of MUSE_PUBLIC_ROUTES\)/.test(source)) {
+      for (const route of MUSE_PUBLIC_ROUTES) excludedRoutes.add(`${route.method} ${route.path}`);
     }
 
     if (
@@ -295,6 +310,17 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents anonymous liveness separately from database readiness", () => {
+    const spec = buildOpenApiSpec() as any;
+    for (const method of ["get", "head"]) {
+      const operation = spec.paths["/api/liveness"][method];
+      expect(operation.security).toEqual([]);
+      expect(operation.responses[503]).toBeDefined();
+    }
+    expect(Object.keys(spec.paths["/api/liveness"].get.responses[200].content["application/json"].schema.properties))
+      .toEqual(["status", "commit"]);
+    expect(spec.paths["/api/health"].get.responses[503]).toBeDefined();
+  });
   it("documents only writable agent update fields and lifecycle status requests", () => {
     const document = buildOpenApiSpec() as any;
     const properties = document.paths["/api/agents/{id}"].patch.requestBody.content["application/json"].schema.properties;
@@ -912,6 +938,34 @@ describe("openapi routes", () => {
       properties: { primaryAgentId: { type: "string", format: "uuid" } },
     });
     expect(path.put.responses["422"]).toBeDefined();
+  });
+
+  it("documents Muse operator management separately from receiver credentials", () => {
+    const { spec } = loadSpecRoutes();
+    const base = "/api/companies/{companyId}/agents/{agentId}/muse-binding";
+    const operations = [
+      ["get", "/api/companies/{companyId}/muse-invitations"],
+      ["post", "/api/companies/{companyId}/muse-invitations"],
+      ["get", base], ["post", base], ["post", `${base}/verify`],
+      ["post", `${base}/revoke`], ["post", `${base}/attest-stop`],
+      ["post", `${base}/attest-detector-cleanup`],
+      ["get", `${base}/qualification`], ["post", `${base}/qualification`], ["delete", `${base}/qualification`],
+    ];
+    for (const [method, routePath] of operations) {
+      const operation = spec.paths[routePath][method];
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+      expect(operation.responses["403"]).toBeDefined();
+    }
+    expect(spec.paths[base].post.responses["201"]).toBeDefined();
+    expect(spec.paths[base].post.responses["201"].content["application/json"].schema.properties.assetVersion.enum).toEqual([MUSE_ASSET_VERSION]);
+    expect(spec.paths[`${base}/revoke`].post.responses["204"]).toBeDefined();
+    expect(spec.paths[`${base}/qualification`].delete.responses["204"]).toBeDefined();
+    expect(spec.paths[`${base}/qualification`].get.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "bindingId", in: "query", required: true }),
+      expect.objectContaining({ name: "qualificationId", in: "query", required: true }),
+    ]));
+    for (const route of MUSE_PUBLIC_ROUTES) expect(spec.paths[route.path]).toBeUndefined();
   });
 
   it("documents operator Dot invitations and current pairing and event-test fields", () => {

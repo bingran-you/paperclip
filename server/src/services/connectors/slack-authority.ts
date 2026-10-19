@@ -37,28 +37,43 @@ export interface SlackTaskAuthority {
   botToken: string;
   searchActionToken?: string | null;
 }
+export type SlackTaskAuthorization = Omit<SlackTaskAuthority, "revision" | "searchActionToken">;
 // Only the live chat service can attest to admission. JSON snapshots, model
 // arguments and credential possession cannot install an authority callback.
 const authorities = new WeakMap<
   Db,
-  (binding: SlackTaskBinding) => Promise<SlackTaskAuthority>
+  {
+    resolve: (binding: SlackTaskBinding) => Promise<SlackTaskAuthority>;
+    authorize?: (binding: SlackTaskBinding) => Promise<SlackTaskAuthorization>;
+  }
 >();
 export function registerSlackTaskAuthority(
   db: Db,
   resolve: (binding: SlackTaskBinding) => Promise<SlackTaskAuthority>,
+  authorize?: (binding: SlackTaskBinding) => Promise<SlackTaskAuthorization>,
 ) {
-  authorities.set(db, resolve);
+  const registration = { resolve, authorize };
+  authorities.set(db, registration);
   return () => {
-    if (authorities.get(db) === resolve) authorities.delete(db);
+    if (authorities.get(db) === registration) authorities.delete(db);
   };
 }
 export async function resolveSlackTaskAuthority(
   db: Db,
   binding: SlackTaskBinding,
 ) {
-  const resolve = authorities.get(db);
-  if (!resolve) throw forbidden("Slack task authority is unavailable");
+  const registration = authorities.get(db);
+  if (!registration) throw forbidden("Slack task authority is unavailable");
+  const resolve = registration.resolve;
   return resolve(binding);
+}
+export async function resolveSlackTaskAuthorization(
+  db: Db,
+  binding: SlackTaskBinding,
+): Promise<SlackTaskAuthorization> {
+  const registration = authorities.get(db);
+  if (!registration) throw forbidden("Slack task authority is unavailable");
+  return (registration.authorize ?? registration.resolve)(binding);
 }
 
 /** Follow only immutable controller provenance, stopping at the latest human message.
@@ -187,7 +202,7 @@ export async function slackEndpointCandidates(
   binding: Pick<SlackTaskBinding, "companyId" | "agentId" | "endpointId">,
 ) {
   return db
-    .select({ id: chatEndpoints.id })
+    .select({ id: chatEndpoints.id, connectionId: chatEndpoints.connectionId })
     .from(chatEndpoints)
     .where(
       and(

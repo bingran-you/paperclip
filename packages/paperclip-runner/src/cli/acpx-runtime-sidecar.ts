@@ -3,7 +3,8 @@ import { parseProviderMode } from "../contracts/provider-mode.js";
 import { acpxProfileActivity, type AcpxActivityAdapter, type AcpxToolEvidence } from "../drivers/acpx/profile-activity.js";
 
 import { resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { resolveCompletionContinuation } from "../drivers/completion-continuation.js";
 import { createInterface } from "node:readline";
 import { deliverAcpxResponse, requireAcpxResponseDelivery } from "../drivers/acpx/response-delivery.js";
 import { createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
@@ -166,6 +167,7 @@ let initializedAgent: QualifiedAcpxAgent | null = null;
 let initializedModel: string | null = null;
 let inputClosed = false;
 const tools = new Map<string, PendingTool>();
+const normalizingTools = new Set<string>();
 const inputs = new Map<string, PendingInput>();
 const permissions = new Map<string, PendingPermission>();
 
@@ -694,20 +696,33 @@ async function pumpTurn(
 
 async function waitForTool(call: RunnerToolCall): Promise<unknown> {
   const activeTurnId = turnId;
-  if (!activeTurnId || call.signal.aborted) {
+  const activeRunId = runId;
+  if (!activeTurnId || !activeRunId || call.signal.aborted) {
     throw new Error("ACPX tool call is not bound to an active turn");
   }
   const callId = boundedIdentity(call.callId, "callId");
-  if (tools.has(callId)) throw new Error("ACPX tool call is duplicated");
+  if (tools.has(callId) || normalizingTools.has(callId)) throw new Error("ACPX tool call is duplicated");
   const operationId = boundedIdentity(call.tool, "operationId");
-  if (tools.size >= MAX_PENDING_TOOLS) {
+  if (tools.size + normalizingTools.size >= MAX_PENDING_TOOLS) {
     throw new Error("ACPX pending tool limit reached");
   }
   if (
     operationId === PRP_COMPLETION_TOOL_NAME ||
     operationId === PRP_BLOCK_TOOL_NAME
   ) {
-    const validation = validatePrpStructuredRunResult(call.arguments);
+    let completionInput: unknown;
+    normalizingTools.add(callId);
+    try {
+      completionInput = await resolveCompletionContinuation(call.arguments, activeRunId, () => waitForTool({
+        tool: "get_task_context", callId: `continuation:${randomUUID()}`, arguments: {}, signal: call.signal,
+      }));
+    } finally {
+      normalizingTools.delete(callId);
+    }
+    if (turnId !== activeTurnId || runId !== activeRunId || call.signal.aborted) {
+      throw new Error("ACPX completion was cancelled or its binding changed");
+    }
+    const validation = validatePrpStructuredRunResult(completionInput);
     if (!validation.ok) {
       throw new Error("ACPX semantic result failed PRP schema validation");
     }

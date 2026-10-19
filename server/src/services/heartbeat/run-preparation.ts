@@ -1,3 +1,5 @@
+import { skillAccessService } from "../skill-access.js";
+import type { AuthorizationActor } from "../authorization.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
@@ -727,6 +729,7 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
   companyId: string;
   issueId: string | null;
   commentIds?: string[];
+  actor?: AuthorizationActor;
 }): Promise<string[]> {
   if (!input.issueId) return [];
 
@@ -801,6 +804,14 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
         inArray(companySkillsTable.id, mentionedSkillIds),
       ),
     );
+  for (const skillId of mentionedSkillIds) {
+    try { await skillAccessService(input.db, input.actor).assertSkill(input.companyId, skillId); }
+    catch {
+      throw new ConfigurationIncompleteFailure("A referenced skill is unavailable or you do not have project access. Update the task's skill reference or project access.", {
+        configurationIncomplete: { reason: "skill_unavailable", companyId: input.companyId, actionUrl: "/skills" },
+      });
+    }
+  }
   const skillKeyById = new Map(skillRows.map((row) => [row.id, row.key]));
   return mentionedSkillIds
     .map((skillId) => skillKeyById.get(skillId) ?? null)
@@ -827,6 +838,12 @@ export interface WakeupOptions {
     requestId: string;
     idempotencyKey: string;
     requestedAt: Date;
+  };
+  /** Server-owned Muse admission receipt; never accepted from API payloads. */
+  durableMuseRequest?: NonNullable<WakeupOptions["durableDotRequest"]> & {
+    bindingId: string;
+    bindingGeneration: number;
+    requestDigest: string;
   };
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";

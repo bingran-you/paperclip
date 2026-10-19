@@ -1,5 +1,6 @@
 import { continuingTeamsFilePublication, type ContinuingTeamsFileTransfer } from "./microsoft-teams/file-transfer-source.js";
-import { notifyChatPublicationWork } from "../chat-work-notifications.js";
+import { notifyChatActionWork, notifyChatPublicationWork } from "../chat-work-notifications.js";
+import { FAILED_RUN_RETRY_STALE_MS, dueChatAction } from "../chat-action-work.js";
 
 import {
   createHash,
@@ -13,7 +14,6 @@ import {
   isNotNull,
   isNull,
   like,
-  lte,
   ne,
   notInArray,
   or,
@@ -104,7 +104,6 @@ type ChatFailedRunRetryOptions = {
   lifecycleRuntimeFence: (delivery: DeliveryRow) => RetryRuntimeFence | null;
   isShuttingDown: () => boolean;
   wakeup: IssueAssignmentWakeupDeps["wakeup"];
-  staleProcessingMs: number;
 };
 
 export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOptions) {
@@ -115,7 +114,6 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     lifecycleRuntimeFence,
     isShuttingDown,
     wakeup,
-    staleProcessingMs: DELIVERY_PROCESSING_STALE_MS,
   } = options;
 
 
@@ -1265,6 +1263,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       .limit(1);
     if (busy || !input.initiatedByUserId) throw failedChatRetryDenied();
     const now = new Date();
+    await notifyChatActionWork(tx, "failed_run_retry");
     const [intent] = await tx
       .insert(chatActions)
       .values({
@@ -1508,36 +1507,42 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       !["issued", "processing"].includes(candidate.status) ||
       (candidate.status === "processing" &&
         candidate.updatedAt.getTime() >
-          now.getTime() - DELIVERY_PROCESSING_STALE_MS) ||
+          now.getTime() - FAILED_RUN_RETRY_STALE_MS) ||
       (typeof candidate.result?.retryAt === "string" &&
         Date.parse(candidate.result.retryAt) > now.getTime())
     )
       return failedChatRetryReceipt(candidate);
-    const [claimed] = await db
-      .update(chatActions)
-      .set({ status: "processing", updatedAt: now })
-      .where(
-        and(
-          eq(chatActions.id, candidate.id),
-          eq(chatActions.status, candidate.status),
-          eq(chatActions.updatedAt, candidate.updatedAt),
-        ),
-      )
-      .returning();
-    if (!claimed) return failedChatRetryReceipt(candidate);
-    const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
-    const settle = async (status: string, result: Record<string, unknown>) => {
-      const [current] = await db
+    const [claimed] = await db.transaction(async (tx) => {
+      await notifyChatActionWork(tx, "failed_run_retry");
+      return tx
         .update(chatActions)
-        .set({ status, result, updatedAt: new Date() })
+        .set({ status: "processing", updatedAt: now })
         .where(
           and(
-            eq(chatActions.id, claimed.id),
-            eq(chatActions.status, "processing"),
-            eq(chatActions.updatedAt, now),
+            eq(chatActions.id, candidate.id),
+            eq(chatActions.status, candidate.status),
+            eq(chatActions.updatedAt, candidate.updatedAt),
           ),
         )
         .returning();
+    });
+    if (!claimed) return failedChatRetryReceipt(candidate);
+    const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
+    const settle = async (status: string, result: Record<string, unknown>) => {
+      const [current] = await db.transaction(async (tx) => {
+        await notifyChatActionWork(tx, "failed_run_retry");
+        return tx
+          .update(chatActions)
+          .set({ status, result, updatedAt: new Date() })
+          .where(
+            and(
+              eq(chatActions.id, claimed.id),
+              eq(chatActions.status, "processing"),
+              eq(chatActions.updatedAt, now),
+            ),
+          )
+          .returning();
+      });
       return failedChatRetryReceipt(current ?? claimed);
     };
     try {
@@ -1669,26 +1674,10 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
 
   async function processFailedChatRunRetries(limit = 20) {
     if (isShuttingDown()) return 0;
-    const now = new Date();
     const candidates = await db
       .select({ id: chatActions.id })
       .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.kind, "failed_run_retry"),
-          or(
-            eq(chatActions.status, "issued"),
-            and(
-              eq(chatActions.status, "processing"),
-              lte(
-                chatActions.updatedAt,
-                new Date(now.getTime() - DELIVERY_PROCESSING_STALE_MS),
-              ),
-            ),
-          ),
-          sql`(${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= ${now.toISOString()}::timestamptz)`,
-        ),
-      )
+      .where(dueChatAction("failed_run_retry"))
       .orderBy(asc(chatActions.createdAt), asc(chatActions.id))
       .limit(Math.max(1, Math.min(50, limit)));
     for (const candidate of candidates)

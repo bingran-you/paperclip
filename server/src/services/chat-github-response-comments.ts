@@ -44,14 +44,16 @@ async function findResponseComment(source: Source, api: Api): Promise<Comment | 
 }
 
 /** One durable, App-owned comment per accepted request. Callers hold the same
- * repository publication lease used by agent replies and review summaries. */
+ * repository publication lease used by agent replies and review summaries.
+ * Reconnect epochs fence publication attempts, not the durable comment identity.
+ * Legacy receipts are also checked against the App-owned provider comment. */
 async function stageResponse(db: Db, source: Source) {
   const [inserted] = await db.insert(chatActions).values({
     companyId: source.endpoint.companyId, endpointId: source.endpoint.id,
     conversationId: source.conversation.id, deliveryId: source.delivery.id,
     principalId: source.delivery.principalId, kind: "github_response_comment",
     providerActionId: actionKey(source.delivery.id),
-    payload: { runtimeGeneration: generation(source.endpoint), agentId: source.endpoint.assignedAgentId },
+    payload: { botExternalId: source.endpoint.botExternalId, agentId: source.endpoint.assignedAgentId },
     status: "received",
   }).onConflictDoNothing().returning();
   const response = inserted ?? (await db.select().from(chatActions).where(and(
@@ -59,7 +61,7 @@ async function stageResponse(db: Db, source: Source) {
     eq(chatActions.providerActionId, actionKey(source.delivery.id)),
   )))[0];
   if (!response || response.conversationId !== source.conversation.id ||
-      response.payload.runtimeGeneration !== generation(source.endpoint) ||
+      (response.payload.botExternalId !== undefined && response.payload.botExternalId !== source.endpoint.botExternalId) ||
       response.payload.agentId !== source.endpoint.assignedAgentId)
     throw forbidden("GitHub response binding changed");
   return response;
@@ -70,6 +72,7 @@ export async function writeGitHubResponseComment(
   input: { body: string; final: boolean; versionAt?: Date; acknowledgement?: boolean },
   assertCurrent: () => Promise<void>,
 ) {
+  await assertCurrent();
   const response = await stageResponse(db, source);
   // A delayed acknowledgement or progress retry must never replace a result.
   if (response.result?.id && (input.acknowledgement || (response.result.final === true && !input.final) ||

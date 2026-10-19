@@ -591,14 +591,14 @@ function evaluatePolicyConditions(
 }
 
 function profileEntryMatches(entry: typeof toolProfileEntries.$inferSelect, ctx: ToolAccessContext): boolean {
+  const selected = entry.selectorType === "application" ? entry.applicationId === ctx.applicationId
+    : entry.selectorType === "connection" ? entry.connectionId === ctx.connectionId
+    : entry.selectorType === "catalog_entry" ? entry.catalogEntryId === ctx.catalogEntryId
+    : entry.selectorType === "tool_name" ? entry.toolName === ctx.toolName
+    : entry.selectorType === "risk_level" ? entry.riskLevel === ctx.riskLevel : false;
+  if (!selected) return false;
   const conditions = isRecord(entry.conditions) ? entry.conditions as ToolPolicyConditions : null;
-  if (!evaluatePolicyConditions(conditions, ctx).matched) return false;
-  if (entry.selectorType === "application") return entry.applicationId === ctx.applicationId;
-  if (entry.selectorType === "connection") return entry.connectionId === ctx.connectionId;
-  if (entry.selectorType === "catalog_entry") return entry.catalogEntryId === ctx.catalogEntryId;
-  if (entry.selectorType === "tool_name") return entry.toolName === ctx.toolName;
-  if (entry.selectorType === "risk_level") return entry.riskLevel === ctx.riskLevel;
-  return false;
+  return evaluatePolicyConditions(conditions, ctx).matched;
 }
 
 function targetMatches(binding: typeof toolProfileBindings.$inferSelect, ctx: ToolAccessContext): boolean {

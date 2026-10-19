@@ -36,9 +36,12 @@ export type {
   NativeExecutionInputV4,
   NativeExecutionInputV5,
   NativeExecutionInputV6,
+  NativeExecutionInputV8,
+  MuseBindingSnapshot,
   DotBindingSnapshot,
   ExternalProviderPort,
   ExternalProviderOperation,
+  NativeExecutionInputV7,
   NativeCompletionSource,
   NativeCompletionSources,
   NativeInteractionResponseEnvelope,
@@ -61,6 +64,7 @@ export type {
   PrpVerificationReasonCode,
   PrpWireConnection,
   ReplayControlPlaneEventsInput,
+  RunnerExecutionDriver,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
   StrictCompletionContractInput,
@@ -110,6 +114,7 @@ export const createRunnerdCodexTransport: (
   runner.createRunnerdCodexTransport;
 export const defaultCapabilityRunnerdBinary =
   runner.defaultCapabilityRunnerdBinary;
+export const runnerBinaryTarget = runner.runnerBinaryTarget;
 export const executeNativeSession = runner.executeNativeSession;
 export const applyNativeSessionGoalControl =
   runner.applyNativeSessionGoalControl;
@@ -155,7 +160,10 @@ export const bundledRemoteProviderPackManifestPath = runner.bundledRemoteProvide
 export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
 
 export const externalOperationDigest = runner.externalOperationDigest;
+export const digestPaperclipSemanticContent = runner.digestPaperclipSemanticContent;
 export const CONFIGURED_ENVIRONMENT_KEYS = runner.CONFIGURED_ENVIRONMENT_KEYS;
 export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = runner.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
 export const configuredEnvironmentProjection = runner.configuredEnvironmentProjection;
 export const configuredEnvironment = runner.configuredEnvironment;
+
+export const probeNativeRunnerEnvironment = runner.probeNativeRunnerEnvironment;

@@ -1,4 +1,5 @@
 import { type CopilotToolEvidence } from "./copilot-tool-evidence.js";
+import { resolveCompletionContinuation } from "../completion-continuation.js";
 import { isProviderMode } from "../../contracts/provider-mode.js";
 import { acpxProfileActivity, type AcpxActivityAdapter, type AcpxToolEvidence } from "./profile-activity.js";
 
@@ -1132,7 +1133,16 @@ class CodexAcpxSession implements HarnessSession {
     }
     const tool = canonicalRunnerToolName(call.tool);
     if (tool === PRP_COMPLETION_TOOL_NAME || tool === PRP_BLOCK_TOOL_NAME) {
-      const validation = validatePrpStructuredRunResult(call.arguments);
+      const completionInput = await resolveCompletionContinuation(call.arguments, this.#input.runId,
+        this.#dynamicToolHandler ? () => this.#dynamicToolHandler!({
+          tool: "get_task_context", callId: `${call.callId}:continuation`,
+          providerSessionId: this.#host.identity().agentSessionId, turnId, arguments: {}, signal: call.signal,
+        }) : undefined);
+      this.#assertOpen();
+      if (this.#activeTurnId !== turnId || this.#pendingTerminal || call.signal.aborted) {
+        throw new Error("The turn ended while resolving completion");
+      }
+      const validation = validatePrpStructuredRunResult(completionInput);
       if (!validation.ok) throw new Error("Invalid semantic run result");
       const blocked = validation.result.reportedWorkDisposition === "blocked";
       if (

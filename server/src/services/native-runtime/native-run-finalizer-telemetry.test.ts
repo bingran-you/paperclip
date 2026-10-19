@@ -1,3 +1,4 @@
+import { enableRunFailureReporting } from "../../__tests__/helpers/run-failure-reporting.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -917,3 +918,6 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     expect(agentTaskRunCalls(callsBefore)).toHaveLength(1);
   });
 });
+
+
+enableRunFailureReporting();

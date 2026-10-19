@@ -100,7 +100,7 @@ export const GITHUB_BOT_TOOLS = [
     name: "submit_review",
     title: "Submit a review assessment",
     description:
-      "Submit a structured assessment for this task's exact PR head. Use begin_review before starting an explicitly requested review. Paperclip validates coverage and score, publishes allowed summary/findings, and computes the Paperclip Review check. Coverage reviewedPaths and omittedPaths name only allowed changed files from read_pull_request(files); describe additional context in the rationale. Follow the schema length limits. Incomplete analysis cannot pass. This never formally approves a PR.",
+      "Submit a structured assessment for this task's exact PR head. Use begin_review before starting an explicitly requested review. Paperclip validates coverage and score, publishes allowed summary/findings, and computes the Paperclip Review check. Coverage reviewedPaths and omittedPaths name only allowed changed files from read_pull_request(files); describe additional context in the rationale. Follow the schema length limits. Incomplete analysis cannot pass. This never formally approves a PR. Transient publication failures retry automatically. A received result or failed result with receipt.retryable=true remains queued; do not claim publication yet. After a timeout, repeat the exact call to recover its durable receipt. Do not begin another review or revise the assessment just to retry publication.",
     risk: "write",
     // Share the input contract with server validation so discovery includes every
     // length/array bound; hidden limits caused real agents to abandon publication.
@@ -241,7 +241,9 @@ export async function githubBotToolsForSession(
 ): Promise<ToolGatewayDescriptor[]> {
   if (!session.agentId || !session.issueId || !session.runId) return [];
   const rows = await db
-    .select({
+    // A PR task can also own inline finding threads. They share one endpoint
+    // and catalog, so discovery must not emit a tool once per conversation.
+    .selectDistinct({
       endpoint: chatEndpoints,
       connection: toolConnections,
       entry: toolCatalogEntries,

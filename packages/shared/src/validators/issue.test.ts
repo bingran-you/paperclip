@@ -652,6 +652,12 @@ describe("issue validators", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it.each(["preconfigured", "isolated"])("rejects task-level homeMode %s on create and update", homeMode => {
+    const overrides = { assigneeAdapterOverrides: { adapterConfig: { homeMode } } };
+    expect(createIssueSchema.safeParse({ title: "Task", ...overrides }).success).toBe(false);
+    expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
+  });
+
   it("rejects retired model profiles in agent runtime config", () => {
     const parsed = createAgentSchema.safeParse({
       name: "Coder",

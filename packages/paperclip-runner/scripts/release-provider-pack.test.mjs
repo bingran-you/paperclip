@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import test from "node:test";
 import profiles from "../acpx-profiles.json" with { type: "json" };
 import distributions from "../cursor-distributions.json" with { type: "json" };
 import { verifyReleaseProviderPack } from "./release-provider-pack.mjs";
+import { existingReleaseProviderPack } from "./stage-release-runner-binaries.mjs";
 
 const revision = "a".repeat(40);
 const digest = "sha256:" + "b".repeat(64);
@@ -47,18 +48,18 @@ test("rejects omitted Cursor, conflicting legacy inventory, stale sources and fo
 });
 
 test("release assembly rejects rehashed stale or missing packs before staging any files", () => {
-  const root = mkdtempSync(join(tmpdir(), "release-provider-pack-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "release-provider-pack-")));
   const source = dirname(dirname(fileURLToPath(import.meta.url)));
   try {
     // Run the actual assembler in an isolated layout so it cannot overwrite built artifacts.
-    for (const file of ["scripts/stage-release-runner-binaries.mjs", "scripts/release-provider-pack.mjs", "src/live/runner-binary.ts", "acpx-profiles.json", "cursor-distributions.json"]) {
+    for (const file of ["scripts/stage-release-runner-binaries.mjs", "scripts/release-provider-pack.mjs", "src/live/runner-binary.ts", "acpx-profiles.json", "cursor-distributions.json", "release-runner-targets.json"]) {
       mkdirSync(dirname(join(root, file)), { recursive: true }); cpSync(join(source, file), join(root, file));
     }
     const platforms = {};
-    for (const target of ["darwin-arm64", "darwin-x64", "linux-x64"]) {
+    for (const target of ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"]) {
       const bytes = Buffer.alloc(64);
-      if (target === "linux-x64") {
-        bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); bytes.writeUInt16LE(62, 18);
+      if (target.startsWith("linux-")) {
+        bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); bytes.writeUInt16LE(target === "linux-x64" ? 62 : 183, 18);
       } else {
         bytes.writeUInt32LE(0xfeedfacf, 0); bytes.writeUInt32LE(target === "darwin-arm64" ? 0x0100000c : 0x01000007, 4);
       }
@@ -75,5 +76,21 @@ test("release assembly rejects rehashed stale or missing packs before staging an
       assert.equal(existsSync(join(root, "dist")), false);
       delete manifest.remoteProviderPack;
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("daemon-only assembly retains an existing same-source Linux provider-pack identity", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "release-provider-retained-")));
+  try {
+    assert.equal(existingReleaseProviderPack(root, revision), undefined);
+    const file = join(root, "dist/remote-provider-packs/linux-x64/provider-pack.json");
+    mkdirSync(dirname(file), { recursive: true });
+    const pack = seal(fixture()); writeFileSync(file, JSON.stringify(pack));
+    assert.deepEqual(existingReleaseProviderPack(root, revision), pack);
+    assert.throws(() => existingReleaseProviderPack(root, "c".repeat(40)), /release source/);
+    const wrongTarget = fixture(); wrongTarget.target = { platform: "darwin", architecture: "arm64" };
+    writeFileSync(file, JSON.stringify(seal(wrongTarget)));
+    assert.throws(() => existingReleaseProviderPack(root, revision), /Linux x64 target/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
 import { describe, expect, it } from "vitest";
@@ -101,6 +102,25 @@ describe("NativeExecutionInputV1", () => {
       }],
       mcp: { assignmentSetId: "sha256:test", digest, bindingId: "native-mcp:run-1" },
     } as const;
+    const preconfigured = {
+      ...input, schema: "paperclip.native-execution-input.v7", homeMode: "preconfigured",
+      provider: { kind: "codex", model: null, approvalPolicy: "never" },
+      executionMode: "default", planningContext: null,
+      runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+    };
+    expect(parseNativeExecutionInput(preconfigured)).toMatchObject({ homeMode: "preconfigured" });
+    for (const agent of ["claude", "codex"]) {
+      expect(() => parseNativeExecutionInput({ ...preconfigured, executionMode: "plan",
+        provider: { kind: "acpx", agent, permissionMode: "approve-all" } })).toThrow("preconfigured ACPX read-only execution is not supported");
+    }
+    for (const permissionMode of ["approve-reads", "approve-paperclip", "deny-all"]) {
+      expect(() => parseNativeExecutionInput({ ...preconfigured, provider: { kind: "acpx", agent: "codex", permissionMode } })).toThrow("requires ACPX approve-all");
+    }
+    expect(() => parseNativeExecutionInput({ ...preconfigured, provider: { kind: "acpx", agent: "codex", permissionMode: "approve-all" } })).toThrow("cannot protect Runner state");
+    expect(buildNativeModelEnvelope(parseNativeExecutionInput(preconfigured)).schema).toBe("paperclip.native-model-envelope.v3");
+    expect(() => parseNativeExecutionInput({ ...preconfigured, homeMode: "other" })).toThrow("homeMode");
+    expect(() => parseNativeExecutionInput({ ...preconfigured, provider: { kind: "opencode", model: "provider/model", permissionMode: "allow" } })).toThrow("supports native Codex");
+    expect(() => parseNativeExecutionInput({ ...preconfigured, schema: "paperclip.native-execution-input.v5" })).toThrow("homeMode");
     const parsed = parseNativeExecutionInput({
       ...input,
       schema: "paperclip.native-execution-input.v3",
@@ -405,6 +425,16 @@ describe("NativeExecutionInputV1", () => {
       session: { ...input.session, driverKind: "opencode_server" },
       provider,
     })).toThrow("does not match");
+  });
+
+  it("decodes saved Copilot v17 input after the current source declaration advances", () => {
+    const historical = JSON.parse(readFileSync(new URL("../../test/fixtures/copilot-profile-v17-identity.json", import.meta.url), "utf8"));
+    const { permissionPolicy, qualificationStatus: _status, ...currentProfile } = QUALIFIED_ACPX_PROFILES.copilot;
+    const provider = { kind: "acpx", agent: "copilot", model: "explicit-provider-model", permissionPolicy,
+      profile: { ...currentProfile, agentProfileVersion: 17, commandDigest: historical.commandDigest } };
+    const parsed = parseNativeExecutionInput({ ...input, session: { ...input.session, driverKind: "acpx_runtime" }, provider });
+    expect(parsed.provider).toEqual(provider);
+    expect(parseNativeExecutionInput(parsed)).toEqual(parsed);
   });
 
   it.each(Object.values(QUALIFIED_ACPX_PROFILES))(

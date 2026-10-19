@@ -244,6 +244,8 @@ impl AcpxSidecarTransport {
             // The qualified sidecar configures the runner-owned gateway. Keep
             // its credential with the name/URL; unrelated secrets stay excluded.
             "PAPERCLIP_NATIVE_MCP_TOKEN",
+            "PAPERCLIP_NATIVE_MCP_STDIO",
+            "PAPERCLIP_NATIVE_MCP_PROXY",
             "PAPERCLIP_ACPX_BUILTIN_ROOT",
             "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT",
             "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
@@ -278,6 +280,17 @@ impl AcpxSidecarTransport {
             Vec::new()
         };
         keys.extend(pi_keys.iter().map(String::as_str));
+        if std::env::var("PAPERCLIP_RUNNER_HOME_MODE").as_deref() == Ok("preconfigured") {
+            keys.extend_from_slice(&[
+                "PAPERCLIP_RUNNER_HOME_MODE",
+                "ACPX_CLAUDE_INCLUDE_USER_SETTINGS",
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+            ]);
+        }
         keys.extend_from_slice(credential_keys);
         // Pi owns a native distribution copy, including a pending refresh at
         // suspension. Allow its bounded cleanup to settle before group KILL;

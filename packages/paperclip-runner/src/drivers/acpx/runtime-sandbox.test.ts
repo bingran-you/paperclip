@@ -6,6 +6,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  realpath,
   rename,
   rm,
   stat,
@@ -50,6 +51,28 @@ describe("ACPX runtime sandbox", () => {
     expect(keys).not.toContain("HOST_SECRET");
     expect(sandbox.launchEnvironment).toMatchObject(pages);
     for (const value of Object.values(pages)) expect(config).not.toContain(value);
+  });
+
+  it.each(["claude", "codex"] as const)("uses existing %s home without creating or changing config", async (agent) => {
+    const fixture = await sandboxFixture(agent);
+    const home = join(temporaryDirectories.at(-1)!, "user-home");
+    await mkdir(home, { mode: 0o755 });
+    const providerHome = join(home, agent === "claude" ? ".claude" : ".codex");
+    await mkdir(providerHome);
+    const config = join(providerHome, agent === "claude" ? "settings.json" : "config.toml");
+    const contents = agent === "claude" ? '{"permissions":{"ask":["Bash"]}}' : 'approval_policy = "never"';
+    await writeFile(config, contents);
+    const environment = { HOME: home, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured", PATH: "/usr/bin:/bin" };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sandbox = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent, environment });
+      expect(sandbox.homeDirectory).toBe(await realpath(home));
+      expect(sandbox.agentHomeDirectory).toBe(await realpath(providerHome));
+      expect(sandbox.launchEnvironment.PAPERCLIP_ACPX_ISOLATED_CONTEXT).toBeUndefined();
+      expect(sandbox.protectedPaths).not.toContain(home);
+      expect(await readFile(config, "utf8")).toBe(contents);
+      expect((await stat(home)).mode & 0o777).toBe(0o755);
+      await expect(stat(join(sandbox.root, "home"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   it("restores Grok permission controls on recovery without importing compatible hooks or credentials", async () => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createPiLaunchSpec } from "./pi-acp-runtime.js";
 import { createCopilotToolEvidence } from "./copilot-tool-evidence.js";
@@ -201,6 +202,59 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime host", () => {
+  it("rejects preconfigured Codex before admission resources or runtime launch", async () => {
+    const fixture = await hostFixture();
+    const openRuntime = vi.fn(), prepareSandbox = vi.fn();
+    await expect(AcpxRuntimeHost.open({ ...fixture.options, agent: "codex", permissionMode: "approve-all",
+      environment: { HOME: fixture.root, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" },
+    }, fixture.dependencies({ openRuntime, prepareSandbox }))).rejects.toThrow("cannot protect Runner state");
+    expect(prepareSandbox).not.toHaveBeenCalled();
+    expect(openRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each(["claude", "codex"] as const)("rejects preconfigured read-only %s before provider admission", async agent => {
+    const fixture = await hostFixture();
+    const openRuntime = vi.fn();
+    await expect(AcpxRuntimeHost.open({ ...fixture.options, agent, permissionMode: "approve-all",
+      providerPolicy: { readOnly: true }, environment: { HOME: fixture.root, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" },
+    }, fixture.dependencies({ openRuntime }))).rejects.toThrow("preconfigured ACPX read-only execution is not supported");
+    expect(openRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each(["approve-reads", "approve-paperclip", "deny-all"] as const)("rejects unqualified preconfigured permission mode %s before admission", async permissionMode => {
+    const fixture = await hostFixture();
+    const openRuntime = vi.fn();
+    await expect(AcpxRuntimeHost.open({ ...fixture.options, permissionMode,
+      environment: { HOME: fixture.root, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" },
+    }, fixture.dependencies({ openRuntime }))).rejects.toThrow("requires ACPX approve-all");
+    expect(openRuntime).not.toHaveBeenCalled();
+  });
+
+  it.each(["claude"] as const)("keeps a stable private bridge namespace without editing %s user MCP configuration", async agent => {
+    const fixture = await hostFixture();
+    const home = join(fixture.root, "user-home");
+    await mkdir(home);
+    const config = join(home, "user-mcp.json");
+    const contents = '{"mcpServers":{"paperclip":{"url":"http://127.0.0.1:3211/user"}}}';
+    await writeFile(config, contents);
+    const model = agent === "claude" ? "claude-sonnet-5" : "gpt-6.1-sol";
+    const names: string[] = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const host = await AcpxRuntimeHost.open({ ...fixture.options, agent, model, permissionMode: "approve-all",
+        environment: { HOME: home, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" },
+        semanticTools: { tools: [], handler: async () => ({}) },
+      }, fixture.dependencies({ openRuntime: async options => {
+        names.push(options.mcpServers[0]!.name);
+        return runtimePort({ getStatus: async () => ({ models: { currentModelId: model } }) });
+      } }));
+      try {
+        expect(names.at(-1)).toMatch(/^paperclip_runner_[a-f0-9]{16}$/);
+        expect(await readFile(config, "utf8")).toBe(contents);
+      } finally { await host.close({ reason: "private namespace verified" }); }
+    }
+    expect(names[1]).toBe(names[0]);
+  });
+
   it.each([undefined, "plan", "ask"] as const)("requires observed Cursor mode %s in the host identity", async selected => {
     const fixture = await hostFixture();
     const mode = selected ?? "agent";
@@ -224,6 +278,31 @@ describe("ACPX runtime host", () => {
     openRuntime.mockClear();
     await expect(AcpxRuntimeHost.open({ ...options, agent: "codex", model: "gpt-5.6-sol", mode: "plan" }, fixture.dependencies({ openRuntime }))).rejects.toThrow(/does not support configurable/);
     expect(openRuntime).not.toHaveBeenCalled();
+  });
+
+  it("shares a preconfigured Claude home across sessions without staging or scrubbing credentials", async () => {
+    const fixture = await hostFixture();
+    const home = join(fixture.root, "user-home");
+    const claudeHome = join(home, ".claude");
+    await mkdir(claudeHome, { recursive: true });
+    const auth = join(claudeHome, ".credentials.json");
+    await writeFile(auth, '{"user_owned":true}');
+    const stageCredential = vi.fn();
+    const options = { ...fixture.options, agent: "claude" as const, model: "claude-sonnet-5", permissionMode: "approve-all" as const,
+      environment: { HOME: home, CLAUDE_CONFIG_DIR: claudeHome, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" } };
+    const opened: AcpxRuntimeHost[] = [];
+    try {
+      for (const normalizedSessionId of ["session-one", "session-two"]) {
+        opened.push(await AcpxRuntimeHost.open({ ...options, normalizedSessionId }, {
+          ...fixture.dependencies({ openRuntime: async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }) }), stageCredential,
+        }));
+      }
+      expect(stageCredential).not.toHaveBeenCalled();
+      expect(await readFile(auth, "utf8")).toBe('{"user_owned":true}');
+      await expect(AcpxRuntimeHost.open({ ...options, normalizedSessionId: "session-one" },
+        fixture.dependencies({ openRuntime: async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }) }))).rejects.toThrow();
+    } finally { await Promise.all(opened.map(host => host.close({ reason: "verified" }))); }
+    expect(await readFile(auth, "utf8")).toBe('{"user_owned":true}');
   });
 
   it.each([
@@ -258,6 +337,28 @@ describe("ACPX runtime host", () => {
       expect(servers[1]).toEqual({ name: "paperclip-assigned", url: "http://127.0.0.1:3211/mcp/gateway",
         bearerToken: "fixture-gateway-token-".repeat(3), runnerOwned: true });
     } finally { await host.close({ reason: "gateway test complete" }); }
+  });
+
+  it.each([false, true])("keeps stdio registration session-local and omits it for readOnly=%s", async readOnly => {
+    const fixture = await hostFixture();
+    const command = join(fixture.root, "desktop-server");
+    await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o555 });
+    const binding = { name: "desktop", command: await realpath(command), args: ["mcp"], env: { HOME: fixture.root },
+      sha256: `sha256:${createHash("sha256").update(await readFile(command)).digest("hex")}`,
+      serialResource: join(fixture.root, "cua.sock") };
+    let servers: AcpxRuntimePortOpenOptions["mcpServers"] = [];
+    const host = await AcpxRuntimeHost.open({ ...fixture.options, agent: "claude", model: "claude-sonnet-5",
+      permissionMode: "approve-reads", providerPolicy: { readOnly },
+      environment: { ...fixture.options.environment, PAPERCLIP_NATIVE_MCP_STDIO: JSON.stringify([binding]), PAPERCLIP_NATIVE_MCP_PROXY: "/verified/runnerd" },
+    }, fixture.dependencies({ openRuntime: async options => {
+      servers = options.mcpServers;
+      return runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) });
+    } }));
+    try {
+      const desktop = servers.find(server => server.name === "desktop");
+      if (readOnly) expect(desktop).toBeUndefined();
+      else expect(desktop).toMatchObject({ name: "desktop", command: "/verified/runnerd", runnerOwned: false, env: {} });
+    } finally { await host.close({ reason: "stdio policy verified" }); }
   });
 
   it.each([

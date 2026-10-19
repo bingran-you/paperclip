@@ -121,6 +121,30 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
+  if (readNonEmptyStringField(configurationIncomplete, "reason") === "shared_realization_unsupported") {
+    if (configurationIncomplete?.holderStale === true) {
+      return {
+        title: "Shared workspace still held",
+        body: "Paperclip stopped before the agent started because another run still holds this task's shared workspace but has produced no output for more than an hour, and this execution environment cannot place concurrent agents in one physical shared folder.",
+        nextAction: "Check whether the other run is still working and stop it if it is stuck, or select an isolated task workspace, then retry the task.",
+        tone: "danger",
+      };
+    }
+    return {
+      title: "Shared workspace unavailable",
+      body: "Paperclip stopped before the agent started because this task allows concurrent agents in a shared workspace that another live run is using, and this execution environment cannot place concurrent agents in one physical shared folder.",
+      nextAction: "Select an isolated task workspace, use a local or SSH environment, or change shared workspace concurrency from `allow` so the task waits for the other run.",
+      tone: "danger",
+    };
+  }
+  if (readNonEmptyStringField(configurationIncomplete, "reason") === "workspace_source_restricted") {
+    return {
+      title: "Workspace source restricted",
+      body: "Paperclip stopped before the agent started because this task's workspace uses a shared project checkout that also holds another task's workspace, and this run cannot read that task. Paperclip does not copy a shared checkout with restricted files.",
+      nextAction: "Push any unpublished work from this task's workspace, then select a new workspace for the task. Alternatively, have an owner grant access to the restricted task. Then retry the task.",
+      tone: "danger",
+    };
+  }
   if (readNonEmptyStringField(configurationIncomplete, "reason") === "ai_connection_unavailable") {
     return {
       title: "AI connection needs attention",

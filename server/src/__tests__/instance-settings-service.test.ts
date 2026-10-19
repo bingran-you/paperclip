@@ -60,6 +60,8 @@ describe("instance settings service", () => {
       enableAgentChat: false,
       enablePublicMcp: false,
       enableOpenAiDot: false,
+      enableMuse: false,
+      enableGrokBot: false,
       enableCombinedInboxTasks: false,
       enableChatConnectors: false,
       enableGitHubReviewBots: false,

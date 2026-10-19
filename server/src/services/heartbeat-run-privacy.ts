@@ -55,6 +55,25 @@ export async function canActorReadHeartbeatRun(
   return decision.allowed;
 }
 
+export async function getHeartbeatRunReadDecisions(
+  db: Db,
+  access: Parameters<typeof canActorReadHeartbeatRun>[1],
+  actor: AuthorizationActor,
+  runs: readonly RunIssueBinding[],
+): Promise<boolean[]> {
+  const decisions = new Map<string, Promise<boolean>>();
+  return Promise.all(runs.map(run => {
+    const binding = { companyId: run.companyId, scopeKind: run.scopeKind, issueId: run.issueId };
+    const key = JSON.stringify([binding.companyId, binding.scopeKind === "company", binding.issueId ?? null]);
+    let decision = decisions.get(key);
+    if (!decision) {
+      decision = canActorReadHeartbeatRun(db, access, actor, binding);
+      decisions.set(key, decision);
+    }
+    return decision;
+  }));
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>

@@ -1,5 +1,6 @@
 export const queryKeys = {
   skillSources: {
+    projects: (companyId: string) => ['project-skill-repositories', companyId] as const,
     preview: (companyId: string, repositoryUrl: string, connectionId: string | null, commitSha: string | null, skillPath: string, filePath: string) => ['skill-sources', companyId, 'preview', repositoryUrl, connectionId, commitSha, skillPath, filePath] as const,
     all: (companyId: string) => ["skill-sources", companyId] as const,
     repositories: (companyId: string) => ["skill-source-repositories", companyId] as const,
@@ -295,6 +296,8 @@ export const queryKeys = {
     dryRun: (id: string) => ["status-cards", "detail", id, "dry-run"] as const,
   },
   issues: {
+    recoveryActions: (id: string, actionId: string | null, runId: string | null) =>
+      ["issues", id, "recovery-actions", actionId, runId] as const,
     list: (companyId: string) => ["issues", companyId] as const,
     mentionPool: (companyId: string) =>
       ["issues", companyId, "mention-pool"] as const,
@@ -743,5 +746,7 @@ export const queryKeys = {
   },
   adapters: {
     all: ["adapters"] as const,
+    availability: (companyId: string | null, environmentId?: string | null) =>
+      ["adapters", "availability", companyId, environmentId ?? null] as const,
   },
 };

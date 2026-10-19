@@ -52,6 +52,7 @@ export async function createAcpxRecoveryBinding(input: {
   mode?: string;
   piThinkingLevel?: PiThinkingLevel;
   providerConfigurationDigest?: string;
+  homeBinding?: Readonly<Record<string, string>>;
   providerPolicy?: { readOnly: boolean; readRoots?: readonly string[]; protectedPaths?: readonly string[] };
 }): Promise<AcpxRecoveryBinding> {
   validateIdentity(input.normalizedSessionId, "normalized session");
@@ -84,6 +85,7 @@ export async function createAcpxRecoveryBinding(input: {
       agentRuntimeVersion: input.profile.agentRuntimeVersion,
       commandDigest: input.profile.commandDigest,
       qualificationModel: input.profile.qualificationModel,
+      ...(input.homeBinding === undefined ? {} : { homeMode: "preconfigured", homeBinding: input.homeBinding }),
       reportedModelId: input.profile.reportedModelId,
       permissionPolicy: input.profile.permissionPolicy,
       ...(input.providerConfigurationDigest === undefined ? {} : { providerConfigurationDigest: input.providerConfigurationDigest }),

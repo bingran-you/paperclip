@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { adapterExecutionTargetEnablesSandboxDuplexBridge } from "@paperclipai/adapter-utils/execution-target";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
@@ -78,6 +79,7 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
   let instructionSave: Record<string, unknown> | null = null;
   const instructionPreparationKey = createHash("sha256").update(JSON.stringify({
     adapterType: agent.adapterType, adapterConfig: agent.adapterConfig, runtimeConfig: agent.runtimeConfig, sessionConfigMetadata,
+    duplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(executionTarget),
     workspace: nativeSessionWorkspaceScope({
       binding: { runId: readRun().id, executionWorkspaceId: persistedExecutionWorkspace?.id ?? readRun().id },
       workspace: executionWorkspace,

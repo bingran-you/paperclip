@@ -1,5 +1,6 @@
 import {
   chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -17,7 +18,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getCACertificates } from "node:tls";
 import { join, resolve } from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
@@ -36,7 +37,14 @@ import {
 } from "./opencode-server-driver.js";
 
 const roots: string[] = [];
-const fixture = resolve("test/fixtures/fake-opencode-server.mjs");
+let fixtureRoot: string | undefined;
+let fixture: string;
+
+beforeAll(async () => {
+  fixtureRoot = await mkdtemp(join(tmpdir(), "paperclip-opencode-fixture-"));
+  fixture = join(fixtureRoot, "fake-opencode-server.mjs");
+  await copyFile(resolve("test/fixtures/fake-opencode-server.mjs"), fixture);
+});
 
 const TURN_TERMINAL_EVENT_TYPES = new Set([
   "turn.completed",
@@ -128,7 +136,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await chmod(fixture, 0o644);
+  if (fixtureRoot) await rm(fixtureRoot, { recursive: true, force: true });
 });
 
 describe("OpenCodeServerDriver", () => {
@@ -2112,6 +2120,41 @@ describe("OpenCodeServerDriver", () => {
     await session.close({ reason: "test" });
   });
 
+  it.each([true, false])("resolves an omitted continuation through the real OpenCode MCP boundary only with a saved monitor: %s", async eligible => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-monitor-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-monitor-workspace-"));
+    roots.push(root, workspace);
+    const continuation = { kind: "monitor", summary: "Wait for the saved task monitor.", idempotencyKey: "task-monitor:saved" };
+    const reads: string[] = [];
+    const accepted: unknown[] = [];
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731", runtimeDirectory: root, command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      dynamicToolHandler: async call => {
+        reads.push(call.tool);
+        return { run: { id: "monitor-default" }, activeTask: { executionRunId: "monitor-default" },
+          completionContinuation: eligible ? continuation : null };
+      },
+      completionFeedback: async result => { accepted.push(result); return "Accepted monitor wait."; },
+    });
+    const session = await driver.openSession({ runId: "monitor-default", normalizedSessionId: "monitor-default", workingDirectory: workspace });
+    try {
+      await session.startTurn({ message: { role: "user", text: "monitor-default" } });
+      const events = await collectTurnEvents(session.events());
+      expect(reads).toEqual(["get_task_context"]);
+      if (eligible) {
+        expect(accepted).toMatchObject([{ reportedWorkDisposition: "yielded", continuation }]);
+        expect(events.filter(event => event.eventType === "run.result.proposed")).toHaveLength(1);
+        expect((await session.snapshot()).semanticResult?.result).toMatchObject({ continuation });
+      } else {
+        expect(accepted).toEqual([]);
+        expect(events.filter(event => event.eventType === "run.result.proposed")).toEqual([]);
+        expect((await session.snapshot()).semanticResult).toBeNull();
+      }
+    } finally { await session.close({ reason: "monitor default test complete" }); }
+  });
+
   it("normalizes a structured block result", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-driver-"));
@@ -2438,7 +2481,7 @@ describe("OpenCodeServerDriver", () => {
     }
   });
 
-  it("rejects malformed and oversized SSE frames", async () => {
+  it("rejects malformed SSE frames", async () => {
     const stream = (value: string) =>
       new ReadableStream<Uint8Array>({
         start(controller) {
@@ -2454,9 +2497,58 @@ describe("OpenCodeServerDriver", () => {
       }
     };
     await expect(consume("data: {bad json}\n\n")).rejects.toThrow();
-    await expect(consume(`data: ${"x".repeat(1_048_577)}`)).rejects.toThrow(
-      "payload limit",
-    );
+  });
+
+  it("keeps the turn and the tool outcome when OpenCode sends an event above the payload limit", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-oversized-sse-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-oversized-sse-workspace-"));
+    roots.push(root, workspace);
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    let streamOpened!: () => void;
+    const opened = new Promise<void>(resolve => { streamOpened = resolve; });
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731", runtimeDirectory: root, command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      fetch: async (input, init) => String(input).endsWith("/event")
+        ? new Response(new ReadableStream<Uint8Array>({ start(controller) { stream = controller; streamOpened(); } }), { headers: { "Content-Type": "text/event-stream" } })
+        : fetch(input, init),
+    });
+    const session = await driver.openSession({ runId: "oversized-sse", normalizedSessionId: "oversized-sse", workingDirectory: workspace });
+    try {
+      const sessionID = session.ids().providerSessionId;
+      const events = collectTurnEvents(session.events());
+      await session.startTurn({ message: { role: "user", text: "run the full suite" } });
+      await opened;
+      const tail = "\nTests: 1 failed, 812 passed\nexit status 1";
+      const output = "test output line\n".repeat(150_000) + tail;
+      const send = (value: unknown) => {
+        const bytes = new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`);
+        for (let index = 0; index < bytes.length; index += 64 * 1024)
+          stream.enqueue(bytes.subarray(index, index + 64 * 1024));
+      };
+      send({ type: "message.updated", properties: { info: { id: "msg_oversized", role: "assistant", sessionID } } });
+      send({ type: "message.part.updated", properties: { part: {
+        id: "prt_oversized", messageID: "msg_oversized", sessionID, type: "tool", callID: "call_oversized", tool: "bash",
+        state: { status: "completed", input: { command: "pnpm test" }, output, title: "pnpm test", metadata: { exit: 1, output }, time: { start: 1, end: 2 } },
+      } } });
+      send({ type: "session.idle", properties: { sessionID } });
+      const observed = await events;
+      expect(observed.at(-1)?.eventType).toBe("turn.completed");
+      const diagnostics = observed.filter(event => event.eventType === "harness.diagnostic");
+      expect(diagnostics.map(event => event.payload.code)).toEqual(["opencode_sse_event_compacted"]);
+      const tool = observed.find(event => event.eventType === "tool.execution.completed" && event.payload.executionId === "prt_oversized");
+      expect(tool?.payload).toMatchObject({
+        name: "bash",
+        status: "completed",
+        outputBytes: Buffer.byteLength(output),
+        outputTruncated: true,
+        outputDigest: null,
+      });
+      expect(String(tool?.payload.output).endsWith(tail)).toBe(true);
+    } finally {
+      await session.close({ reason: "test complete" });
+    }
   });
 
   it("restarts OpenCode when session startup fails transiently", async () => {

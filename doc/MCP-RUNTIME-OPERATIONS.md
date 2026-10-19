@@ -36,6 +36,18 @@ delivery path. Managed gateway discovery excludes historical native assignments.
 Their stored rows remain available for existing runs. Explicit company gateways
 continue to use their configured scopes.
 
+## Client-side tool-call deadline
+
+The gateway bounds each provider call, but the agent's MCP client also needs a
+bound. Without one, a gateway request that never answers holds the agent turn
+until the adapter execution timeout ends the run. Claude's default MCP tool
+timeout is far longer than a run, and ACP `mcpServers` entries have no
+per-server timeout field. So when an ACP Claude run receives runtime MCP
+servers, the ACPX engine sets `MCP_TOOL_TIMEOUT` to 15 minutes. A call that
+passes this deadline returns an MCP error to the model, and the turn
+continues. An `MCP_TOOL_TIMEOUT` value in the adapter `env` configuration
+takes priority.
+
 ## Metrics
 
 The board runtime health API summarizes one-hour event windows plus current durable slot state:
@@ -163,6 +175,19 @@ curl -fsS -X PATCH \
 
 Recovery is complete when stuck-slot alerts clear, timeout/error rates return below threshold, the connection is healthy or intentionally disabled, and audit events show no new restart suppression or capacity deferrals.
 
+### Catalog publication
+
+Discovery keeps the last descriptor when pages repeat a tool name. Catalog rows
+are written in transactions of at most 500 tools. Refresh preserves existing row
+IDs, first-seen timestamps, operator-disabled actions, and unchanged pending
+reviews. Publication locks the application before the connection, as setup
+finalization and removal do. Provider discovery runs before these locks.
+
+Each completed chunk remains committed if a later chunk fails. Default-profile
+synchronization runs in a separate transaction after catalog publication. A
+failure there rolls back the profile changes without removing discovered tools.
+Retry the catalog refresh after correcting the failure.
+
 ## Verification Coverage
 
 Automated coverage includes:
@@ -170,3 +195,4 @@ Automated coverage includes:
 - A synthetic degraded runtime-health scenario in `server/src/__tests__/tool-access-service.test.ts` that creates a stale running slot, degraded connection, timeout event, capacity deferral, and restart suppression.
 - A durable audit-write failure scenario in `server/src/__tests__/tool-access-service.test.ts` that verifies `mcp_runtime_audit_write_failures` fires from the counter path.
 - A gateway runtime recovery scenario in `server/src/__tests__/tool-gateway.test.ts` that recovers a stuck local stdio slot before reuse.
+- PostgreSQL catalog publication tests in `server/src/__tests__/tool-catalog-publication.test.ts` cover 250 and 2,500 tools, overlapping pages, preserved choices, partial failure, and publication lock contention.

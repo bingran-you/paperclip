@@ -1,3 +1,4 @@
+import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -296,7 +297,9 @@ export const issueExecutionWorkspaceSettingsSchema = z
 
 export const issueAssigneeAdapterOverridesSchema = z
   .object({
-    adapterConfig: z.record(z.string(), z.unknown()).optional(),
+    adapterConfig: z.record(z.string(), z.unknown())
+      .refine(config => !Object.prototype.hasOwnProperty.call(config, "homeMode"), "homeMode must be set by an operator on the agent, not on a task")
+      .optional(),
     useProjectWorkspace: z.boolean().optional(),
   })
   .strict();
@@ -556,10 +559,29 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+export const resumeWorkspaceFinalizationSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  ownerToken: z.string().guid(),
+  controllerAndCopybackStopped: z.literal(true),
+  stopEvidence: z.string().trim().min(20).max(12000),
+}).strict();
+
 export const retryWorkspaceExportSchema = z.object({
   actionId: z.string().guid(),
   runId: z.string().guid(),
   repairNote: z.string().trim().min(20).max(12000),
+}).strict();
+
+export const reconstructWorkspaceSchema = z.object({
+  actionId: z.string().guid(),
+  runId: z.string().guid(),
+  expectedStatusVersion: z.number().int().nonnegative(),
+  attachmentIds: z.array(z.string().guid()).min(1).max(20).refine(ids => new Set(ids).size === ids.length),
+  missingWork: z.string().trim().min(20).max(12000),
+  actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
+  outcomeEvidence: z.string().trim().min(20).max(12000),
+  acknowledgeLostWork: z.literal(true),
 }).strict();
 
 export const resolveIssueRecoveryActionSchema = z
@@ -737,6 +759,7 @@ const createIssueBaseSchema = z.object({
     .enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES)
     .optional()
     .nullable(),
+  workspaceSelection: taskWorkspaceSelectionSchema.optional(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema
     .optional()
     .nullable(),
@@ -884,6 +907,7 @@ const issueCommentAttachmentIdsSchema = z
 
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
+    workspaceSelection: true,
     createdByUserId: true,
     responsibleUserId: true,
     watchdog: true,

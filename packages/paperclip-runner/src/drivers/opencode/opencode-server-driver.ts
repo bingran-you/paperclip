@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { resolveCompletionContinuation } from "../completion-continuation.js";
+import { createHash, randomBytes } from "node:crypto";
 import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import {
@@ -20,6 +21,8 @@ import { pipeline } from "node:stream/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
+import { annotateOmittedProviderText, parseOpenCodeSseFrames } from "./sse-frames.js";
+import { githubCredentialEnvironment } from "../../github-credential-environment.js";
 
 import {
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -494,6 +497,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   }> = [];
   readonly #messageUsageFingerprints = new Map<string, string>();
   readonly #workspaceChangesByTurn = new Map<string, Record<string, unknown>>();
+  #reportedSseCompaction = false;
   readonly #emittedFileReferences = new Set<string>();
   readonly #pendingRuntimeRequests = new Map<
     string,
@@ -1037,7 +1041,15 @@ class OpenCodeHarnessSession implements HarnessSession {
       try {
         if (this.#closed || this.#completionSettlement)
           throw new Error("A completion is already settling or the session is closed");
-        const validation = validatePrpStructuredRunResult(call.arguments);
+        this.#completionSettlement = new Promise<void>(resolve => { settle = resolve; });
+        const completionInput = await resolveCompletionContinuation(call.arguments, this.#runId,
+          this.#dynamicToolHandler ? () => this.#dynamicToolHandler!({
+            tool: "get_task_context", callId: `${call.callId}:continuation`,
+            threadId: this.#providerSessionId, turnId, arguments: {},
+          }) : undefined);
+        if (this.#closed || this.#activeTurnId !== turnId)
+          throw new Error("The turn ended while resolving completion");
+        const validation = validatePrpStructuredRunResult(completionInput);
         if (!validation.ok) throw new Error("Invalid semantic result");
         if (
           (tool === PRP_BLOCK_TOOL_NAME &&
@@ -1066,7 +1078,6 @@ class OpenCodeHarnessSession implements HarnessSession {
         const fingerprint = canonicalJson(validation.result);
         if (this.#resultFingerprint && this.#resultFingerprint !== fingerprint)
           throw new Error("A different semantic result was already committed");
-        this.#completionSettlement = new Promise<void>(resolve => { settle = resolve; });
         // Wait for the bound controller before committing or resolving the
         // provider call. A rejection remains repairable in this same turn.
         const feedback = this.#completionFeedback
@@ -1359,8 +1370,31 @@ class OpenCodeHarnessSession implements HarnessSession {
             reason: "Opened the OpenCode server-sent event stream",
           });
         }
-        for await (const frame of parseSseFrames(response.body)) {
+        for await (const frame of parseOpenCodeSseFrames(response.body)) {
           if (this.#closed) return;
+          const compaction = frame.compaction;
+          if (compaction?.omitted) {
+            // Even the compacted structure exceeded its bound. Report the
+            // frame instead of ending the stream or dropping it silently.
+            this.#emit("harness.diagnostic", {
+              code: "opencode_sse_event_omitted",
+              message: `OpenCode sent a ${compaction.frameChars}-character event that could not be retained within the payload bound.`,
+              providerEventType: compaction.eventType,
+              frameChars: compaction.frameChars,
+            });
+            continue;
+          }
+          if (compaction && !this.#reportedSseCompaction) {
+            this.#reportedSseCompaction = true;
+            this.#emit("harness.diagnostic", {
+              code: "opencode_sse_event_compacted",
+              message: `OpenCode sent a ${compaction.frameChars}-character event. Long strings were shortened to keep the event within the payload bound.`,
+              providerEventType: compaction.eventType,
+              frameChars: compaction.frameChars,
+              truncatedStrings: compaction.truncatedStrings,
+              omittedChars: compaction.omittedChars,
+            });
+          }
           const frameId =
             this.#runtime.trace?.frame({
               direction: "provider_to_client",
@@ -1371,22 +1405,26 @@ class OpenCodeHarnessSession implements HarnessSession {
           let event: unknown;
           try {
             event = JSON.parse(frame.data);
+            if (compaction) annotateOmittedProviderText(event, compaction);
             if (frameId) {
               this.#runtime.trace?.interpretation({
                 frameId,
                 stage: "typescript_opencode_sse_parse",
-                ruleId: "opencode.sse.json",
+                ruleId: compaction ? "opencode.sse.compacted_json" : "opencode.sse.json",
                 disposition: "mapped",
                 fieldMappings: [
                   {
                     inputPath: "$raw.data",
                     outputPath: "$providerEvent",
                     action: "normalized",
-                    reason:
-                      "Decoded the exact SSE data payload as an OpenCode event",
+                    reason: compaction
+                      ? "Decoded the compacted SSE data payload as an OpenCode event"
+                      : "Decoded the exact SSE data payload as an OpenCode event",
                   },
                 ],
-                reason: "OpenCode SSE frame parsed as JSON",
+                reason: compaction
+                  ? `OpenCode SSE frame of ${compaction.frameChars} characters parsed as JSON after ${compaction.truncatedStrings} long strings were shortened (${compaction.omittedChars} characters omitted)`
+                  : "OpenCode SSE frame parsed as JSON",
               });
             }
           } catch (error) {
@@ -1486,7 +1524,11 @@ class OpenCodeHarnessSession implements HarnessSession {
     const type = text(event.type);
     // Id-less deltas are additive: two identical chunks can be legitimate
     // adjacent tokens. Content deduplication would silently lose the second.
-    const eventId = text(event.id) || (type === "message.part.delta" ? null : canonicalJson(value));
+    // Key id-less events by digest: a retained canonical copy of each recent
+    // event would hold up to 10,000 large tool payloads in memory.
+    const eventId = text(event.id) || (type === "message.part.delta"
+      ? null
+      : `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`);
     if (eventId !== null && this.#seenProviderEvents.has(eventId)) return;
     if (eventId !== null) this.#seenProviderEvents.add(eventId);
     if (this.#seenProviderEvents.size > 10_000)
@@ -2352,7 +2394,7 @@ async function startRuntime(input: {
       { mode: 0o600 },
     );
     const environment = sanitizedEnvironment(
-      input.options.environment ?? process.env,
+      input.options.environment,
       {
         HOME: isolatedHome,
         XDG_CONFIG_HOME: configHome,
@@ -2829,41 +2871,19 @@ async function reservePort(): Promise<number> {
   return port;
 }
 
-async function* parseSseFrames(
-  stream: ReadableStream<Uint8Array>,
-): AsyncIterable<{ raw: string; data: string }> {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    if (buffer.length > 1_048_576)
-      throw new Error("OpenCode SSE event exceeded the retained payload limit");
-    let boundary: RegExpExecArray | null;
-    while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
-      const rawFrame = buffer.slice(0, boundary.index);
-      const raw = buffer.slice(0, boundary.index + boundary[0].length);
-      const frame = rawFrame.replaceAll("\r", "");
-      buffer = buffer.slice(boundary.index + boundary[0].length);
-      const data = frame
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (!data || data === "[DONE]") continue;
-      yield { raw, data };
-    }
-  }
-}
-
 async function* parseSse(
   stream: ReadableStream<Uint8Array>,
 ): AsyncIterable<unknown> {
-  for await (const frame of parseSseFrames(stream))
-    yield JSON.parse(frame.data);
+  for await (const frame of parseOpenCodeSseFrames(stream)) {
+    if (frame.compaction?.omitted) continue;
+    const event = JSON.parse(frame.data) as unknown;
+    if (frame.compaction) annotateOmittedProviderText(event, frame.compaction);
+    yield event;
+  }
 }
 
 function sanitizedEnvironment(
-  source: NodeJS.ProcessEnv,
+  source: NodeJS.ProcessEnv | undefined,
   overrides: Record<string, string>,
 ): NodeJS.ProcessEnv {
   const allowed = [
@@ -2882,9 +2902,10 @@ function sanitizedEnvironment(
     "OPENROUTER_API_KEY",
   ];
   const result: NodeJS.ProcessEnv = {};
+  const candidate = source ?? process.env;
   for (const key of allowed)
-    if (source[key] !== undefined) result[key] = source[key];
-  return { ...result, ...overrides };
+    if (candidate[key] !== undefined) result[key] = candidate[key];
+  return { ...result, ...githubCredentialEnvironment(source ?? {}), ...overrides };
 }
 
 function sanitizedEnvironmentKeys(): string[] {

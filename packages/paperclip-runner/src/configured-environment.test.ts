@@ -96,4 +96,21 @@ describe("configured environment authority", () => {
     expect(createSanitizedAcpxSpawnInput(source, "codex").env).toMatchObject(pages);
     expect(createCapabilityRunnerdProviderEnvironment({ provider: "opencode", options: { environment: source }, identity, codexHome: "/isolated/home", runtimeContextPath: "/isolated/context", hasRuntimeContext: false })).toMatchObject(pages);
   });
+
+  it("does not inherit an ambient GitHub broker into OpenCode", () => {
+    vi.stubEnv("PAPERCLIP_GITHUB_BROKER_TOKEN", "ambient-capability");
+    vi.stubEnv("PAPERCLIP_GITHUB_BROKER_URL", "http://ambient.invalid");
+    vi.stubEnv("GH_TOKEN", "ambient-github-token");
+    try {
+      for (const environment of [undefined, {}]) {
+        const prepared = createCapabilityRunnerdProviderEnvironment({
+          provider: "opencode", options: { environment }, identity,
+          codexHome: "/isolated/home", runtimeContextPath: "/isolated/context", hasRuntimeContext: false,
+        });
+        expect(prepared.PAPERCLIP_GITHUB_BROKER_TOKEN).toBeUndefined();
+        expect(prepared.PAPERCLIP_GITHUB_BROKER_URL).toBeUndefined();
+        expect(prepared.GH_TOKEN).toBeUndefined();
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
 });

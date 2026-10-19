@@ -46,6 +46,96 @@ const identity: DurableRecoveryIdentity = {
 const expectedRunnerVersion = "0.3.0";
 const expectedRunnerDigest = `sha256:${"a".repeat(64)}`;
 
+it("commits credential updates before ACK and preserves replay identity", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-credential-update-"));
+  let release!: () => void;
+  const barrier = new Promise<void>(resolveCommit => { release = resolveCommit; });
+  const commits = vi.fn(async () => barrier);
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
+    expectedRunnerVersion, expectedRunnerDigest, onCommittedEvent: commits });
+  try {
+    await core.start();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    const frame = semanticInputEvent();
+    const event = frame.payload as Record<string, unknown>;
+    event.sourceEventId = "credential-update-1";
+    event.eventType = "auth.credentials.updated";
+    event.payload = { schema: "paperclip.auth.credentials.updated.v1", provider: "codex",
+      bindingId: "harness-auth", revision: 1, detection: "credential_store" };
+    sendSecure(client, frame);
+    await vi.waitFor(() => expect(commits).toHaveBeenCalledTimes(1));
+    expect(core.store.state.ackedSourceSeq).toBe(0);
+    release();
+    const ack = (await receiveSecure(client))!;
+    expect(ack.kind).toBe("ack");
+    expect(core.store.state.ackedSourceSeq).toBe(1);
+    expect(commits).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: "auth.credentials.updated", payload: event.payload,
+    }));
+    sendSecure(client, frame);
+    expect((await receiveSecure(client))!.kind).toBe("ack");
+    expect(core.store.state.committedEvents).toHaveLength(1);
+    expect(core.store.state.committedEvents[0].deliveryCount).toBe(2);
+    expect(core.store.state.committedEvents[0].logicalEffectCount).toBe(1);
+    client.socket.destroy();
+  } finally {
+    release();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it.each(["success", "integrity_failure"] as const)("ignores a replaced connection's late credential commit %s", async outcome => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-credential-reconnect-"));
+  let release!: () => void;
+  const barrier = new Promise<void>(resolveCommit => { release = resolveCommit; });
+  let first = true;
+  const commits = vi.fn(async () => {
+    if (!first) return;
+    first = false;
+    await barrier;
+    if (outcome === "integrity_failure") throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+  });
+  const onProtocolIntegrityError = vi.fn();
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
+    expectedRunnerVersion, expectedRunnerDigest, onCommittedEvent: commits, onProtocolIntegrityError });
+  const frame = (seq: number) => {
+    const envelope = semanticInputEvent(seq);
+    const event = envelope.payload as Record<string, unknown>;
+    event.sourceEventId = `credential-reconnect-${seq}`;
+    event.eventType = "auth.credentials.updated";
+    event.payload = { schema: "paperclip.auth.credentials.updated.v1", provider: "codex",
+      bindingId: "harness-auth", revision: seq, detection: "credential_store" };
+    return envelope;
+  };
+  try {
+    await core.start();
+    const old = (await authenticate(core, core.issueBootstrapTicket()))!;
+    sendSecure(old, frame(1));
+    await vi.waitFor(() => expect(commits).toHaveBeenCalledTimes(1));
+    const replacement = (await authenticate(core, old.leaseToken!))!;
+    for (const seq of [1, 2]) {
+      sendSecure(replacement, frame(seq));
+      expect(await receiveSecure(replacement)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: seq } });
+    }
+    release();
+    await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    expect(core.store.state.ackedSourceSeq).toBe(2);
+    expect(core.store.state.committedEvents.map(event => event.sourceSeq)).toEqual([1, 2]);
+    expect(onProtocolIntegrityError).not.toHaveBeenCalled();
+    sendSecure(replacement, frame(3));
+    expect(await receiveSecure(replacement)).toMatchObject({ kind: "ack", payload: { ackedSourceSeq: 3 } });
+    const saved = JSON.parse(readFileSync(core.store.path, "utf8"));
+    expect(saved.ackedSourceSeq).toBe(3);
+    expect(saved.committedEvents.map((event: { sourceSeq: number }) => event.sourceSeq)).toEqual([1, 2, 3]);
+    replacement.socket.destroy();
+  } finally {
+    release();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function renewalRequest(client: AuthenticatedClient, expiresAt: number): Record<string, unknown> {
   return {
     protocol: "paperclip.runner", version: client.welcome.version,
@@ -107,6 +197,42 @@ it("renews one authenticated connection for three weeks without replacing its au
     } finally { await restored.stop(); }
   } finally {
     clock.mockRestore();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it("reports how long the authenticated Runner has been disconnected", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-disconnect-age-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  try {
+    await core.start();
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    // An unauthenticated peer closing is not a Runner disconnect.
+    let closeUnauthenticated = () => {};
+    const unauthenticated = core.attachWireConnection({
+      onJson: () => {},
+      onClose: (listener) => {
+        closeUnauthenticated = () => listener({ message: "closed" });
+      },
+      close: () => closeUnauthenticated(),
+      sendJson: () => {},
+    });
+    expect(unauthenticated.isAuthenticated()).toBe(false);
+    closeUnauthenticated();
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    const before = Date.now();
+    client.socket.destroy();
+    await vi.waitFor(() => expect(core.activeRunnerConnectionCount()).toBe(0), { timeout: 1_000 });
+    const after = Date.now();
+    expect(core.runnerDisconnectedForMs(after + 300_000)).toBeGreaterThanOrEqual(300_000);
+    expect(core.runnerDisconnectedForMs(after + 300_000)).toBeLessThanOrEqual(300_000 + after - before);
+    const resumed = (await authenticate(core, client.leaseToken!))!;
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    resumed.socket.destroy();
+  } finally {
     await core.stop();
     rmSync(root, { recursive: true, force: true });
   }
@@ -400,6 +526,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
       ANTHROPIC_BASE_URL: "https://gateway.example",
       PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
       PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
+      PAPERCLIP_NATIVE_MCP_STDIO: "[]",
+      PAPERCLIP_NATIVE_MCP_PROXY: "/runner/paperclip-runnerd",
       DATABASE_URL: "must-not-reach-runnerd",
       PAPERCLIP_API_KEY: "must-not-reach-runnerd",
       NODE_OPTIONS: "--require=/untrusted/bootstrap.cjs",
@@ -435,6 +563,8 @@ it("preserves an explicit OpenCode permission mode at the runner spawn boundary"
     ANTHROPIC_BASE_URL: "https://gateway.example",
     PAPERCLIP_OPENCODE_PERMISSION_MODE: "deny",
     PAPERCLIP_OPENCODE_RUNTIME_DIR: "/runner/opencode",
+    PAPERCLIP_NATIVE_MCP_STDIO: "[]",
+    PAPERCLIP_NATIVE_MCP_PROXY: "/runner/paperclip-runnerd",
   });
   expect(launches[0]!.environment.DATABASE_URL).toBeUndefined();
   expect(launches[0]!.environment.PAPERCLIP_API_KEY).toBeUndefined();

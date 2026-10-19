@@ -14,7 +14,7 @@ type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
 type Prepare = Parameters<ReturnType<typeof createHeartbeatInstructionWorkingCopy>["prepare"]>[0];
 type Copy = NonNullable<Awaited<ReturnType<Input["instructionCopies"]["prepare"]>>>;
 
-function fixture() {
+function fixture(executionTarget: Input["workspace"]["executionTarget"] = null) {
   let run = { id: "current-run", companyId: "company", agentId: "agent", runnerProfileJson: null, status: "queued" } as ReturnType<Input["readRun"]>;
   const copy = { runId: run.id, companyId: run.companyId, agentId: run.agentId,
     localRoot: "/workspace/copy", executionRoot: "/workspace/copy", entryFile: "AGENTS.md",
@@ -35,7 +35,7 @@ function fixture() {
     agent: { id: "agent", companyId: "company", adapterType: "codex_local", adapterConfig: { lifecycleMode: "warm" }, runtimeConfig: {} } as unknown as Input["agent"],
     context,
     session: { taskSession: null, taskSessionForRun: { lastRunId: "previous-run" }, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
-    workspace: { executionTarget: null, executionWorkspace: { cwd: "/workspace" } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
+    workspace: { executionTarget, executionWorkspace: { cwd: "/workspace" } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
     appendRunEvent,
   });
   const prepare: Prepare = { runtimeConfig: { retained: true }, hasInstructionFilesystem: true,
@@ -49,6 +49,30 @@ function fixture() {
 beforeEach(() => { vi.clearAllMocks(); native.claim.mockResolvedValue(null); });
 
 describe("instruction working-copy extraction boundary", () => {
+  it.each(["openai_dot_mcp", "muse_external"])("does not prepare an instruction filesystem for %s", async backend => {
+    const f = fixture();
+    const result = await f.controller.prepare({ ...f.prepare, hasInstructionFilesystem: false,
+      nativeRuntimeResolution: { kind: "native", profile: { backend } } as Prepare["nativeRuntimeResolution"] });
+    expect(result).toEqual(f.prepare.runtimeConfig);
+    expect(f.copies.prepare).not.toHaveBeenCalled();
+    expect(native.reserve).not.toHaveBeenCalled();
+    expect(f.controller.instructionCopy).toBeNull();
+  });
+
+  it("changes instruction preparation identity before claiming a copy when duplex changes", async () => {
+    const keys: (string | undefined)[] = [];
+    for (const enabled of [false, false, true]) {
+      const f = fixture({ kind: "remote", transport: "sandbox", remoteCwd: "/workspace", enableSandboxDuplexBridge: enabled });
+      await f.controller.prepare({ ...f.prepare, nativeRuntimeResolution: {
+        kind: "native", profile: { backend: "opencode_server" },
+      } as Prepare["nativeRuntimeResolution"] });
+      keys.push(f.controller.nativeInstructionWorkingCopy()?.preparationKey);
+    }
+    expect(keys[0]).toBeTypeOf("string");
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).not.toBe(keys[0]);
+  });
+
   it("retains a warm reservation for outer cleanup when subsequent preparation throws", async () => {
     const f = fixture();
     f.copies.prepare.mockRejectedValue(new Error("preparation interrupted"));

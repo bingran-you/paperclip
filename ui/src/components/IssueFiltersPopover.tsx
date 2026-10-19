@@ -108,7 +108,7 @@ export function IssueFiltersPopover({
   labels,
   currentUserId,
   enableExternalObjectFilters = true,
-  enableRoutineVisibilityFilter = false,
+  enableAgentCreatedVisibilityFilter = false,
   buttonVariant = "ghost",
   iconOnly = false,
   creators,
@@ -123,7 +123,7 @@ export function IssueFiltersPopover({
   labels?: LabelOption[];
   currentUserId?: string | null;
   enableExternalObjectFilters?: boolean;
-  enableRoutineVisibilityFilter?: boolean;
+  enableAgentCreatedVisibilityFilter?: boolean;
   buttonVariant?: "ghost" | "outline";
   iconOnly?: boolean;
   creators?: CreatorOption[];
@@ -520,13 +520,13 @@ export function IssueFiltersPopover({
                   />
                   <span className="text-sm">Live runs only</span>
                 </label>
-                {enableRoutineVisibilityFilter ? (
+                {enableAgentCreatedVisibilityFilter ? (
                   <label className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
                     <Checkbox
-                      checked={state.hideRoutineExecutions}
-                      onCheckedChange={(checked) => onChange({ hideRoutineExecutions: checked === true })}
+                      checked={state.showAgentCreatedTasks}
+                      onCheckedChange={(checked) => onChange({ showAgentCreatedTasks: checked === true })}
                     />
-                    <span className="text-sm">Hide routine runs</span>
+                    <span className="text-sm">show agent-created tasks</span>
                   </label>
                 ) : null}
               </div>

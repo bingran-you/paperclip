@@ -530,6 +530,7 @@ export function rebindNativeSessionCheckpoint(input: {
       ("executionMode" in current ? current.executionMode : "default") ||
     !sameProvider(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
+    ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution &&
       "runtimeContext" in current &&
       previousExecution.runtimeContext.aggregateDigest !== current.runtimeContext.aggregateDigest &&

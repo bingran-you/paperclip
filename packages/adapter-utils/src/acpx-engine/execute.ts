@@ -105,9 +105,15 @@ import {
   type AcpRuntimeUsageCost,
 } from "acpx/runtime";
 import {
+  ACP_TOOL_KINDS,
+  ACPX_CLAUDE_MCP_TOOL_TIMEOUT_MS,
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
   ACPX_HANDSHAKE_TIMEOUT_MS,
   ACPX_HANDSHAKE_TRANSPORT_POLL_MS,
+  ACPX_STALLED_TOOL_CHECK_INTERVAL_MS,
+  ACPX_STALLED_TOOL_MARGIN_MS,
+  ACPX_STALLED_TOOL_TIMEOUT_MS,
+  ACPX_TOOL_STALLED_ERROR_CODE,
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
   DEFAULT_ACP_ENGINE_NON_INTERACTIVE_PERMISSIONS,
@@ -388,6 +394,13 @@ export interface AcpxEngineExecutorOptions {
    * to drive the deadline without real time.
    */
   duplexLossCancelDeadlineMs?: number;
+  /**
+   * Overrides {@link resolveStalledToolTimeoutMs} and the interval at which
+   * the stalled-tool watchdog checks pending tool calls. Tests inject small
+   * values to drive the watchdog without real time.
+   */
+  stalledToolTimeoutMs?: number;
+  stalledToolCheckIntervalMs?: number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -1478,6 +1491,28 @@ function normalizeNonInteractivePermissions(config: Record<string, unknown>): "d
     : "deny";
 }
 
+/**
+ * How long a pending tool call may go without any ACP update before the host
+ * ends the turn; 0 disables the watchdog. `stalledToolTimeoutSec` in the
+ * adapter config wins (0 or less disables it). Otherwise only Claude turns are
+ * watched, with a bound kept above Claude's own tool bounds in `env`.
+ */
+export function resolveStalledToolTimeoutMs(
+  config: Record<string, unknown>,
+  env: Record<string, string>,
+  acpxAgent: string,
+): number {
+  const configured = config.stalledToolTimeoutSec;
+  if (typeof configured === "number" && Number.isFinite(configured)) {
+    return configured > 0 ? Math.round(configured * 1000) : 0;
+  }
+  if (acpxAgent !== "claude") return 0;
+  const toolBounds = [env.MCP_TOOL_TIMEOUT, env.BASH_MAX_TIMEOUT_MS]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return Math.max(ACPX_STALLED_TOOL_TIMEOUT_MS, ...toolBounds.map((value) => value + ACPX_STALLED_TOOL_MARGIN_MS));
+}
+
 function normalizeRequestedThinkingEffort(config: Record<string, unknown>): string {
   return (
     asString(config.modelReasoningEffort, "") ||
@@ -2045,6 +2080,11 @@ async function buildRuntime(input: {
   // it reliably sets the model before any turns are run.
   if (requestedModel && acpxAgent === "claude" && !env.ANTHROPIC_MODEL) {
     env.ANTHROPIC_MODEL = requestedModel;
+  }
+  // ACP `mcpServers` entries carry no per-server timeout, so bound Claude's
+  // MCP tool calls through its env setting instead.
+  if (acpxAgent === "claude" && mcpServers.length > 0 && !env.MCP_TOOL_TIMEOUT) {
+    env.MCP_TOOL_TIMEOUT = String(ACPX_CLAUDE_MCP_TOOL_TIMEOUT_MS);
   }
   // Gemini CLI reads GEMINI_MODEL when creating each ACP session. Its ACP
   // implementation supports set_model, but not set_config_option; configure
@@ -3249,6 +3289,46 @@ async function emitRuntimeEvent(
   }
 }
 
+function isPendingAcpTool(tool: { status?: string }): boolean {
+  return tool.status !== "completed" && tool.status !== "failed" && tool.status !== "cancelled";
+}
+
+/**
+ * Activity as of the moment the turn's stop fired, for a stopped turn only.
+ * Separates a turn that went silent long before its deadline from one that
+ * was still working. Reports only ages and closed ACP tool-kind labels.
+ */
+export function summarizeAcpStopActivity(
+  stopRequestedAt: number | null,
+  lastEventBeforeStopAt: number | null,
+  pendingTools: ReadonlyArray<{ kind?: string; firstSeenAt?: number }>,
+): { acpLastEventAgeAtStopMs?: number; acpOldestPendingToolAgeAtStopMs?: number; acpPendingToolKinds?: string } {
+  const summary: ReturnType<typeof summarizeAcpStopActivity> = {};
+  if (pendingTools.length > 0) {
+    const knownKinds: readonly string[] = ACP_TOOL_KINDS;
+    summary.acpPendingToolKinds = uniqueSorted(
+      pendingTools.map((tool) => (tool.kind && knownKinds.includes(tool.kind) ? tool.kind : "unknown")),
+    ).join(",");
+  }
+  if (stopRequestedAt === null) return summary;
+  const age = (since: number) => {
+    const value = stopRequestedAt - since;
+    return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  };
+  if (lastEventBeforeStopAt !== null) {
+    const value = age(lastEventBeforeStopAt);
+    if (value !== undefined) summary.acpLastEventAgeAtStopMs = value;
+  }
+  const pendingSince = pendingTools
+    .map((tool) => tool.firstSeenAt)
+    .filter((at): at is number => typeof at === "number" && at <= stopRequestedAt);
+  if (pendingSince.length > 0) {
+    const value = age(Math.min(...pendingSince));
+    if (value !== undefined) summary.acpOldestPendingToolAgeAtStopMs = value;
+  }
+  return summary;
+}
+
 function resultErrorMessage(result: AcpRuntimeTurnResult): string | null {
   if (result.status !== "failed") return null;
   return result.error.message;
@@ -3927,6 +4007,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const createRuntime = deps.createRuntime ?? createAcpRuntime;
   const now = deps.now ?? (() => Date.now());
   const duplexLossCancelDeadlineMs = deps.duplexLossCancelDeadlineMs ?? ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS;
+  const stalledToolCheckIntervalMs = deps.stalledToolCheckIntervalMs ?? ACPX_STALLED_TOOL_CHECK_INTERVAL_MS;
   const warmHandles = deps.warmHandles ?? defaultWarmHandles;
   const stagedRuntimes = deps.stagedRuntimes ?? defaultStagedRuntimes;
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
@@ -4042,11 +4123,33 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     const lossDeadline = new Promise<void>((resolve) => {
       resolveLossDeadline = resolve;
     });
+    // Set when the stalled-tool watchdog (armed in `stepTurnStart`) ends the
+    // turn: the closed ACP kind of the silent tool call and how long it went
+    // without an update. The watchdog cancels the turn and arms the same
+    // fail-fast deadline as a duplex loss.
+    // `permissionRequested` says whether the agent's permission request for
+    // that call reached the host. It records receipt only, not that the reply
+    // reached the agent, so it separates a call stalled before its request
+    // arrived from one stalled on the return trip or after the decision;
+    // `pendingPermissionRequested` counts the pending calls whose request did.
+    let stalledTool: {
+      kind: string;
+      silentMs: number;
+      permissionRequested: boolean;
+      pendingPermissionRequested: number;
+      settledSameKind: number;
+      settledSameKindPermissionRequested: number;
+    } | null = null;
+    let stalledToolTimer: ReturnType<typeof setInterval> | undefined;
     let forcedStop = false;
     let runtimeStopConfirmed = false;
     let safeInterruptedSession = false;
     let preserveInterruptedSession = false;
-    const interruptionTools = new Map<string, { kind?: string; status?: string }>();
+    const interruptionTools = new Map<string, { kind?: string; status?: string; firstSeenAt?: number; lastUpdateAt?: number }>();
+    // Tool call ids whose permission request reached the host. The request can
+    // arrive before the relay sees the call's `tool_call` event, so it is kept
+    // apart from `interruptionTools`.
+    const permissionRequestedToolCallIds = new Set<string>();
     let incompleteToolInventory = false;
     try {
       await ctx.onCancellationReady?.();
@@ -4338,6 +4441,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // must not merge the Paperclip server's ambient environment back in
           // when it spawns the provider child.
           inheritProcessEnv: false,
+          // Observe permission requests without deciding them: returning
+          // undefined leaves the decision to ACPX's permission-mode resolver.
+          onPermissionRequest: async (request) => {
+            const toolCallId = request.raw?.toolCall?.toolCallId;
+            if (typeof toolCallId === "string" && toolCallId) permissionRequestedToolCallIds.add(toolCallId);
+            return undefined;
+          },
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
             : undefined,
@@ -4759,6 +4869,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let observedUsage: Pick<AdapterExecutionResult, "usage" | "usageBasis" | "costUsd" | "usageComplete"> = { usageComplete: false };
       let lastRuntimeEventAt: number | null = null;
       let observedRuntimeEvents = 0;
+      // Activity as of the moment the turn's stop (wall-clock timeout or
+      // operator stop) fired. The cancel can make the agent emit closing
+      // events (including updates that close the stalled tool), so the
+      // finalize-time age and pending set alone cannot tell a silent stall
+      // from live work.
+      let turnStopRequestedAt: number | null = null;
+      let lastRuntimeEventBeforeStopAt: number | null = null;
+      let pendingToolsAtStop: Array<{ kind?: string; firstSeenAt?: number }> | null = null;
+      // When a tool call last reached a final status (or the turn started).
+      // A call queued behind slow sequential calls gets no update until they
+      // finish, so the stalled-tool watchdog also needs this to be old.
+      let lastToolSettledAt: number | null = null;
       let turnDispatchAttempted = false;
       // The turn-local state the sequence steps share. `promptBuild` sets the
       // prompt, `preTurnUsage` sets the pre-turn status, `turnStart` sets the
@@ -4846,6 +4968,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
       const stepTurnStart = (signal: AbortSignal, startTimeoutMs: number | undefined): StartedTurn => {
         ctx.signal?.throwIfAborted();
+        signal.addEventListener("abort", () => {
+          if (turnStopRequestedAt !== null) return;
+          turnStopRequestedAt = now();
+          pendingToolsAtStop = [...interruptionTools.values()].filter(isPendingAcpTool);
+        }, { once: true });
         // After entering startTurn, a thrown error cannot prove the provider
         // received no work. Only failures before this boundary are free to settle.
         turnDispatchAttempted = true;
@@ -4879,24 +5006,83 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // before this turn started — so the turn returns a terminal result
         // right away. `turnFinalize` reads the same latch and builds the
         // failure from the typed loss reason alone.
+        // `cancel()` only asks the agent to end the turn; it does not end the
+        // turn by itself. Start the fail-fast deadline the moment the host
+        // cancels, so the run does not wait past this bound for an agent that
+        // stopped answering.
+        const armCancelDeadline = () => {
+          if (!lossDeadlineTimer && !lossDeadlineTripped) {
+            lossDeadlineTimer = setTimeout(() => {
+              lossDeadlineTripped = true;
+              resolveLossDeadline?.();
+            }, duplexLossCancelDeadlineMs);
+          }
+        };
         const bridge = prepared.paperclipBridge;
         if (bridge?.onLoss) {
           const cancelForLoss = (reason: DuplexLossReason) => {
             void turn.cancel({ reason: `paperclip sandbox duplex channel lost (${reason})` }).catch(() => {});
-            // `cancel()` only asks the agent to end the turn; it does not end
-            // the turn by itself. Start the fail-fast deadline the moment the
-            // loss latches, so the run does not wait past this bound for an
-            // agent that stopped answering.
-            if (!lossDeadlineTimer && !lossDeadlineTripped) {
-              lossDeadlineTimer = setTimeout(() => {
-                lossDeadlineTripped = true;
-                resolveLossDeadline?.();
-              }, duplexLossCancelDeadlineMs);
-            }
+            armCancelDeadline();
           };
           removeLossListener = bridge.onLoss(cancelForLoss);
           const alreadyLatched = bridge.readRunDisposition?.();
           if (alreadyLatched?.failed) cancelForLoss(alreadyLatched.lossReason ?? "other");
+        }
+        // A pending tool call that gets no ACP update for this long, while no
+        // other tool call finishes either, is stalled: Claude's own tool
+        // bounds end every healthy call sooner, and a live subagent's Task
+        // call keeps receiving heartbeats. A call that stalls before it runs
+        // (for example, a lost permission round trip) is outside those
+        // bounds and would otherwise hold the turn until the wall-clock
+        // backstop. End the turn instead, through the same cancel and
+        // fail-fast deadline as a duplex loss.
+        const stalledToolTimeoutMs = deps.stalledToolTimeoutMs
+          ?? resolveStalledToolTimeoutMs(ctx.config, prepared.env, prepared.acpxAgent);
+        if (stalledToolTimeoutMs > 0) {
+          lastToolSettledAt = now();
+          stalledToolTimer = setInterval(() => {
+            if (stalledTool !== null || turnStopRequestedAt !== null) return;
+            const checkedAt = now();
+            if (lastToolSettledAt !== null && checkedAt - lastToolSettledAt < stalledToolTimeoutMs) return;
+            let oldest: { toolCallId: string; kind?: string; silentMs: number } | null = null;
+            let pendingPermissionRequested = 0;
+            for (const [toolCallId, tool] of interruptionTools) {
+              if (!isPendingAcpTool(tool)) continue;
+              if (permissionRequestedToolCallIds.has(toolCallId)) pendingPermissionRequested += 1;
+              if (tool.lastUpdateAt === undefined) continue;
+              const silentMs = checkedAt - tool.lastUpdateAt;
+              if (silentMs >= stalledToolTimeoutMs && (!oldest || silentMs > oldest.silentMs)) {
+                oldest = { toolCallId, kind: tool.kind, silentMs };
+              }
+            }
+            if (!oldest) return;
+            clearInterval(stalledToolTimer);
+            let settledSameKind = 0;
+            let settledSameKindPermissionRequested = 0;
+            for (const [toolCallId, tool] of interruptionTools) {
+              if (isPendingAcpTool(tool) || tool.kind !== oldest.kind) continue;
+              settledSameKind += 1;
+              if (permissionRequestedToolCallIds.has(toolCallId)) settledSameKindPermissionRequested += 1;
+            }
+            const knownKinds: readonly string[] = ACP_TOOL_KINDS;
+            stalledTool = {
+              kind: oldest.kind && knownKinds.includes(oldest.kind) ? oldest.kind : "unknown",
+              silentMs: oldest.silentMs,
+              permissionRequested: permissionRequestedToolCallIds.has(oldest.toolCallId),
+              pendingPermissionRequested,
+              settledSameKind,
+              settledSameKindPermissionRequested,
+            };
+            turnStopRequestedAt = checkedAt;
+            pendingToolsAtStop = [...interruptionTools.values()].filter(isPendingAcpTool);
+            void ctx.onLog(
+              "stderr",
+              `[paperclip] A pending tool call (kind ${stalledTool.kind}) had no update for ${Math.round(stalledTool.silentMs / 1000)}s; ending the turn. Its permission request ${stalledTool.permissionRequested ? "reached" : "did not reach"} Paperclip.\n`,
+            ).catch(() => {});
+            void turn.cancel({ reason: "paperclip stalled tool watchdog" }).catch(() => {});
+            armCancelDeadline();
+          }, stalledToolCheckIntervalMs);
+          stalledToolTimer.unref?.();
         }
         // ACP can resolve the turn before its provider exits. Keep the Stop
         // deadline armed through settlement, including provider cleanup.
@@ -4927,18 +5113,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // the fail-fast deadline fires with no agent-supplied terminal. Its
       // `status` mirrors the shape a real cooperative cancel already
       // produces, so `turnFinalize` needs no change: it reads the latched
-      // loss disposition, not this `stopReason`, to build the reported
-      // failure and its message.
-      const LOSS_DEADLINE_TERMINAL: AcpRuntimeTurnResult = {
+      // loss disposition or the stalled-tool record, not this `stopReason`,
+      // to build the reported failure and its message.
+      const cancelDeadlineTerminal = (): AcpRuntimeTurnResult => ({
         status: "cancelled",
-        stopReason: "paperclip_duplex_loss_deadline",
-      };
+        stopReason: stalledTool ? "paperclip_stalled_tool_deadline" : "paperclip_duplex_loss_deadline",
+      });
       const stepEventRelay = async (): Promise<AcpRuntimeTurnResult> => {
         const turn = activeTurn as AcpRuntimeTurn;
         const toolTitles = new Map<string, string>();
         const drainEvents = (async (): Promise<void> => {
           for await (const event of turn.events) {
             lastRuntimeEventAt = now();
+            if (turnStopRequestedAt === null) lastRuntimeEventBeforeStopAt = lastRuntimeEventAt;
             observedRuntimeEvents += 1;
             // ACPX currently flattens client-side filesystem/terminal receipts
             // into status text. They cannot establish complete action outcomes.
@@ -4950,7 +5137,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 interruptionTools.set(event.toolCallId, {
                   kind: event.kind ?? previous?.kind,
                   status: event.status ?? previous?.status,
+                  firstSeenAt: previous?.firstSeenAt ?? lastRuntimeEventAt,
+                  lastUpdateAt: lastRuntimeEventAt,
                 });
+                if (event.status && !isPendingAcpTool({ status: event.status })) lastToolSettledAt = lastRuntimeEventAt;
               }
             }
             if (event.type === "text_delta" && event.stream !== "thought") {
@@ -4987,31 +5177,33 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // both the close call and the drain it unblocks before this step
           // returns, so no late runtime event can still mutate shared state
           // (output segments, tool inventory) after finalization reads it.
-          await turn.closeStream({ reason: "paperclip duplex loss cancel deadline" }).catch(() => {});
+          await turn.closeStream({ reason: stalledTool ? "paperclip stalled tool cancel deadline" : "paperclip duplex loss cancel deadline" }).catch(() => {});
           await drainEvents.catch(() => {});
           flushOutputSegment();
-          return LOSS_DEADLINE_TERMINAL;
+          return cancelDeadlineTerminal();
         }
         flushOutputSegment();
         // `turn.result` settles only when the agent's provider process
         // returns or rejects; a latched loss that armed the deadline after
         // the event drain already ended must still bound this wait.
-        return await Promise.race([turn.result, lossDeadline.then(() => LOSS_DEADLINE_TERMINAL)]);
+        return await Promise.race([turn.result, lossDeadline.then(cancelDeadlineTerminal)]);
       };
       const stepTurnFinalize = async (
         input: TurnFinalizeInput<AcpRuntimeTurnResult>,
       ): Promise<TurnCompletion> => {
+        // The turn has ended; tools left pending now cannot stall it.
+        clearInterval(stalledToolTimer);
         // Capture runtime activity before usage reads, error logs, or cleanup
         // make an otherwise silent turn look active at its execution deadline.
         const lastEventAgeMs = lastRuntimeEventAt === null ? undefined : now() - lastRuntimeEventAt;
+        const pendingTools = [...interruptionTools.values()].filter(isPendingAcpTool);
         const activityDiagnostics = {
           acpObservedEventCount: observedRuntimeEvents,
           ...(lastEventAgeMs !== undefined && Number.isSafeInteger(lastEventAgeMs) && lastEventAgeMs >= 0
             ? { acpLastEventAgeMs: lastEventAgeMs } : {}),
-          acpPendingToolCount: [...interruptionTools.values()].filter(
-            (tool) => tool.status !== "completed" && tool.status !== "failed" && tool.status !== "cancelled",
-          ).length,
+          acpPendingToolCount: pendingTools.length,
           acpToolInventoryComplete: !incompleteToolInventory,
+          ...summarizeAcpStopActivity(turnStopRequestedAt, lastRuntimeEventBeforeStopAt, pendingToolsAtStop ?? pendingTools),
         };
         if (input.kind === "terminal") {
         const terminal = input.terminal;
@@ -5042,6 +5234,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // enum, so no raw provider text rides the message.
         const channelLostMessage = duplexLossReason
           ? `The sandbox duplex control channel was lost (${duplexLossReason}) before the run completed.`
+          : null;
+        // The stalled-tool watchdog ended the turn. A timeout or channel loss
+        // explains the outcome first, and a turn that completed anyway (its
+        // completion raced the cancel) keeps its success. The message carries
+        // only the closed ACP tool kind and the silent time.
+        const toolStalled = stalledTool !== null && !timedOut && !channelLost && terminal.status !== "completed";
+        const toolStalledMessage = stalledTool
+          ? `A pending tool call (kind ${stalledTool.kind}) received no update for ${Math.round(stalledTool.silentMs / 60_000)} minutes, so Paperclip ended the turn instead of waiting for the execution timeout.`
           : null;
         // A completed, non-timed-out turn whose channel stayed live is the one
         // success path. Every other outcome — a failed, cancelled, or timed-out
@@ -5093,9 +5293,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "paperclip timeout cleanup"
             : channelLost
               ? "paperclip duplex channel lost cleanup"
-              : failedTurn
-                ? `paperclip turn ${terminal.status}`
-                : "paperclip completed turn cleanup",
+              : toolStalled
+                ? "paperclip stalled tool cleanup"
+                : failedTurn
+                  ? `paperclip turn ${terminal.status}`
+                  : "paperclip completed turn cleanup",
           discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
           dropWarmEntry: false,
           recordCloseError: false,
@@ -5103,21 +5305,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           skipRemoteClose: channelLost,
         };
 
-        const failureDiagnostic = !timedOut && !channelLost && terminal.status === "failed"
+        const failureDiagnostic = !timedOut && !channelLost && !toolStalled && terminal.status === "failed"
           ? terminalSessionFailure
           : null;
         const errorMessage = timedOut
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : channelLost
             ? channelLostMessage
-            : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
+            : toolStalled
+              ? toolStalledMessage
+              : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
-        const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
+        const classifiedFailure = !timedOut && !channelLost && !toolStalled && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
-          summary: channelLost ? "duplex_channel_lost" : terminal.status,
+          summary: channelLost ? "duplex_channel_lost" : toolStalled ? "tool_stalled" : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
         });
@@ -5134,9 +5338,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "acpx_timeout"
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
-              : terminal.status === "failed"
-                ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                : null,
+              : toolStalled
+                ? ACPX_TOOL_STALLED_ERROR_CODE
+                : terminal.status === "failed"
+                  ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
+                  : null,
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5149,8 +5355,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           usageComplete,
           resultJson: {
-            status: channelLost ? "failed" : terminal.status,
+            status: channelLost || toolStalled ? "failed" : terminal.status,
             ...activityDiagnostics,
+            ...(toolStalled && stalledTool
+              ? {
+                  acpStalledToolKind: stalledTool.kind,
+                  acpStalledToolSilentMs: stalledTool.silentMs,
+                  acpStalledToolPermissionRequested: stalledTool.permissionRequested,
+                  acpPendingToolPermissionRequestedCount: stalledTool.pendingPermissionRequested,
+                  acpSettledSameKindToolCount: stalledTool.settledSameKind,
+                  acpSettledSameKindToolPermissionRequestedCount: stalledTool.settledSameKindPermissionRequested,
+                }
+              : {}),
             ...(failureDiagnostic ? { terminalSessionFailure: failureDiagnostic } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
@@ -5194,6 +5410,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           return {
             kind: "timed_out",
             cause: { kind: "turn_timed_out", timeoutSec: prepared.timeoutSec },
+            resources: emptyConsumed,
+          };
+        }
+        // The host cancelled a stalled turn. That is a failure, not a stop
+        // anyone requested, so it must not settle as a cancellation.
+        if (toolStalled) {
+          return {
+            kind: "failed",
+            cause: { kind: "turn_failed", error: new Error(toolStalledMessage ?? "A pending tool call stalled.") },
             resources: emptyConsumed,
           };
         }
@@ -5590,6 +5815,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       removeStopListener?.();
       removeLossListener?.();
       clearTimeout(lossDeadlineTimer);
+      clearInterval(stalledToolTimer);
       // End the run root span exactly once, on every return and on a throw.
       runRootSpan.end(runFailed);
       // Release the per-session staging lease as the run's final act, AFTER the

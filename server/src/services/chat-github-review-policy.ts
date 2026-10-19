@@ -230,8 +230,8 @@ export function githubReviewConclusion(
   assessment: GitHubReviewAssessment,
   threshold: GitHubReviewPolicy["ratingThreshold"],
 ): GitHubReviewConclusion {
-  if (!assessment.complete || assessment.score === 0) return "action_required";
   if (threshold === null) return "neutral";
+  if (!assessment.complete || assessment.score === 0) return "action_required";
   return assessment.score >= threshold ? "success" : "failure";
 }
 

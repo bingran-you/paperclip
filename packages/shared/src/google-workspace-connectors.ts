@@ -1,5 +1,5 @@
 export const GOOGLE_WORKSPACE_CONNECTOR_PROFILE_IDS = [
-  "gmail.read", "gmail.draft", "drive.read", "drive.write", "docs.read", "docs.write",
+  "gmail.read", "gmail.draft", "gmail.archive", "drive.read", "drive.write", "docs.read", "docs.write",
   "sheets.read", "sheets.write", "slides.read", "slides.write", "calendar.read",
   "calendar.write", "chat.read", "chat.write", "people.read", "workspace-search.read",
 ] as const;
@@ -16,6 +16,7 @@ export const GOOGLE_WORKSPACE_CONNECTOR_PROFILES: Readonly<Record<GoogleWorkspac
 }>> = {
   "gmail.read": def("gmail", "https://gmailmcp.googleapis.com/mcp/v1", [auth("gmail.readonly")]),
   "gmail.draft": def("gmail", "https://gmailmcp.googleapis.com/mcp/v1", [auth("gmail.readonly"), auth("gmail.compose")], ["create_draft"]),
+  "gmail.archive": def("gmail", "https://gmailmcp.googleapis.com/mcp/v1", [auth("gmail.readonly"), auth("gmail.modify")], ["unlabel_thread"]),
   "drive.read": def("google-drive", "https://drivemcp.googleapis.com/mcp/v1", [auth("drive.readonly")]),
   "drive.write": def("google-drive", "https://drivemcp.googleapis.com/mcp/v1", [auth("drive.readonly"), auth("drive.file")], ["copy_file", "create_file"]),
   "docs.read": def("google-docs", "https://docsmcp.googleapis.com/mcp/v1", [auth("documents.readonly")]),

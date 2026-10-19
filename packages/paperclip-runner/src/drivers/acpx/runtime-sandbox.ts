@@ -1,6 +1,7 @@
 import { piProviderConfiguration } from "./pi-provider-config.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
+import { preconfiguredHomeEnvironment, usesPreconfiguredHome } from "../preconfigured-home.js";
 import { randomBytes } from "node:crypto";
 import {
   constants,
@@ -370,6 +371,32 @@ export async function prepareAcpxRuntimeSandbox(input: {
     join(root, "acpx-state"),
     root,
   );
+  if (usesPreconfiguredHome(input.environment)) {
+    if (input.agent !== "claude" && input.agent !== "codex") throw new Error("preconfigured_home_unsupported_provider");
+    const homes = preconfiguredHomeEnvironment(input.environment);
+    const workspaceRecordPath = join(root, "workspace");
+    await writePrivateFile(workspaceRecordPath, `${input.binding.workspacePath}\n`);
+    const launchEnvironment = {
+      ...createSanitizedAcpxSpawnInput(input.environment, input.agent).env,
+      ...homes,
+      PAPERCLIP_ACPX_PROFILE: input.agent,
+      PAPERCLIP_RUNNER_HOME_MODE: "preconfigured",
+      ...(input.agent === "claude" ? { ACPX_CLAUDE_INCLUDE_USER_SETTINGS: "1" } : {}),
+    };
+    return {
+      root, stateDirectory, workspaceRecordPath,
+      homeDirectory: homes.HOME,
+      configDirectory: homes.XDG_CONFIG_HOME ?? join(homes.HOME, ".config"),
+      dataDirectory: homes.XDG_DATA_HOME ?? join(homes.HOME, ".local/share"),
+      cacheDirectory: homes.XDG_CACHE_HOME ?? join(homes.HOME, ".cache"),
+      agentHomeDirectory: input.agent === "claude"
+        ? homes.CLAUDE_CONFIG_DIR ?? join(homes.HOME, ".claude")
+        : homes.CODEX_HOME ?? join(homes.HOME, ".codex"),
+      protectedPaths: Object.freeze([physicalRuntimeDirectory, ...policy.protectedPaths]),
+      launchEnvironment: Object.freeze(launchEnvironment),
+      persistedEnvironment: Object.freeze({ ...homes, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" }),
+    };
+  }
   const homeDirectory = await ensurePrivateDirectory(join(root, "home"), root);
   const configDirectory = await ensurePrivateDirectory(
     join(root, "config"),

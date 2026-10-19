@@ -1,4 +1,4 @@
-import type { DotBindingSnapshot } from "./external-provider.js";
+import type { DotBindingSnapshot, MuseBindingSnapshot, ExternalBotProviderKind } from "./external-provider.js";
 import { QUALIFIED_ACPX_VERSION } from "../drivers/acpx/generated-profiles.js";
 import { isSupportedAcpxProfileVersion, type AcpxProfileVersion } from "../drivers/acpx/profile-compatibility.js";
 import { isProviderMode } from "./provider-mode.js";
@@ -9,9 +9,12 @@ import { explicitTaskSkillNames, parseNativeRuntimeContext, type NativeRuntimeCo
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V1 = "paperclip.native-execution-input.v1" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V2 = "paperclip.native-execution-input.v2" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V3 = "paperclip.native-execution-input.v3" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V8 = "paperclip.native-execution-input.v8" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V6 = "paperclip.native-execution-input.v6" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V4 = "paperclip.native-execution-input.v4" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA = "paperclip.native-execution-input.v5" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V7 = "paperclip.native-execution-input.v7" as const;
+export type NativeHomeMode = "isolated" | "preconfigured";
 export const NATIVE_MODEL_ENVELOPE_SCHEMA_V1 = "paperclip.native-model-envelope.v1" as const;
 export const NATIVE_MODEL_ENVELOPE_SCHEMA_V2 = "paperclip.native-model-envelope.v2" as const;
 export const NATIVE_MODEL_ENVELOPE_SCHEMA = "paperclip.native-model-envelope.v3" as const;
@@ -240,12 +243,23 @@ export interface NativeExecutionInputV5 extends Omit<NativeExecutionInputV4, "sc
 
 export interface NativeExecutionInputV6 extends Omit<NativeExecutionInputV5, "schema" | "provider" | "workspace" | "session"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V6;
-  provider: { kind: "openai_dot"; model: null; binding: DotBindingSnapshot };
+  provider: { kind: ExternalBotProviderKind; model: null; binding: DotBindingSnapshot };
   workspace: { access: "none"; cwd: null; repoUrl: null; repoRef: null; branchName: null };
-  session: Omit<NativeExecutionInputV5["session"], "driverKind"> & { driverKind: "openai_dot_mcp" };
+  session: Omit<NativeExecutionInputV5["session"], "driverKind"> & { driverKind: "openai_dot_mcp" | "grok_bot_mcp" };
 }
 
-export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6;
+export interface NativeExecutionInputV7 extends Omit<NativeExecutionInputV5, "schema"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V7;
+  homeMode: NativeHomeMode;
+}
+
+export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V8;
+  provider: { kind: "muse"; model: null; binding: MuseBindingSnapshot; bridgeRevision: "muse-v1" };
+  session: Omit<NativeExecutionInputV6["session"], "driverKind"> & { driverKind: "muse_external" };
+}
+
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8;
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -334,7 +348,7 @@ function nullableText(value: unknown, path: string): string | null {
  * intentionally not an extensible metadata bag: new fields require a contract
  * revision and an explicit security review.
  */
-function parseDotNativeExecutionInput(input: Record<string, unknown>): NativeExecutionInputV6 {
+function parseExternalNativeExecutionInput(input: Record<string, unknown>): NativeExecutionInputV6 {
   const provider = record(input.provider, "input.provider");
   exactKeys(provider, ["kind", "model", "binding"], "input.provider");
   const b = record(provider.binding, "input.provider.binding");
@@ -343,16 +357,17 @@ function parseDotNativeExecutionInput(input: Record<string, unknown>): NativeExe
   const workspace = record(input.workspace, "input.workspace");
   exactKeys(workspace, ["access", "cwd", "repoUrl", "repoRef", "branchName"], "input.workspace");
   const session = record(input.session, "input.session");
-  if (provider.kind !== "openai_dot" || provider.model !== null || workspace.access !== "none"
+  const driverKind = provider.kind === "grok_bot" ? "grok_bot_mcp" : "openai_dot_mcp";
+  if (!["openai_dot", "grok_bot"].includes(String(provider.kind)) || provider.model !== null || workspace.access !== "none"
       || [workspace.cwd, workspace.repoUrl, workspace.repoRef, workspace.branchName].some(v => v !== null)
-      || session.driverKind !== "openai_dot_mcp" || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn"
+      || session.driverKind !== driverKind || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn"
       || binding.companyId !== b.companyId || binding.agentId !== b.agentId
       || !Number.isSafeInteger(b.bindingGeneration) || Number(b.bindingGeneration) < 1
       || !Number.isSafeInteger(b.acceptByUnixMs) || !Number.isSafeInteger(b.expiresAtUnixMs)
       || Number(b.acceptByUnixMs) < 1 || Number(b.acceptByUnixMs) >= Number(b.expiresAtUnixMs)
       || Number(b.expiresAtUnixMs) - Number(b.acceptByUnixMs) > 86_400_000
       || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
-    throw new NativeExecutionInputError("Dot v6 requires a bound per-turn remote service with no filesystem or credential access");
+    throw new NativeExecutionInputError("External v6 requires a bound per-turn remote service with no filesystem or credential access");
   }
   // Reuse the preceding closed contract's task/context validation. The local
   // validation value never leaves this function or becomes an execution path.
@@ -361,18 +376,35 @@ function parseDotNativeExecutionInput(input: Record<string, unknown>): NativeExe
     session: { ...session, driverKind: "codex_app_server" },
     workspace: { cwd: "/", repoUrl: null, repoRef: null, branchName: null } }) as NativeExecutionInputV5;
   return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V6,
-    provider: { kind: "openai_dot", model: null, binding: {
+    provider: { kind: provider.kind as ExternalBotProviderKind, model: null, binding: {
       bindingId: text(b.bindingId, "input.provider.binding.bindingId"), bindingGeneration: Number(b.bindingGeneration),
       companyId: text(b.companyId, "input.provider.binding.companyId"), agentId: text(b.agentId, "input.provider.binding.agentId"),
       acceptByUnixMs: Number(b.acceptByUnixMs), expiresAtUnixMs: Number(b.expiresAtUnixMs),
     } }, workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
-    session: { ...common.session, driverKind: "openai_dot_mcp" } };
+    session: { ...common.session, driverKind } };
+}
+
+function parseMuseNativeExecutionInput(input: Record<string, unknown>): NativeExecutionInputV8 {
+  const provider = record(input.provider, "input.provider");
+  exactKeys(provider, ["kind", "model", "binding", "bridgeRevision"], "input.provider");
+  const session = record(input.session, "input.session");
+  if (provider.kind !== "muse" || provider.bridgeRevision !== "muse-v1" || session.driverKind !== "muse_external") {
+    throw new NativeExecutionInputError("Muse v8 requires the muse-v1 bridge and muse_external driver");
+  }
+  const common = parseExternalNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V6,
+    provider: { kind: "openai_dot", model: provider.model, binding: provider.binding },
+    session: { ...session, driverKind: "openai_dot_mcp" } });
+  return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V8,
+    provider: { kind: "muse", model: null, binding: common.provider.binding, bridgeRevision: "muse-v1" },
+    session: { ...common.session, driverKind: "muse_external" } };
 }
 
 export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
-  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6) return parseDotNativeExecutionInput(input);
-  const isV5 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8) return parseMuseNativeExecutionInput(input);
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6) return parseExternalNativeExecutionInput(input);
+  const isV7 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V7;
+  const isV5 = isV7 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
   const isV4 = isV5 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V4;
   const isV3 = isV4 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V3;
   const isV2 = isV3 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V2;
@@ -390,6 +422,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     ...(isV3 ? ["runtimeContext"] : []),
     ...(isV4 ? ["continuationPrompt", "initialCommunicationGuidance"] : []),
     ...(isV5 ? ["completionSources"] : []),
+    ...(isV7 ? ["homeMode"] : []),
   ], "input");
   if (!isV2 && input.schema !== NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
     throw new NativeExecutionInputError(
@@ -397,6 +430,25 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     );
   }
 
+  if (isV7) {
+    if (input.homeMode !== "isolated" && input.homeMode !== "preconfigured") {
+      throw new NativeExecutionInputError("input.homeMode must be isolated or preconfigured");
+    }
+    const selected = record(input.provider, "input.provider");
+    if (input.homeMode === "preconfigured" && selected.kind === "acpx" && input.executionMode === "plan") {
+      throw new NativeExecutionInputError("preconfigured ACPX read-only execution is not supported; use isolated mode or native Codex");
+    }
+    if (input.homeMode === "preconfigured" && selected.kind === "acpx" && selected.permissionMode !== "approve-all") {
+      throw new NativeExecutionInputError("preconfigured home currently requires ACPX approve-all; local permission rules still apply");
+    }
+    if (input.homeMode === "preconfigured" && selected.kind === "acpx" && selected.agent === "codex") {
+      throw new NativeExecutionInputError("preconfigured ACPX Codex cannot protect Runner state; use native Codex or isolated mode");
+    }
+    if (input.homeMode === "preconfigured" && selected.kind !== "codex"
+      && !(selected.kind === "acpx" && selected.agent === "claude")) {
+      throw new NativeExecutionInputError("preconfigured home supports native Codex and ACPX Claude only");
+    }
+  }
   const binding = record(input.binding, "input.binding");
   exactKeys(binding, ["companyId", "runId", "issueId", "agentId", "agentKeyId", "executionWorkspaceId"], "input.binding");
   const task = record(input.task, "input.task");
@@ -837,7 +889,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   if (!isV5) return { ...withPermissions, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V4 };
   return {
     ...withPermissions,
-    schema: NATIVE_EXECUTION_INPUT_SCHEMA,
+    ...(isV7 ? { schema: NATIVE_EXECUTION_INPUT_SCHEMA_V7, homeMode: input.homeMode as NativeHomeMode } : { schema: NATIVE_EXECUTION_INPUT_SCHEMA }),
     provider: parsedProvider as NativeProviderConfigV5,
     ...(input.completionSources !== undefined ? { completionSources: parseCompletionSources(input.completionSources) } : {}),
   };
@@ -901,7 +953,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: 
       interactionResponses: structuredClone(input.interactionResponses),
     };
   }
-  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6) {
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V7 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8) {
     const sourceBinding = input.completionSources;
     const references = sourceBinding?.contractRevision === input.completionContract.contract.revision
       && sourceBinding.promptSha256 === createHash("sha256").update(input.task.prompt).digest("hex")
@@ -920,7 +972,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: 
       },
       executionMode: input.executionMode,
       planningContext: structuredClone(input.planningContext),
-      workspace: input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6 || input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore" ? null : { cwd: input.workspace.cwd },
+      workspace: input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8 || input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore" ? null : { cwd: input.workspace.cwd },
       completionContract: {
         ...structuredClone(input.completionContract.contract),
         criteria: input.completionContract.contract.criteria.map((criterion) => {

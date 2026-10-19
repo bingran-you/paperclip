@@ -47,10 +47,18 @@ incomplete assessments require action. To block merging, separately require this
 check from the dedicated App in GitHub branch protection or a ruleset. A new head
 commit needs its own check. Report-only mode publishes a neutral conclusion, which
 GitHub can accept for a required check; it does not enforce a score requirement.
+This includes incomplete assessments and failed runs: their checks remain neutral
+and explain the failure without presenting a passing assessment.
 A passing score does not formally approve a PR. **Approvals and change requests**
 contains those optional agent permissions. Scheduling filters, ignored files,
 and inline-comment options have separate disclosures. The header shows the App
 identity, copyable mention, avatar download, and GitHub branding settings.
+
+Published review summaries use the GitHub bot's display name in their heading.
+The check name remains **Paperclip Review**. Multiple bots can review the same
+PR through separate GitHub Apps: each keeps its own task, summary, findings, and
+check. Check updates match both the App ID and the endpoint/PR/commit identity.
+Repository branch rules decide separately which App's check is required to merge.
 
 ## Self-hosted setup
 
@@ -207,8 +215,18 @@ claims. It does not exchange codes, track App or installation identity, store
 GitHub secrets, or interpret bot events. It forwards original webhook bytes,
 provider headers, and signature in an envelope sealed to the stack before
 writing the inbox. The stack decrypts and authenticates those bytes through its
-existing durable ingress. Only that local check can verify a connection or
-admit work. Shared-App account connectors keep the behavior described above.
+existing durable ingress. Cloud-managed Apps are excluded from the direct-tenant
+callback recovery scanner and its callback-mismatch warning; the Cloud inbox owns
+relay delivery retries. Only that local check can verify a connection or
+admit work. After a repair, a fresh authenticated event for the bound installation
+can verify webhook delivery even when the relay deduplicates a redelivered old ping.
+This also applies while the connection needs attention: the signed event verifies
+delivery without retaining its content, admitting work, or changing repository
+access, even when its repository is disabled or unavailable. Verification returns
+the connection to the provider-setup step; later installation events cannot
+activate it. The manager must still complete reconnect and activation before new
+review requests can run.
+Shared-App account connectors keep the behavior described above.
 
 Unverified gateway traffic has request, byte, pending-queue, retention and wake
 limits. Its transport deduplication includes the body and signature, so a forged
@@ -224,6 +242,12 @@ manual existing-App recovery remain available. Connecting does not prove that
 an agent runtime can execute a review.
 
 ### One editable response per request
+
+A pull request task can retain both its main discussion and inline finding
+threads. Bot tool discovery lists each endpoint/catalog tool once across those
+threads. Publishing an inline finding therefore does not duplicate the tool
+catalog on the task's next run. Both conversation mappings remain available for
+authorized follow-up replies.
 
 After accepting authorized GitHub work, Paperclip posts **Working on this…**
 before starting the agent. Issue and PR discussion comments use the same GitHub

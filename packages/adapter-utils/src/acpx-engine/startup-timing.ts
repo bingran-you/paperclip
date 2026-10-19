@@ -47,6 +47,14 @@ export function normalizeProviderFamily(key: string | undefined): string {
  */
 export const SANDBOX_STARTUP_SPAN_ATTR_PREFIX = "paperclip.sandbox.startup.";
 
+export const EXECUTION_PREPARATION_SPAN_ATTRS = {
+  runId: "paperclip.task.run.run_id",
+  fileCount: "paperclip.execution.fileCount",
+  bytes: "paperclip.execution.bytes",
+  repositoryCacheOutcome: "paperclip.execution.repositoryCache.outcome",
+  repositoryCacheReferenceSupplied: "paperclip.execution.repositoryCache.reference_supplied",
+} as const;
+
 /**
  * The closed attribute-name contract for every sandbox-startup span. This is
  * the single source of truth for the harness span attributes. Each name uses

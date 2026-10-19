@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,7 @@ import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
   ensureCodexAuthCacheEntryDir,
   isCodexAuthCacheEnabled,
+  readSubscriptionAccountId,
   resolveCodexAuthCacheEntryPath,
   selectVendCredential,
 } from "./codex-auth-cache.js";
@@ -642,27 +644,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
-  const connectorSourceHome = configuredCodexHome;
-  const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
-    && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
-  if (connectorSkillDigest) {
-    // Never mount assignment-specific skills into the shared company/user home.
-    // A different skill revision gets a new home, so revoked/changed resources
-    // cannot survive as stale symlinks or bleed into another agent's session.
-    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
-      "connector-runtimes", agent.id, connectorSkillDigest);
-  }
-  const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
-    // A missing-source entry would become a dangling skill symlink; skip it.
-    .filter((entry) => !isPaperclipSkillSourceMissing(entry));
-  const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
-  }
   const configuredOpenAiApiKey =
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
       : null;
+  const skillSourceHome = configuredCodexHome;
+  const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
+    && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
+  const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
+    .filter((entry) => !isPaperclipSkillSourceMissing(entry));
+  const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
+  const desiredSet = new Set(desiredSkillNames);
+  // An explicit inventory is the server's authorized execution selection. Include
+  // empty inventories: revocation must not fall back to a previously populated home.
+  let runtimeSkillDigest = Array.isArray(config.paperclipRuntimeSkills)
+    ? createHash("sha256").update(JSON.stringify({ connectorSkillDigest,
+      skills: codexSkillEntries.filter(entry => desiredSet.has(entry.key))
+        .map(entry => [entry.key, entry.source]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    })).digest("hex")
+    : connectorSkillDigest;
+  const runtimeCredentialHome = runtimeSkillDigest
+    ? skillSourceHome ?? await prepareManagedCodexHome(process.env, onLog, agent.companyId, { apiKey: configuredOpenAiApiKey })
+    : null;
+  if (runtimeSkillDigest) {
+    const credentialHome = runtimeCredentialHome!;
+    const credentialBytes = await fs.readFile(path.join(credentialHome, "auth.json")).catch(() => null);
+    const selectedConfig = await fs.readFile(path.join(credentialHome, "config.toml")).catch(() => null);
+    // Keep selected-home provider/MCP edits (and removals) in the launched home.
+    const selectedConfigDigest = selectedConfig ? createHash("sha256").update(selectedConfig).digest("hex") : null;
+    // Copy-back may retain a refreshed regular credential in a generated home.
+    // Account switches must select a different home, while token refreshes for
+    // the same subscription identity preserve its cache and session state.
+    const credentialIdentity = credentialBytes
+      ? readSubscriptionAccountId(credentialBytes) ?? createHash("sha256").update(credentialBytes).digest("hex") : null;
+    runtimeSkillDigest = createHash("sha256").update(JSON.stringify({
+      runtimeSkillDigest, credentialHome, credentialIdentity, selectedConfigDigest, apiKey: envConfig.OPENAI_API_KEY ?? null,
+    })).digest("hex");
+    // Different authorized versions/assignments get separate homes, including
+    // session state. Previously permitted private links cannot survive revocation.
+    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
+      connectorSkillDigest ? "connector-runtimes" : "skill-runtimes", agent.id, runtimeSkillDigest);
+  }
+  if (!executionTargetIsRemote) {
+    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  }
   // A configured CODEX_HOME that lives under the Paperclip-managed company tree
   // (the per-agent home set by the server isolation guard) still needs auth
   // seeded — it ships with no credentials and OPENAI_API_KEY="" by default.
@@ -697,14 +722,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void error;
     });
   }
-  if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
+  if (configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
-    const seedEnv = connectorSkillDigest ? {
-      ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+    const seedEnv = runtimeSkillDigest ? {
+      ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
     } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
@@ -737,7 +762,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
   // target, so both local and sandboxed Codex processes pick up the routing.
-  // An explicit env.CODEX_HOME override is treated as user-managed and skipped.
+  // A caller-owned home stays untouched. A generated skill home receives the
+  // configured provider routing even when it seeds credentials from that home.
   const envConfigStrings = Object.fromEntries(
     Object.entries(envConfig).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -745,7 +771,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
     env: envConfigStrings,
-    codexHome: configuredCodexHome ? null : effectiveCodexHome,
+    codexHome: configuredCodexHome && !runtimeSkillDigest ? null : effectiveCodexHome,
   });
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and

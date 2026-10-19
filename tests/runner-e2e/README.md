@@ -139,8 +139,9 @@ Paperclip task, run an agent, or replace a Product E2E result.
 `--suite confirmation-replies` selects ten local native Claude/Codex cells:
 conversational single-task approval, saved-plan approval, rejection, card-click
 acceptance as a control, and ambiguous approval with two independent pending
-proposals. The onboarding cells use the production wizard, runtime switch and
-persona. The ambiguity fixture creates ordinary board cards through the public
+proposals. The onboarding cells use the production wizard and persona. Codex
+retains its automatic native selection; Claude uses an explicit runtime switch.
+The ambiguity fixture creates ordinary board cards through the public
 API, sends "Yes, go ahead" through the browser, requires both to stay pending
 with a clarification reply and no execution, then approves only one and rejects
 the other through separate browser messages.
@@ -184,8 +185,9 @@ pnpm test:e2e:runner -- --suite confirmation-replies
 and native Claude, each with onboarding, idle handoff, busy handoff, two-task
 handoff, and restart recovery. These exercise the production completion-delivery
 path and agent-authored responses. There is no separate completion feature flag.
-The onboarding cell reuses the real wizard and its existing pre-execution native
-runtime switch, retaining the production persona.
+The onboarding cell reuses the real wizard and retains the production persona.
+Codex uses its automatic native default; Claude explicitly changes runtime
+before execution.
 
 The idle chat cell asks the agent to delegate one welcome note to a named worker and
 report its result without another user message. A bounded local file read in
@@ -1082,18 +1084,19 @@ default is retained**, even when it differs from that profile's normal harness
 model. Configured and provider-observed model identities are reported separately.
 
 There are thirteen cases on `legacy-codex`, `legacy-claude`, `runner-codex`, and
-`runner-acpx-claude`, local only (52 cells). Native profiles complete the same
-production wizard using their legacy provider, then change only the agent's
-runtime configuration via the public API before its first task. The wizard does
-not currently offer native Runner. Persona, managed instructions, skills, seeded
-question, and task invocation are preserved. Explicit model choices are retained;
-an unset model resolves through the production runtime-switch defaults. The
-production switch removes the legacy Paperclip operational skill because Runner
-supplies its control-plane contract through its protocol; other assigned skills,
-including `/first-task`, are retained. Native runtime permissions come from the
-existing qualified profile. Evidence labels
-this setup `post-onboarding-runtime-switch`; it does not claim a native wizard
-path exists. Legacy setup is labeled `production-wizard`.
+`runner-acpx-claude`, local only (52 cells). `runner-codex` selects OpenAI in the
+production wizard, omits the runner override, and verifies the saved native
+configuration without changing runners afterward. `legacy-codex` selects
+Legacy runner in Advanced before authentication and creation. Both are labeled
+`production-wizard`. Claude's creation default is unchanged: `legacy-claude`
+retains its wizard configuration, while `runner-acpx-claude` explicitly changes
+runtime through the public API before its first task and is labeled
+`post-onboarding-runtime-switch`. Persona, managed instructions, skills, seeded
+question, and task invocation are preserved. The native path removes the legacy
+Paperclip operational skill because Runner supplies that contract through its
+protocol; other assigned skills, including `/first-task`, are retained.
+Each isolated onboarding company has a $5 task budget. Setup probes have a
+separate campaign reservation because they do not create task cost events.
 
 | First response / control | Complete journey |
 | --- | --- |
@@ -1449,12 +1452,11 @@ released on failure and normal isolated-instance cleanup removes the workspace.
 The usual provider billing and partial-attempt reporting apply. No production
 prompts, onboarding defaults, or provider permissions are changed.
 
-For pre-default native onboarding qualification, select all `first-task` cases
-with profiles `runner-codex,runner-acpx-claude` (26 cells). The existing public-API
-runtime switch occurs after the real wizard creates its first agent and before
-any provider work. It preserves the wizard's model, persona, skills, and task.
-This tests the native first-task process in advance of the UI/default rollout;
-it does not certify a native option in the wizard, which is not offered yet.
+For native onboarding qualification, select `first-task` with profiles
+`runner-codex,runner-acpx-claude` (26 cells). Codex verifies the production
+creation default with the experimental flag disabled. Claude still uses the
+existing public-API runtime switch before provider work; that case does not
+qualify a native Claude creation default.
 
 Current proof and remaining decisions are recorded in
 [the 21 September qualification report](QUALIFICATION-2026-09-21.md). In particular,
@@ -1999,11 +2001,30 @@ Run the explicit `paperclipai runtime setup pi` for that installation first.
 This lane rejects candidate flags, local/remote daemon overrides, provider asset
 or pack overrides, and Node injection. It launches the installed JavaScript CLI
 without a TypeScript loader, rechecks its pins on controller restart, and records
-`installed-cli-admission.json` in private attempt evidence. It supports only the
-explicit Pi extended, native, controls and warm suites, which require none of the
+`installed-cli-admission.json` in private attempt evidence. Pi uses the explicit
+extended, native, controls and warm suites, which require none of the
 source-only response barriers. Cursor/Copilot qualification gates stay intact.
 Pi's historical `qualificationCandidate` fixture selector remains a roster key;
 it no longer grants an opt-in when the source Pi declaration admits normal use.
+
+The same four installed-package pins also admit three existing local native
+Codex cells: `first-task.runner-codex.local.task-card-accept`,
+`everyday-workflows.runner-codex.local.build-revise`, and
+`agent-chat.runner-codex.local.continuity-restart`. Select exact IDs; other
+Codex cells, legacy profiles and remote environments remain outside this lane.
+These reuse the onboarding, independently checked file/revision, and restart
+graders. They require separately authorized provider access and are not executed
+by the provider-free release smoke.
+
+The release consumer calls `probeInstalledCodexStartup` from `installed-cli.ts`
+against its installed server, normal platform daemon and contained npm Codex.
+It checks a real native read-only session and joined cleanup using empty homes,
+file-only authentication storage and a closed environment. It sends no provider
+turn, consults no account, records the actual CLI version without an equality
+gate, and exposes no session IDs. Build/source, Mach-O/ELF and official npm
+provenance checks precede this probe. Startup proof does not establish useful-file
+delivery, authentication, reasoning effort or follow-up behavior; the existing
+live journeys must prove those separately.
 
 Installed Pi Daytona cells also require the published plugin fixture inputs
 `PAPERCLIP_RUNNER_E2E_INSTALLED_DAYTONA_PLUGIN` (canonical package root),
@@ -2131,6 +2152,29 @@ the changed chief-of-staff persona and skill selections; it needs no fixture
 change for that default selection. Hiring from that wizard-created chief of
 staff remains a separate follow-up qualification.
 
+The explicit-only cell `confirmation-replies.runner-codex.daytona.task-card-accept`
+extends that wizard journey to one fresh managed company. Select this exact ID;
+the automatic roster and all local prompts remain unchanged. Its fixture seeds
+encrypted credentials and an immutable OCI image environment, but does not
+prequalify the image or create an agent. Connect owns the existing saved
+environment probe, fresh scoped adapter discovery, and selected runtime setup.
+The case requires one confirmed platform probe and one native Codex setup lease,
+then verifies the automatically saved native configuration after reload.
+
+The completed child must expose a downloaded `garden-welcome.txt` attachment
+whose byte size, SHA-256, content and scenario marker are independently checked.
+A saved document alone cannot pass. Existing task-card grading and the same-task
+follow-up continuity checks remain required. This cell has one attempt, zero
+automatic retries and a shared fifteen-minute deadline with cleanup time
+reserved. The script authors three turns; four task runs were observed in the
+historical local journey. The existing twelve-run guard and $5 company task cap
+remain, with native setup, one completion judge request, sandbox time and cleanup
+requiring separate reservation. Registration and provider-free controls do not
+establish live qualification or funding within the remaining paid reserve.
+
+This OCI-image Core case does not prove Cloud signup, warm/cold provisioning or
+name-only snapshot qualification. Those remain separate acceptance gates.
+
 ### Hiring completion accounting evidence
 
 The v3 hiring grader uses turn-accounting v2 in both executable guards. It requires complete per-run public event streams, exact native tool-use/result pairing and canonical execution IDs for completion actions. Only successful known GET issue/document/comment operations, verified reads/discovery, and attributed native chat finish are admitted. Writes, failed mutation attempts, incomplete streams and unknown actions cannot pass. Separate ACPX host request IDs and provider execution IDs are not joined by name/order/count; missing mapping is uncomparable action coverage, not a measured task failure. The original source-read and exact template checks remain unchanged.
@@ -2177,6 +2221,48 @@ Private traces and database files must not be published. Unconfirmed cleanup
 always preserves recovery state regardless of this optional diagnostic flag.
 
 The `file-edit-validate` fixture independently downloads the exact active artifact work product from the tested run. It requires the matching run-attributed attachment, filename, MIME type, recorded byte count and SHA-256, then compares the downloaded content to the expected bytes. A workspace file alone cannot satisfy this gate. Explicit failed-case diagnostic retention follows the final result after integrity, isolation and evidence checks, including incomplete publication.
+
+## Projectless task workspaces (explicit-only)
+
+`task-workspaces` contains exactly three cells: legacy OpenCode locally and native
+OpenCode locally and on Daytona, using the existing qualified model. These are
+configured acceptance cells; registration and fixture calibration do not establish
+live qualification.
+
+```sh
+pnpm test:e2e:runner -- --list --suite task-workspaces
+pnpm test:e2e:runner -- --id task-workspaces.legacy-opencode.local.task-directory-repository-resume --max-automatic-retries 0
+pnpm test:e2e:runner -- --id task-workspaces.runner-opencode.local.task-directory-repository-resume --max-automatic-retries 0
+pnpm test:e2e:runner -- --id task-workspaces.runner-opencode.daytona.task-directory-repository-resume --max-automatic-retries 0
+```
+
+Each cell creates a task through the browser without a project or configured
+adapter cwd. The first turn writes task files and requests the same public
+repository preparation twice. Independent APIs must show one pending receipt
+and the same original root. After a controller restart, the second admission
+prepares the repository; the agent makes a local commit and leaves a dirty file.
+The third turn copies those prior bytes into a registered downloadable artifact.
+The oracle checks the task's exact root and stable binding, public file reads,
+repository pin, local Git ancestry and dirty bytes, artifact metadata/digest,
+three attributed successful runs, durable native terminal events and remote
+lease attribution. Daytona uses per-turn leases, so a warm process cannot stand
+in for persisted files. This suite does not qualify channel-default configuration
+or arbitrary repository credentials.
+
+These cells exercise trusted app-created tasks. Low-trust chat tasks cannot use
+`prepare_repository` to initiate controller clones, even for public URLs with
+full-auto provider permissions. Their pending acquisitions fail after a trust
+downgrade; verified existing public checkouts can be reused without acquisition.
+No-repository admission and immutable recovery remain supported. Trusted
+acquisition does not yet impose repository byte or cumulative storage quotas.
+
+Each cell allows three turns, one attempt, four minutes per turn and fifteen
+minutes total, with 1,000-cent company and agent budget hard stops. `--all` excludes
+it. `OPENROUTER_API_KEY` is required; Daytona also requires `DAYTONA_API_KEY`, a
+verified immutable image and its matching remote runner/provider artifacts.
+Use the normal isolated-instance cleanup and report pipeline. Private evidence
+includes `snapshots/task-workspaces.json` and `task-workspaces-runs.json`; only
+marked synthetic task screenshots can enter the public projection.
 
 ## Repository skill packages
 
