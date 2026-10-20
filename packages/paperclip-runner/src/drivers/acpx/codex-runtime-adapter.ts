@@ -1,3 +1,4 @@
+import { resolveClaudeEffort, createClaudeEffortAdmission } from "./claude-effort.js";
 import { createPiThinkingAdmission, resolvePiThinkingLevel } from "./pi-thinking.js";
 import { usesPreconfiguredHome } from "../preconfigured-home.js";
 import type { ChildProcess } from "node:child_process";
@@ -101,6 +102,14 @@ interface AcpxRuntimeExtensionBoundary {
   active: AcpxRuntimeExtensionTurn | null;
   sessionIds: Set<string>;
   steering: AcpxRuntimeSteeringCapability | null;
+}
+
+export class AcpxProviderProcessLostError extends Error {
+  readonly code = "ACPX_PROVIDER_PROCESS_LOST";
+  constructor(message = "The owned ACPX provider exited during its active turn") {
+    super(message);
+    this.name = "AcpxProviderProcessLostError";
+  }
 }
 
 class AcpxRuntimeCloseTimeoutError extends Error {
@@ -308,6 +317,8 @@ export async function openQualifiedAcpxRuntime(
   const modeBinding = createAcpxModeBinding(options.profile.agent, options.mode);
   const selectedPiThinkingLevel = resolvePiThinkingLevel(options.profile.agent, options.piThinkingLevel);
   const piThinking = selectedPiThinkingLevel ? createPiThinkingAdmission(selectedPiThinkingLevel, { restoring: options.restoringSession }) : undefined;
+  const selectedClaudeEffort = resolveClaudeEffort(options.profile.agent, options.claudeEffort);
+  const claudeEffort = selectedClaudeEffort ? createClaudeEffortAdmission(selectedClaudeEffort) : undefined;
   const cursorInstructions = options.profile.agent === "cursor"
     ? createCursorInstructionAdmission(options.systemInstructions)
     : null;
@@ -319,6 +330,7 @@ export async function openQualifiedAcpxRuntime(
       return (direction: "inbound" | "outbound", message: unknown) => { instructions?.(direction, message); mode?.(direction, message); };
     } } : {}),
     ...(piThinking ? { protocolGuardFactory: () => piThinking.createGuard() } : {}),
+    ...(claudeEffort ? { protocolGuardFactory: () => claudeEffort.createGuard() } : {}),
     sessionStore,
     agentRegistry: createRegistry({
       // Preserve Claude's ACP capability identity. This is metadata only: the
@@ -544,6 +556,23 @@ export async function openQualifiedAcpxRuntime(
           await commandLaunches.refreshConsumedCommand?.();
         }
         return ensuredHandle;
+      }) : claudeEffort ? ensuredSession.then(async (ensuredHandle) => {
+        handle = ensuredHandle;
+        options.signal?.throwIfAborted();
+        if (!claudeEffort.isReady()) {
+          if (!runtime.setConfigOption) throw new Error("Claude effort admission requires native configuration");
+          const spawnsBeforeControl = commandLaunches.count;
+          await runtime.setConfigOption({ handle: ensuredHandle, key: "effort", value: selectedClaudeEffort! });
+          claudeEffort.assertReady();
+          await children.verifyLifetimeOwnership();
+          options.signal?.throwIfAborted();
+          // Fresh sessions retain their initialized provider. Only a cold
+          // control connection consumes another single-use launch snapshot.
+          if (commandLaunches.count > spawnsBeforeControl) {
+            await commandLaunches.refreshConsumedCommand?.();
+          }
+        }
+        return ensuredHandle;
       }) : ensuredSession)
     .catch((error: unknown) => {
       throw classifySessionEnsureFailure(error);
@@ -560,6 +589,7 @@ export async function openQualifiedAcpxRuntime(
     cursorInstructions?.assertReady();
     modeBinding?.assertReady();
     piThinking?.assertReady();
+    claudeEffort?.assertReady();
     // A provider can answer only after the verified sentinel is armed, but do
     // not admit the session until the owner has observed that exact handoff.
     await children.verifyLifetimeOwnership();
@@ -614,7 +644,7 @@ export async function openQualifiedAcpxRuntime(
     return runtimePort(
       runtime,
       handle,
-      { ...requireIdentity(handle), ...(modeBinding ? { mode: modeBinding.selectedMode } : {}), ...(selectedPiThinkingLevel ? { piThinkingLevel: selectedPiThinkingLevel } : {}) },
+      { ...requireIdentity(handle), ...(modeBinding ? { mode: modeBinding.selectedMode } : {}), ...(selectedPiThinkingLevel ? { piThinkingLevel: selectedPiThinkingLevel } : {}), ...(selectedClaudeEffort ? { claudeEffort: selectedClaudeEffort } : {}) },
       baseStore,
       children,
       runtimeCloseTimeoutMs,
@@ -622,6 +652,7 @@ export async function openQualifiedAcpxRuntime(
       commandLaunches,
       permissionBoundary,
       extensionBoundary,
+      options.profile.agent === "copilot",
       options.profile.agent === "copilot" ? assertCopilotPromptPolicy : undefined,
     );
   } catch (error) {
@@ -1052,6 +1083,7 @@ function runtimePort(
   commandLaunches: { count: number; refreshConsumedCommand?: () => Promise<void> },
   permissionBoundary: { active: AbortController | null; hasAdmittedTurn: boolean; handler?: AcpRuntimeOptions["onPermissionRequest"] },
   extensionBoundary: AcpxRuntimeExtensionBoundary,
+  monitorProviderDeath: boolean,
   assertPromptPolicy?: (text: string) => void,
 ): AcpxRuntimePort {
   extensionBoundary.sessionIds = new Set([identity.backendSessionId]);
@@ -1095,6 +1127,7 @@ function runtimePort(
     pendingExternalIntent: boolean;
   };
   let runtimeClosed = false;
+  let providerProcessLost = false;
   let runtimeCloseAttempt: RuntimeCloseAttempt | undefined;
   let lateReconciliationOwner: Promise<void> | undefined;
   // Each independently observed late failure receives a bounded reconciliation
@@ -1410,10 +1443,12 @@ function runtimePort(
         }
       : {}),
     startTurn(input) {
+      if (providerProcessLost) throw new AcpxProviderProcessLostError();
       assertPromptPolicy?.(input.text);
       if (extensionBoundary.active) throw new Error("ACPX runtime already has an active turn");
       const approval = new AbortController();
       const controller = new AbortController();
+      const providerDeath = new AbortController();
       const extensionTurn: AcpxRuntimeExtensionTurn = {
         requestId: input.requestId, sessionId: identity.backendSessionId, controller,
         signal: input.signal ? AbortSignal.any([controller.signal, input.signal, approval.signal]) : AbortSignal.any([controller.signal, approval.signal]),
@@ -1421,7 +1456,25 @@ function runtimePort(
         onRequest: input.onExtensionRequest, onNotification: input.onExtensionNotification,
       };
       extensionBoundary.active = extensionTurn;
+      // A guardian can outlive the provider while ACP awaits a callback.
+      // Native exit or a typed ACP agent disconnect retires this turn; losing
+      // the controller connection must preserve deliverable input instead.
+      // Cleanup still requires the independent provider-only lifetime proof.
+      const retireProviderTurn = (error = new AcpxProviderProcessLostError()): void => {
+        providerProcessLost = true;
+        providerDeath.abort(error);
+        approval.abort(error);
+        controller.abort(error);
+      };
+      const stopWatchingProviderExit = !monitorProviderDeath
+        ? () => undefined
+        : children.watchProviderExit(() => {
+          if (!runtimeCloseAttempt && !runtimeClosed && !extensionTurn.signal.aborted && extensionBoundary.active === extensionTurn) {
+            retireProviderTurn();
+          }
+        });
       const releaseExtensionTurn = (): void => {
+        stopWatchingProviderExit();
         controller.abort(new Error("ACPX extension turn expired"));
         if (extensionBoundary.active === extensionTurn) extensionBoundary.active = null;
       };
@@ -1451,9 +1504,18 @@ function runtimePort(
         throw error;
       }
       const guarded = turnWithVerifiedLifetimeOwnership(turn, finishOwnershipAdmission);
-      extensionTurn.promptStarted = guarded.promptStarted;
-      const result = guarded.result.then(
+      const promptStarted = abortableExtensionResult(guarded.promptStarted, providerDeath.signal);
+      void promptStarted.catch(() => undefined);
+      extensionTurn.promptStarted = promptStarted;
+      const result = abortableExtensionResult(guarded.result, providerDeath.signal).then(
         (value) => {
+          if (monitorProviderDeath && value.status === "failed"
+            && (value.error?.code === "AGENT_DISCONNECTED" || value.error?.detailCode === "AGENT_DISCONNECTED")) {
+            // ACP can terminalize before the independent exit observer runs.
+            // Retire callbacks and the session before finally removes the
+            // observer, so a late answer cannot admit another native turn.
+            retireProviderTurn(new AcpxProviderProcessLostError("The owned ACPX provider disconnected during its active turn"));
+          }
           approval.signal.throwIfAborted();
           // ACPX may resolve its own permission policy before invoking the
           // host callback. Keep that typed denial on the same runner outcome.
@@ -1470,6 +1532,7 @@ function runtimePort(
       void result.catch(() => undefined);
       return {
         ...guarded,
+        promptStarted,
         result,
         cancel: (input) => {
           controller.abort(new Error("ACPX extension turn cancelled"));
@@ -1480,16 +1543,28 @@ function runtimePort(
           return guarded.closeStream(input);
         },
         events: (async function* () {
+          const iterator = guarded.events[Symbol.asyncIterator]();
           try {
-            for await (const event of guarded.events) {
+            for (;;) {
+              const next = await abortableExtensionResult(iterator.next(), providerDeath.signal);
+              if (next.done) break;
               approval.signal.throwIfAborted();
-              yield event;
+              yield next.value;
             }
           } catch (error) {
             approval.signal.throwIfAborted();
             throw error;
+          } finally {
+            // A broken provider may never release its iterator. Observe its
+            // eventual close without delaying the failed turn's publication.
+            void iterator.return?.().catch(() => undefined);
           }
           approval.signal.throwIfAborted();
+          // Copilot's transport can end its event iterator before independent
+          // provider-exit proof settles the pending permission and turn result.
+          // Do not publish a successful stream end while that turn still owns
+          // an unanswered callback or an unreported failure.
+          if (monitorProviderDeath) await result;
         })(),
       };
     },
@@ -1746,6 +1821,7 @@ class SpawnedChildSet {
   readonly #providerExits = new Map<ChildProcess, ProviderExitObservation>();
   readonly #terminations = new Map<ChildProcess, Promise<unknown[]>>();
   readonly #lifetimeOwnership: Promise<void>[] = [];
+  readonly #exitWatchers = new Set<() => void>();
   #lifetimeOwnershipSealed = false;
   #sealed = false;
 
@@ -1831,6 +1907,11 @@ class SpawnedChildSet {
     };
   }
 
+  watchProviderExit(observer: () => void): () => void {
+    this.#exitWatchers.add(observer);
+    return () => { this.#exitWatchers.delete(observer); };
+  }
+
   #track(child: ChildProcess, providerExit: ProviderExitObservation): void {
     this.#children.add(child);
     const onError = (error: unknown) => this.#errors.add(error);
@@ -1857,6 +1938,7 @@ class SpawnedChildSet {
     providerExit.observe((outcome) => {
       if (outcome.exited) {
         providerExited = true;
+        for (const observer of this.#exitWatchers) observer();
         forgetIfReleased();
       } else {
         this.#errors.add(outcome.error);

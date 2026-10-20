@@ -408,6 +408,17 @@ above still apply.
 
 ## Native Runner Trace Spans
 
+Provider-pack fallback staging separates `provider_pack.archive.verify`
+(controller archive identity), `provider_pack.archive.probe` (remote helper support),
+`provider_pack.archive.reuse` (copy and hash image files),
+`provider_pack.archive.verify_missing` (verify only layers needing upload),
+`provider_pack.archive.transfer` (compressed file
+transfer), and `provider_pack.archive.extract` (received hash check and extraction).
+They are children of the existing pack selection/upload path and also appear in
+the local run timing log. Their fixed names add no paths, credentials, or content
+attributes. The operator endpoint gate remains unchanged. Source installs without
+prebuilt archives retain the existing directory upload span.
+
 The native provider lifecycle emits one foldable OpenTelemetry trace, linked to
 the server attempt described above. This is
 the native-run trace schema version `3`. `task.provider_session` is the native
@@ -704,7 +715,9 @@ backend Sentry DSN and the audited SDK. Set `PAPERCLIP_SENTRY_RUN_FAILURES` to:
 
 Missing, blank, or unrecognized values keep run reporting off. Expected operator
 stops, shutdown interruptions, successful runs, and queued work do not report in
-either enabled mode. The mode does not change run status, retries, recovery,
+either enabled mode. A native run that is `failed` while it waits for a same-run
+retry (`nativePhase` `retryable_failure`) does not report either. It reports once
+if a later write ends the retry as a terminal failure. The mode does not change run status, retries, recovery,
 Telemetry, or OpenTelemetry export. It is process-wide, so an operator can enable
 it on one staging instance without enabling it on other deployments. Restart the
 server after changing deployment environment variables.
@@ -1504,13 +1517,20 @@ The `sandbox.startup` root span uses this closed attribute allowlist.
 | `paperclip.sandbox.startup.root.work_ms` | number  | no       | The sum of the step wall times.                            |
 | `paperclip.sandbox.startup.root.diff_ms` | number  | no       | `work_ms − wall_ms`; the overlap the parallel steps saved. |
 | `paperclip.sandbox.startup.provider`     | string  | yes      | The normalized provider family.                            |
-| `paperclip.sandbox.startup.cold_start`   | boolean | yes      | Whether the bring-up is a cold start.                      |
+| `paperclip.sandbox.startup.cold_start`   | boolean | yes      | Legacy value, set only when receipts establish cold or warm startup. |
+| `paperclip.sandbox.startup.warmth`       | string  | yes      | Receipt-derived `cold`, `warm`, `partial_reuse`, or `unknown`. |
 | `paperclip.sandbox.startup.region`       | string  | yes      | The clamped region label.                                  |
 | `paperclip.sandbox.startup.image_id`     | string  | yes      | The hashed image id.                                       |
 | `paperclip.sandbox.startup.sandbox_id`   | string  | yes      | The hashed sandbox id.                                     |
 | `paperclip.sandbox.startup.lease_id`     | string  | yes      | The hashed lease id.                                       |
 
 ### Step span attributes
+
+The root's warmth uses the per-layer receipts documented in
+[run-log-events.md](./run-log-events.md#startup-reuse-evidence). Partial and
+unknown evidence omit the legacy `cold_start` boolean. A reused session ID or
+runtime object alone cannot establish warmth. These attributes retain the
+operator OTLP endpoint gate and are no-operations without that endpoint.
 
 Each bring-up step span uses this closed attribute allowlist. The step name
 rides the span name, so no `step` attribute repeats it.

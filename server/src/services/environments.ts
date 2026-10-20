@@ -322,6 +322,14 @@ function mergeManagedEnvironmentMetadata(
   return merged;
 }
 
+function preserveInvalidatedSnapshotProofs(replacement: SQL): SQL {
+  const proofs = sql`(select coalesce(jsonb_object_agg(entry.key, entry.value || '{"invalidated":true}'::jsonb), '{}'::jsonb)
+    from jsonb_each(coalesce(${environments.metadata}->${SANDBOX_PLATFORM_PROBE_METADATA_KEY}, '{}'::jsonb)) as entry
+    where entry.value->>'v' = '2')`;
+  return sql`case when ${proofs} = '{}'::jsonb then ${replacement}
+    else coalesce(${replacement}, '{}'::jsonb) || jsonb_build_object(${SANDBOX_PLATFORM_PROBE_METADATA_KEY}::text, ${proofs}) end`;
+}
+
 export function environmentService(db: Db) {
   /**
    * Idempotently ensure THE Paperclip-managed sandbox environment for this
@@ -869,8 +877,11 @@ export function environmentService(db: Db) {
       proof: Record<string, unknown> | null;
     }): Promise<boolean> => {
       const existing = sql`coalesce(${environments.metadata}->${SANDBOX_PLATFORM_PROBE_METADATA_KEY}, '{}'::jsonb)`;
+      const previous = sql`${existing}->${input.companyId}`;
       const probes = input.proof === null
-        ? sql`${existing} - ${input.companyId}`
+        ? sql`case when ${previous}->>'v' = '2'
+          then jsonb_set(${existing}, ARRAY[${input.companyId}]::text[], ${previous} || '{"invalidated":true}'::jsonb, true)
+          else ${existing} - ${input.companyId} end`
         : sql`${existing} || ${JSON.stringify({ [input.companyId]: input.proof })}::jsonb`;
       const rows = await db.update(environments).set({
         metadata: sql`jsonb_set(coalesce(${environments.metadata}, '{}'::jsonb), ARRAY[${SANDBOX_PLATFORM_PROBE_METADATA_KEY}]::text[], ${probes}, true)`,
@@ -1142,7 +1153,8 @@ export function environmentService(db: Db) {
         const userMetadata = withoutManagedEnvironmentArchiveToken(patch.metadata ?? null);
         if (userMetadata) delete userMetadata[SANDBOX_PLATFORM_PROBE_METADATA_KEY];
         if (changesTarget) {
-          values.metadata = userMetadata;
+          const replacement = userMetadata === null ? sql`null::jsonb` : sql`${JSON.stringify(userMetadata)}::jsonb`;
+          metadataUpdate = preserveInvalidatedSnapshotProofs(replacement);
         } else {
           const replacement = userMetadata === null ? sql`null::jsonb` : sql`${JSON.stringify(userMetadata)}::jsonb`;
           metadataUpdate = sql`case when ${environments.metadata} ? ${SANDBOX_PLATFORM_PROBE_METADATA_KEY}
@@ -1152,7 +1164,7 @@ export function environmentService(db: Db) {
         }
       } else if (changesTarget || patch.status !== undefined) {
         metadataUpdate = sql`${environments.metadata} - ${MANAGED_ENVIRONMENT_ARCHIVE_TOKEN_METADATA_KEY}`;
-        if (changesTarget) metadataUpdate = sql`${metadataUpdate} - ${SANDBOX_PLATFORM_PROBE_METADATA_KEY}`;
+        if (changesTarget) metadataUpdate = preserveInvalidatedSnapshotProofs(sql`${metadataUpdate} - ${SANDBOX_PLATFORM_PROBE_METADATA_KEY}`);
       }
 
       const row = await writeDb

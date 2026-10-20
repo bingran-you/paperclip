@@ -61,6 +61,7 @@ export interface AdapterDisplayInfo {
 }
 
 const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
+  copilot_runtime: { label: "GitHub Copilot", description: "Copilot through Paperclip Runner", icon: Code, hideFromVisualSelection: true },
   acpx_local: {
     label: "ACPX (retired)",
     description: "Retired standalone ACPX adapter",
@@ -220,7 +221,8 @@ export function agentDisplayAdapterType(agent: { adapterType: string; adapterCon
   if (agent.adapterConfig.provider === "openai_dot" || agent.adapterConfig.provider === "grok_bot" || agent.adapterConfig.provider === "muse") {
     return agent.adapterConfig.provider;
   }
-  return agentHarnessType(agent.adapterType, agent.adapterConfig) === "codex_local" ? "codex_local" : agent.adapterType;
+  const harness = agentHarnessType(agent.adapterType, agent.adapterConfig);
+  return ["codex_local", "claude_local"].includes(harness) ? harness : agent.adapterType;
 }
 
 export function isKnownAdapterType(type: string): boolean {

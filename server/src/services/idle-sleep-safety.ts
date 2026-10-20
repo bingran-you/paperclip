@@ -212,7 +212,7 @@ const WORK_CHECKS = [
     "chat_deliveries", "chat_publications", "chat_actions",
     "chat_completion_deliveries", "tool_action_requests", "tool_action_deliveries",
     "workspace_runtime_services",
-    "execution_workspace_runtime_leases", "pipeline_automation_executions",
+    "execution_workspace_runtime_leases",
     "native_run_finalizations", "company_transfer_runs", "decisions", "decision_effect_executions",
     "decision_archive_notification_outbox", "browser_use_sessions", "browser_use_runs",
     "browser_use_browsers",

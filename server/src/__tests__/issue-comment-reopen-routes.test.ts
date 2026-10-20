@@ -6,6 +6,9 @@ import { HttpError } from "../errors.js";
 vi.mock("../services/fast-responses.js", () => ({
   enqueueFastResponse: vi.fn(async () => undefined),
 }));
+vi.mock("../services/execution-blocker.js", () => ({
+  getExecutionBlocker: vi.fn(async () => null),
+}));
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -1215,7 +1218,7 @@ describe("issue comment reopen routes", () => {
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -1246,6 +1249,58 @@ describe("issue comment reopen routes", () => {
     );
   });
 
+  it.each([
+    ["post", "queued"],
+    ["post", "running"],
+    ["patch", "queued"],
+    ["patch", "running"],
+  ] as const)("preserves a %s comment's %s retry execution", async (method, status) => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      ...createScheduledRetry(),
+      status,
+    });
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+
+    const app = await installActor(createApp());
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "Recovery evidence is attached." })
+      : await request(app).patch(`/api/issues/${issue.id}`).send({ comment: "Recovery evidence is attached." });
+
+    expect(res.status).toBe(method === "post" ? 201 : 200);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(issue.id, expect.objectContaining({ status: "todo" }));
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      issue.assigneeAgentId,
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+  });
+
+  it.each(["post", "patch"] as const)("keeps the task active when a retry is promoted during a %s comment", async method => {
+    const issue = { ...makeIssue("in_progress"), executionRunId: "retry-run-1" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue(createScheduledRetry());
+    mockHeartbeatService.cancelRun.mockResolvedValue({ id: "retry-run-1", status: "running" });
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+    const app = await installActor(createApp());
+
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${issue.id}/comments`).send({ body: "Additional context for the active run." })
+      : await request(app).patch(`/api/issues/${issue.id}`).send({ comment: "Additional context for the active run." });
+
+    expect(res.status).toBe(method === "post" ? 201 : 200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(issue.id, expect.objectContaining({ status: "todo" }));
+    expect(mockLogActivity).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "heartbeat.cancelled" }));
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      issue.assigneeAgentId, expect.objectContaining({ reason: "issue_commented" }),
+    ));
+  });
+
   it("does not move scheduled-retry issues to todo when POST comment retry cancellation fails", async () => {
     const issue = {
       ...makeIssue("in_progress"),
@@ -1262,7 +1317,7 @@ describe("issue comment reopen routes", () => {
       .send({ body: "I added the missing detail; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(
@@ -1945,7 +2000,7 @@ describe("issue comment reopen routes", () => {
         actorUserId: "local-board",
       }),
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",
@@ -1976,7 +2031,7 @@ describe("issue comment reopen routes", () => {
       .send({ comment: "Retry window is over; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1", undefined, { expectedStatus: "scheduled_retry" });
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(

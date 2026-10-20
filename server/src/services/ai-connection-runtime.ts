@@ -1,3 +1,4 @@
+import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
@@ -28,6 +29,7 @@ export function isAiConnectionBusy(error: unknown): error is HttpError {
 
 // Blank values intentionally override inherited credentials in CLI child environments.
 export const AI_AUTH_ENV_KEYS = [
+  "COPILOT_GITHUB_TOKEN",
   "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_CODEX_PROVIDERS",
   "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_USE_VERTEXAI",
   "HERMES_HOME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -311,6 +313,7 @@ export async function prepareManagedAiRuntime(
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
       ...managedAiHomeEnvironment(home),
+      ...(input.binding.provider === "github" ? { GH_TOKEN: "", GITHUB_TOKEN: "" } : {}),
     };
     const capability =
       AI_CONNECTION_CAPABILITIES[input.binding.provider].methods[
@@ -336,7 +339,7 @@ export async function prepareManagedAiRuntime(
     }
     if (!routing && input.binding.provider === "openrouter") {
       env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
-        provider: { openrouter: { options: { apiKey: value } } },
+        provider: { openrouter: { options: { apiKey: value, headers: OPENROUTER_ATTRIBUTION_HEADERS } } },
       });
       env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
     }
@@ -352,7 +355,15 @@ export async function prepareManagedAiRuntime(
     }
     const projected = routing ? managedProviderRouting(routing, harness, value, typeof input.config.model === "string" ? input.config.model : "") : undefined;
     if (projected) {
+      const customHeaders = env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS;
       Object.assign(env, projected.env);
+      if (projected.env.ANTHROPIC_CUSTOM_HEADERS && customHeaders !== undefined) {
+        // Preserve secret references until adapter resolution; the adapter merges
+        // attribution after resolving them. Ordinary gateway headers survive too.
+        env.ANTHROPIC_CUSTOM_HEADERS = typeof customHeaders === "string"
+          ? openRouterClaudeHeaders(customHeaders)
+          : customHeaders;
+      }
       if (projected.hermesConfig) await writeFile(path.join(providerHome, "config.yaml"), projected.hermesConfig, { mode: 0o600 });
       if (projected.codexConfig) await writeFile(path.join(providerHome, "config.toml"), 'cli_auth_credentials_store = "file"\n' + projected.codexConfig, { mode: 0o600 });
     }

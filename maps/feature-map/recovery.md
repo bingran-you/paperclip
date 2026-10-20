@@ -23,6 +23,13 @@ Agent access: [companion](../agent-access-map/recovery.md).
   permitted operator action; it does not claim an automatic path is still live.
 - `workspace`: workspace divergence/export failures show the applicable repair,
   reconcile, or isolated reissue action with evidence and authority checks.
+  Retained-file recovery runs in the harness with observed task progress and a
+  Retry recovery action only after transient failures. It preserves newer files,
+  keeps uncertain sources held, and delivers saved human input through ordinary
+  admission. The task does not expose infrastructure-certification forms or a
+  workspace link when the destination is disabled. Local PostgreSQL and real
+  filesystem regressions cover native and legacy recovery and one-time delivery;
+  hosted provider recovery remains separate acceptance.
 - `unknown-outcome`: uncertain external side effects require inspection and
   an explicit decision, not automatic replay.
 - `user-continuation`: saved user messages after a stop are reconsidered once
@@ -64,6 +71,16 @@ confirmation; unavailable actions must explain the gate or remain absent.
 After a stop, send a new instruction on the same task or inspect one already
 saved while cleanup was pending. Observe the waiting message, continuation, and
 eventual result rather than manually changing the task status to look complete.
+
+A continuation denied before startup by an existing execution hold remains a
+wait. Once the original hold clears, the server verifies the dispatch receipt
+and absence of execution evidence, ignores any historical false incident for
+that unused admission, and reconsiders saved input through normal admission.
+No infrastructure-certification form is needed. The
+[database regressions](../../server/src/__tests__/heartbeat-undispatched-execution-wait.test.ts)
+cover incident prevention, retained audit history, concurrent restart admission,
+ordered messages, contradictory execution evidence, and unchanged pause and
+task gates. These tests do not qualify a live provider or prove task completion.
 
 ### `browser-reconnect`
 
@@ -109,6 +126,13 @@ workspace references. These cases prove classification, not a live remote
 provider restart. For that journey, interrupt a disposable deployment after
 workspace preparation and before its first executor claim, then confirm one
 provider turn starts on the original run through the normal admission gates.
+
+Active remote process supervision distinguishes a failed health read from a
+confirmed exit. The [executor tests](../../server/src/services/native-runtime/native-session-executor.test.ts)
+exercise timeout recovery with a real listening process, unchanged ownership,
+and rejected identity evidence. The Runner restart tests require positive exit
+evidence before replacement. This coverage does not prove recovery of a
+historical retained sandbox or behavior during a live provider outage.
 
 The same database suite pauses an original preparation while recovery claims
 the remote run. It then verifies that the old preparation yields without opening
@@ -203,6 +227,20 @@ explicit rejection. Reload to confirm the durable outcome. For a workspace
 repair, record the compared branches/revisions and preserve uncommitted work;
 confirm the repair's actual result before resuming. Check the denied and stale
 action paths. A changed card label is insufficient proof of workspace integrity.
+
+For graceful legacy shutdown, interrupt a disposable sandbox run while file
+export is in flight. Delay settlement past the first 30-second wait. Confirm
+the lease stays available, no repair hold or successor appears before export,
+and the finalizer drain waits for the same owner. After export, confirm saved
+files, successful lease cleanup, and one bounded continuation. Reload before
+checking the successor. Repeat with controller loss: the expired fence must
+retain the exact source and require repair, never claim restored files or start
+a second executor. The database-backed
+[shutdown regression](../../server/src/__tests__/heartbeat-process-recovery.test.ts)
+checks finalizer joining, release order, durable retry uniqueness, and reload.
+The [settlement regressions](../../server/src/services/heartbeat/recovery.test.ts)
+cover other-controller fencing and owner loss. Provider boundaries are controlled
+in these tests; they do not qualify a live sandbox export.
 
 For an abandoned native controller, follow the [stop-verification procedure](../../doc/native-workspace-finalization-recovery.md)
 with a disposable deployment. A new platform-bound owner recovers automatically

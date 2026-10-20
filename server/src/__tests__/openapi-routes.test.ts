@@ -13,7 +13,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
 
 const apiPrefixes: Record<string, string> = {
-  "pipelines.ts": "/api",
   "cases.ts": "/api",
   "smoke-lab.ts": "/api",
   "access.ts": "/api",
@@ -26,6 +25,7 @@ const apiPrefixes: Record<string, string> = {
   "announcements.ts": "/api",
   "ai-connections.ts": "/api",
   "decision-models.ts": "/api",
+  "agent-observability.ts": "/api",
   "fast-responses.ts": "/api",
   "attention.ts": "/api",
   "approvals.ts": "/api",
@@ -310,6 +310,15 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("removes Pipelines discovery while retaining Cases and Routines", () => {
+    const spec = buildOpenApiSpec() as any;
+    const paths = Object.keys(spec.paths);
+    expect(paths.filter((path) => /pipelines|review-cases|case-events|\{caseId\}/.test(path))).toEqual([]);
+    expect(spec.paths["/api/companies/{companyId}/cases"].post).toBeDefined();
+    expect(spec.paths["/api/cases/{id}"].get).toBeDefined();
+    expect(spec.paths["/api/routines/{id}/run"].post).toBeDefined();
+  });
+
   it("documents anonymous liveness separately from database readiness", () => {
     const spec = buildOpenApiSpec() as any;
     for (const method of ["get", "head"]) {
@@ -356,10 +365,19 @@ describe("openapi routes", () => {
     expect(operation.responses["404"]).toBeDefined();
   });
 
-  it("documents strict run-attributed feedback without a read endpoint", () => {
+  it("documents strict run-attributed feedback and board-only commentary reads", () => {
     const { spec } = loadSpecRoutes();
     const path = spec.paths["/api/companies/{companyId}/agent-commentary"];
-    expect(Object.keys(path)).toEqual(["post"]);
+    expect(Object.keys(path)).toEqual(["get", "post"]);
+    const detail = spec.paths["/api/companies/{companyId}/agent-commentary/{id}"].get;
+    for (const read of [path.get, detail]) {
+      expect(read.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+      expect(read.responses["403"]).toBeDefined();
+      expect(read.responses["404"]).toBeDefined();
+    }
+    expect(path.get.parameters.map((parameter: { name: string }) => parameter.name)).toEqual(
+      expect.arrayContaining(["agentId", "kind", "q", "limit", "offset"]),
+    );
     const operation = path.post;
     expect(operation.security).toEqual([{ AgentBearerAuth: [] }]);
     expect(operation["x-paperclip-authorization"]).toEqual({ actor: "agent", heartbeatBound: true });
@@ -393,6 +411,19 @@ describe("openapi routes", () => {
     expect(Object.keys(remove.responses)).toEqual(expect.arrayContaining(["200", "400", "401", "403", "404", "409"]));
   });
 
+  it("documents masked board-only agent export settings and revision-checked writes", () => {
+    const { spec } = loadSpecRoutes();
+    const settings = spec.paths["/api/companies/{companyId}/observability"];
+    const test = spec.paths["/api/companies/{companyId}/observability/test"].post;
+    for (const operation of [settings.get, settings.put, settings.delete, test]) {
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    }
+    expect(settings.delete.requestBody.content["application/json"].schema).toMatchObject({ required: ["expectedRevision"], additionalProperties: false });
+    expect(test.responses["409"]).toBeDefined();
+    expect(JSON.stringify(settings.get.responses)).not.toMatch(/credentialsSecretId|ciphertext|apiKey/);
+    expect(test.responses["200"].content["application/json"].schema.properties.source).toMatchObject({ enum: ["control_plane"] });
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
@@ -423,6 +454,14 @@ describe("openapi routes", () => {
     expect(wake.responses["202"]).toBeDefined();
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
+  });
+  it("advertises the guarded prepared-task promotion contract to API clients", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const patch = res.body.paths["/api/issues/{id}"].patch;
+    expect(patch.requestBody.content["application/json"].schema.properties.expectedStatusVersion)
+      .toMatchObject({ type: "integer", minimum: 0 });
+    expect(patch.responses["409"]).toBeDefined();
+    expect(patch.description).toContain("send exactly status=todo and expectedStatusVersion");
   });
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");

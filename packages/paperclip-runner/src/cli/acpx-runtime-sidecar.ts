@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
+import { resolveClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import { parseProviderMode } from "../contracts/provider-mode.js";
 import { acpxProfileActivity, type AcpxActivityAdapter, type AcpxToolEvidence } from "../drivers/acpx/profile-activity.js";
 
@@ -35,7 +37,7 @@ import {
   normalizeAcpFormElicitation,
   type NormalizedAcpForm,
 } from "../drivers/acpx/acp-question-adapter.js";
-import { openCodexAcpxRuntime } from "../drivers/acpx/codex-runtime-adapter.js";
+import { openCodexAcpxRuntime, AcpxProviderProcessLostError } from "../drivers/acpx/codex-runtime-adapter.js";
 import { AcpxApprovalRequiredError } from "../drivers/acpx/permission-policy.js";
 import { normalizeAcpxPermission, type NormalizedAcpxPermission } from "../drivers/acpx/acp-permission-adapter.js";
 import { acpxGoalProjection } from "../drivers/acpx/session-goals.js";
@@ -299,6 +301,7 @@ async function dispatch(
         permissionMode: params.permissionMode,
         mode: params.mode,
         piThinkingLevel: params.piThinkingLevel,
+        claudeEffort: params.claudeEffort,
         providerPolicy: params.providerPolicy,
         systemInstructions: params.systemInstructions,
         runtimeContext: params.runtimeContext,
@@ -680,7 +683,7 @@ async function pumpTurn(
     terminal = {
       status: "failed",
       error: {
-        ...(error instanceof AcpxApprovalRequiredError ? { code: error.code } : {}),
+        ...(error instanceof AcpxApprovalRequiredError || error instanceof AcpxProviderProcessLostError ? { code: error.code } : {}),
         message: safeMessage(error),
         retryable: false,
       },
@@ -1224,12 +1227,13 @@ function safeOutput(value: unknown): Record<string, unknown> {
 function parseOpenParams(
   value: Record<string, unknown>,
 ): AcpxSidecarOpenParams {
-  const fields = new Set(["runtimeDirectory", "normalizedSessionId", "workingDirectory", "agent", "model", "permissionMode", "mode", "piThinkingLevel", "permissionModePinned", "providerPolicy", "systemInstructions", "runtimeContext", "tools", "providerSessionKey", "expectedIdentity"]);
+  const fields = new Set(["runtimeDirectory", "normalizedSessionId", "workingDirectory", "agent", "model", "permissionMode", "mode", "piThinkingLevel", "claudeEffort", "permissionModePinned", "providerPolicy", "systemInstructions", "runtimeContext", "tools", "providerSessionKey", "expectedIdentity"]);
   if (Object.keys(value).some(key => !fields.has(key))) throw new Error("ACPX open parameters include an unsupported field");
   const agent = requireQualifiedAgent(value.agent);
   const model = requiredText(value.model, "model");
   if (value.mode !== undefined && agent !== "cursor") throw new Error("mode is supported only for Cursor");
   const piThinkingLevel = resolvePiThinkingLevel(agent, value.piThinkingLevel);
+  const claudeEffort = resolveClaudeEffort(agent, value.claudeEffort);
   resolveQualifiedAcpxProfile(agent, model);
   if (
     value.providerSessionKey !== undefined &&
@@ -1251,6 +1255,7 @@ function parseOpenParams(
     permissionMode: requiredPermissionMode(value.permissionMode),
     ...(value.mode === undefined ? {} : { mode: parseProviderMode(value.mode) }),
     ...(piThinkingLevel ? { piThinkingLevel } : {}),
+    ...(claudeEffort ? { claudeEffort } : {}),
     permissionModePinned: value.permissionModePinned === true,
     ...(value.providerPolicy == null ? {} : { providerPolicy: parseProviderPolicy(value.providerPolicy) }),
     systemInstructions: boundedText(
@@ -1322,6 +1327,7 @@ function parseExpectedIdentity(value: unknown): AcpxExpectedSessionIdentity {
       : { permissionMode: requiredPermissionMode(input.permissionMode) }),
     ...(input.mode === undefined ? {} : { mode: parseProviderMode(input.mode) }),
     ...(input.piThinkingLevel === undefined ? {} : { piThinkingLevel: resolvePiThinkingLevel("pi", input.piThinkingLevel) }),
+    ...(input.claudeEffort === undefined ? {} : { claudeEffort: resolveClaudeEffort("claude", input.claudeEffort) }),
     providerLifetimeFenceCandidates: requiredFenceCandidates(
       input.providerLifetimeFenceCandidates,
     ),
@@ -1526,7 +1532,7 @@ function safeText(value: unknown, maxBytes = 8_192): string {
 }
 
 function redactSecrets(value: string): string {
-  return value.replace(
+  return redactObservabilityDiagnostic(value, process.env).replace(
     /(key|token|secret|password|authorization)\s*[:=]\s*[^\s,}\]]+/gi,
     "$1=[REDACTED]",
   );

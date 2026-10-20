@@ -310,8 +310,9 @@ describe("AppDefinition catalog", () => {
   it("separates GitHub tools from the review bot without changing the provider identity", () => {
     const github = getConnectableAppDefinition("github")!;
     const bot = getConnectableAppDefinition("github-code-review-bot")!;
-    expect(github.methods.map((method) => method.key)).toEqual(["managed", "mcp-key"]);
-    expect(github.methods.every((method) => method.purpose === "tool")).toBe(true);
+    expect(github.methods.map((method) => method.key)).toEqual(["managed", "mcp-key", "copilot-token"]);
+    expect(github.methods.filter((method) => method.purpose === "tool").map((method) => method.key)).toEqual(["managed", "mcp-key"]);
+    expect(github.methods.find((method) => method.key === "copilot-token")).toMatchObject({ purpose: "ai", transport: "runtime_auth" });
     expect(bot.name).toBe("GitHub Code Review Bot");
     expect(bot.methods).toHaveLength(1);
     expect(bot.methods[0]).toMatchObject({ provider: "github", purpose: "channel", transport: "chat_sdk" });
@@ -884,7 +885,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(81);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(82);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -956,7 +957,7 @@ describe("AppDefinition catalog", () => {
   });
   it("keeps all Google Workspace profiles aligned with their app, endpoint, scopes, ownership, risk, and write policy", () => {
     expect(GOOGLE_WORKSPACE_CONNECTOR_PROFILE_IDS).toEqual(
-      GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS.map((entry) => entry.profile),
+      [...GOOGLE_WORKSPACE_PROFILE_EXPECTATIONS.map((entry) => entry.profile), "workspace.all"],
     );
     expect(Object.keys(GOOGLE_WORKSPACE_CONNECTOR_PROFILES)).toEqual([
       ...GOOGLE_WORKSPACE_CONNECTOR_PROFILE_IDS,

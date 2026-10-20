@@ -760,6 +760,9 @@ export function createPostgresRunDispatchAdapter(
     const promoteLockedRun = async (tx: Db, run: HeartbeatRun, publications: ActivityPublication[]) => {
       if (
         run.status !== "scheduled_retry" ||
+        // The locked row is also the cancellation claim. If Stop won first,
+        // leave settlement to that owner rather than promote its parked run.
+        run.resultJson?.startupCancellation ||
         !run.scheduledRetryAt ||
         new Date(run.scheduledRetryAt).getTime() > now.getTime()
       ) {

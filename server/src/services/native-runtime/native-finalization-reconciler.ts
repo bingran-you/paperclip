@@ -35,7 +35,7 @@ import {
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
-import { reportRunFailure } from "../run-failure-report.js";
+import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { dismissObsoleteNativePolicyReviews } from "./obsolete-policy-reviews.js";
 import {
@@ -519,9 +519,10 @@ export async function claimNativeSessionResumptions(input: {
         }).where(eq(heartbeatRuns.id, row.run.id)).returning();
         // Only a genuine transition into "failed" is a new terminal failure.
         // A candidate that is already "failed" (the filter above admits
-        // both "running" and "failed") must not send a second Sentry event.
+        // both "running" and "failed") must not send a second Sentry event,
+        // unless that earlier write was an unreported pending retry.
         terminalRunToEmit =
-          updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
+          updatedRun && isNewTerminalRunFailure(row.run, updatedRun) ? updatedRun : null;
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
           { status: "blocked" },

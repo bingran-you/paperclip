@@ -1,3 +1,4 @@
+import type { NativeRunRuntimeGrant } from "./runtime-context.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -458,6 +459,7 @@ export interface AcpxSessionIdentity {
   /** Effective provider mode identifier, bound to the session identity. */
   mode?: string;
   piThinkingLevel?: "off" | "low" | "high" | "max";
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   providerLifetimeFenceCandidates: readonly [number, number, number];
 }
 
@@ -507,7 +509,7 @@ export interface HarnessSession {
     displayId?: string | null;
   };
   events(): AsyncIterable<PrpEvent>;
-  attachRun?(input: { runId: string }): Promise<void> | void;
+  attachRun?(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */

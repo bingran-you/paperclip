@@ -1,6 +1,8 @@
+import { applyProviderObservabilityEnvironment, redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
 import { resolvePinnedOpenCodeCommand } from "../drivers/opencode/opencode-server-driver.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
+import { resolveClaudeEffort, admittedClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import { admittedPiThinkingLevel, resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
@@ -29,7 +31,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
@@ -78,7 +80,7 @@ import {
   createSanitizedAwsAgentCoreEnvironment,
   createSanitizedClaudeManagedEnvironment,
 } from "../drivers/claude-managed/environment.js";
-import { composeNativeSystemInstructions, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
+import { composeNativeSystemInstructions, type NativeRunRuntimeGrant, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
 import type {
   NativeAcpxPermissionMode,
   NativeOpenCodePermissionMode,
@@ -425,6 +427,22 @@ async function rotateExternalAuthorityEpoch(
   });
   assertSuspendedRunnerState(archivedRunnerState, priorIdentity);
   return controlPlaneState;
+}
+
+function projectCopilotRunGrant(
+  grant: NativeRunRuntimeGrant,
+  runnerFilesystemRoot?: string,
+): NativeRunRuntimeGrant {
+  const projected = structuredClone(grant);
+  const context = projected.runtimeContext;
+  if (!runnerFilesystemRoot || !context) return projected;
+  const sourceInstructionRoot = context.instructions.bundle.rootPath;
+  context.instructions.bundle.rootPath = posix.join(runnerFilesystemRoot, "context", "instructions");
+  context.skills.forEach((skill, index) => {
+    skill.bundle.rootPath = posix.join(runnerFilesystemRoot, "context", "skills", `${index}-${skill.bundle.digest.slice(0, 12)}`);
+  });
+  projected.instructions = projected.instructions.replaceAll(sourceInstructionRoot, context.instructions.bundle.rootPath);
+  return projected;
 }
 
 function rotatedRunAttachPayload(
@@ -1220,6 +1238,7 @@ export interface CapabilityRunnerdProcessEvidence {
   providerDriver: string | null;
   /** Effective native mode, populated only from the admitted Pi identity. */
   piThinkingLevel?: "off" | "low" | "high" | "max";
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   providerVersion: string | null;
   acpxAgent: QualifiedAcpxAgent | null;
   agentServerVersion: string | null;
@@ -1236,6 +1255,7 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
+  observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   observeCredentials?: boolean;
@@ -1247,6 +1267,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
   piThinkingLevel?: "off" | "low" | "high" | "max";
+  claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   acpxPermissionModePinned?: boolean;
   acpxSidecarPath?: string;
   /** SHA-256 verified by the provider-pack authority before runner startup. */
@@ -1459,6 +1480,17 @@ export function expandRunnerdCanonicalNotifications(
       params,
     };
   });
+}
+
+/** Keep durable expiry visible to the facade before its terminal notification. */
+export function runnerdRuntimeRequestExpiryNotification(
+  eventType: string, payload: Record<string, unknown>, threadId: string | null, turnId: string | null,
+): CodexRpcNotification | null {
+  if (eventType !== "runtime_request.expired") return null;
+  return { method: "paperclip/runtimeRequestExpired", params: {
+    ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}),
+    payload, itemId: payload.itemId,
+  } };
 }
 
 export function runnerdCanonicalNotificationMethod(
@@ -3008,6 +3040,7 @@ function resolveBuildOwnedCliArtifact(
 function acpxProviderPackageAuthority(
   sidecarScript: string,
   ownerPackageRoot = packageRoot,
+  agent?: QualifiedAcpxAgent,
 ): {
   root: string;
   manifest: string;
@@ -3046,6 +3079,15 @@ function acpxProviderPackageAuthority(
     );
   }
   const sidecarPackageRoot = resolve(cliDirectory, "../..");
+  // Copilot's native closure belongs to the runner package itself. Its asset
+  // guard requires the bound manifest directly inside that same package root;
+  // the workspace dependency root used by JS providers is a different owner.
+  if (agent === "copilot") {
+    return {
+      root: sidecarPackageRoot,
+      manifest: resolve(sidecarPackageRoot, "package.json"),
+    };
+  }
   // A local source build lives at <workspace>/packages/paperclip-runner and
   // resolves dependencies from <workspace>/node_modules. `pnpm deploy` makes
   // the package itself the deployment root and owns <deploy>/node_modules/.pnpm.
@@ -3264,7 +3306,7 @@ function withRunnerdProviderTrace(
   }
   return result;
 }
-export function createCapabilityRunnerdProviderEnvironment(input: {
+function createCapabilityRunnerdProviderEnvironmentBase(input: {
   provider: NonNullable<CapabilityRunnerdCodexTransportOptions["provider"]>;
   options: CapabilityRunnerdCodexTransportOptions;
   identity: DurableRecoveryIdentity;
@@ -3297,7 +3339,9 @@ export function createCapabilityRunnerdProviderEnvironment(input: {
       input.acpxSidecarPath ??
       input.options.acpxSidecarPath ??
       resolve(packageRoot, "dist", "cli", "acpx-runtime-sidecar.cjs");
-    const providerPackageAuthority = acpxProviderPackageAuthority(sidecarPath);
+    const providerPackageAuthority = acpxProviderPackageAuthority(
+      sidecarPath, packageRoot, input.options.acpxAgent,
+    );
     // This is the trusted runner/sidecar boundary. The provider sandbox still
     // uses createSanitizedAcpxSpawnInput and does not inherit gateway tokens.
     const assignedGateway = nativeMcpLaunchBinding(input.options.environment ?? {});
@@ -3358,6 +3402,10 @@ export function createCapabilityRunnerdProviderEnvironment(input: {
     if (apiKey?.trim()) environment[key] = apiKey;
   }
   return environment;
+}
+
+export function createCapabilityRunnerdProviderEnvironment(input: Parameters<typeof createCapabilityRunnerdProviderEnvironmentBase>[0]): NodeJS.ProcessEnv {
+  return applyProviderObservabilityEnvironment(createCapabilityRunnerdProviderEnvironmentBase(input), input.options.observability, input.provider === "acpx");
 }
 
 export function resolveRunnerdAcpxPermissionMode(
@@ -3623,6 +3671,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string; permission?: boolean }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
+    resolveClaudeEffort(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.claudeEffort);
     resolvePiThinkingLevel(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.piThinkingLevel);
     if (options.acpxMode !== undefined && options.provider !== "acpx") {
       throw new Error("acpxMode requires the ACPX provider");
@@ -4092,6 +4141,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    currentRunGrant?: NativeRunRuntimeGrant;
   }): Promise<void> {
     if (this.#pendingWarmRecoveryCompletion !== null) {
       throw new Error("native_runner_warm_transition_completion_pending");
@@ -4101,6 +4151,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new Error("native_runner_prp_run_rotation_unavailable");
     }
     await this.#awaitWarmRunAttachmentReady();
+    const currentRunGrant = input.currentRunGrant
+      ? projectCopilotRunGrant(input.currentRunGrant, this.options.runnerFilesystemRoot)
+      : undefined;
+    if (this.options.provider === "acpx" && this.options.acpxAgent === "copilot" && !currentRunGrant) {
+      throw new Error("native_runner_current_instruction_grant_unavailable");
+    }
     const prior = core.store.state.identity;
     const desired: DurableRecoveryIdentity = {
       ...prior,
@@ -4130,12 +4186,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             desired,
             this.#authorizedTools,
             this.options.resumeCompletionContract,
+            currentRunGrant?.runtimeContext,
+            currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
           )
         : rotatedRunAttachPayload(
             core.store.state,
             desired,
             this.#authorizedTools,
             this.options.resumeCompletionContract,
+            currentRunGrant?.runtimeContext,
+            currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
           );
       this.#runAttachTemplate = structuredClone(runAttachTemplate);
       const payload = {
@@ -4814,6 +4874,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await prepareIsolatedCodexHome({
         context: sourceRuntimeContext,
         codexHome: localCodexHome,
+        observability: this.options.observability,
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
@@ -4987,6 +5048,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               providerPolicy: { readOnly: params.permissions === "paperclip-runner-workspace-read-only" },
               ...(selectedAcpxMode === undefined ? {} : { mode: selectedAcpxMode }),
               ...(acpxProfile!.agent === "pi" ? { piThinkingLevel: this.options.piThinkingLevel } : {}),
+              ...(acpxProfile!.agent === "claude" && this.options.claudeEffort ? { claudeEffort: this.options.claudeEffort } : {}),
               permissionMode: resolveRunnerdAcpxPermissionMode(
                 this.options.acpxPermissionMode,
               ),
@@ -5550,6 +5612,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#core = core;
     if (rotatedAuthority) {
+      if (provider === "acpx" && this.options.acpxAgent === "copilot"
+        && typeof this.options.baseInstructions !== "string") {
+        throw new Error("native_runner_current_instruction_grant_unavailable");
+      }
       const runAttachTemplate = rotatedRunAttachPayload(
         controlPlaneState,
         desiredIdentity,
@@ -5758,6 +5824,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await prepareIsolatedCodexHome({
         context: sourceRuntimeContext,
         codexHome: localCodexHome,
+        observability: this.options.observability,
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
@@ -6513,6 +6580,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ).requestId;
         if (typeof requestId === "string")
           this.#bridgedRuntimeInputs.delete(requestId);
+        // Operator resolution/Stop keep their existing acknowledgement path.
+        const expiry = runnerdRuntimeRequestExpiryNotification(event.eventType, record(eventPayload), this.#threadId, this.#turnId);
+        if (expiry) this.#queue.push({ ...expiry,
+          ...(this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH ? { paperclipTrace: {
+            sourceEventId: event.sourceEventId, sourceEventType: event.eventType,
+          } } : {}),
+        });
         continue;
       }
       const sessionUpdatePayload = record(eventPayload);
@@ -6721,6 +6795,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (descriptor.turnControls !== undefined && descriptor.agent !== (this.options.acpxAgent ?? "codex")) {
         throw new Error("ACPX capability identity differs from the admitted profile");
       }
+      const claudeEffort = admittedClaudeEffort(this.options.acpxAgent ?? "codex", this.options.claudeEffort, descriptor, providerIdentity);
+      if (claudeEffort !== undefined) this.#evidence.claudeEffort = claudeEffort;
       const piThinkingLevel = admittedPiThinkingLevel(this.options.acpxAgent ?? "codex", this.options.piThinkingLevel, descriptor, providerIdentity);
       if (piThinkingLevel !== undefined) this.#evidence.piThinkingLevel = piThinkingLevel;
       this.#turnControls = parseAcpxTurnControlCapabilities(descriptor.turnControls, descriptor.agent);
@@ -6864,7 +6940,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   async #runnerHasExited(): Promise<boolean> {
-    if (this.#handle) return this.#handle.child.exitCode !== null;
+    if (this.#handle) return this.#handle.isExitConfirmed?.() ?? this.#handle.child.exitCode !== null;
     const adoptedRunner = this.options.adoptExistingRunner;
     if (!adoptedRunner) return true;
     try {
@@ -6948,7 +7024,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #watchRunner(handle: RunnerProcessHandle): void {
     void handle.completion.then(
       (result) => {
-        this.#evidence.runnerExited = true;
+        const exitConfirmed = handle.isExitConfirmed?.() ?? true;
+        this.#evidence.runnerExited = exitConfirmed;
         this.#evidence.runnerExitCode = result.code;
         this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
         const detail = result.stderr.trim() || result.stdout.trim();
@@ -6961,6 +7038,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         // process completion; clean terminal exit is the expected lifecycle.
         this.#pumpEventsSafely();
         const expectedPerTurnExit =
+          exitConfirmed &&
           result.code === 0 &&
           (this.options.lifecyclePolicy?.mode ?? "per_turn") === "per_turn" &&
           (this.#core?.store.state.committedEvents.some(
@@ -6968,19 +7046,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ) ??
             false);
         if (expectedPerTurnExit) return;
-        const code = /provider_frame_too_large|stdout frame exceeded/i.test(
-          detail,
-        )
-          ? "provider_frame_too_large"
-          : /runner_ingress_bind_conflict/i.test(detail)
-            ? "runner_ingress_bind_conflict"
-            : /transport_reconnect_grace_exceeded/i.test(detail)
-              ? "transport_reconnect_grace_exceeded"
-              : this.#startupComplete
-                ? "native_runner_process_exited"
-                : this.#startupFailureCode;
+        const code = !exitConfirmed
+          ? "runner_process_termination_unconfirmed"
+          : /provider_frame_too_large|stdout frame exceeded/i.test(detail)
+            ? "provider_frame_too_large"
+            : /runner_ingress_bind_conflict/i.test(detail)
+              ? "runner_ingress_bind_conflict"
+              : /transport_reconnect_grace_exceeded/i.test(detail)
+                ? "transport_reconnect_grace_exceeded"
+                : this.#startupComplete
+                  ? "native_runner_process_exited"
+                  : this.#startupFailureCode;
         if (
           code === "native_runner_process_exited" &&
+          exitConfirmed &&
           this.options.runnerReconnectGraceMs !== undefined &&
           handle.restart
         ) {
@@ -6989,7 +7068,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         }
         this.#failTransport(
           new Error(
-            `${code}: runnerd exited unexpectedly${result.code === null ? "" : ` with code ${result.code}`}${detail ? `: ${detail.slice(-1_000)}` : ""}`,
+            `${code}: runnerd ${exitConfirmed ? "exited unexpectedly" : "process supervision ended"}${result.code === null ? "" : ` with code ${result.code}`}${detail ? `: ${detail.slice(-1_000)}` : ""}`,
           ),
         );
       },
@@ -6998,6 +7077,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           return;
         if (
           this.#startupComplete &&
+          handle.isExitConfirmed?.() !== false &&
           this.options.runnerReconnectGraceMs !== undefined &&
           handle.restart
         ) {
@@ -7007,9 +7087,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           );
           return;
         }
+        const code = handle.isExitConfirmed?.() === false
+          ? "runner_process_termination_unconfirmed"
+          : this.#startupComplete
+            ? "native_runner_process_exited"
+            : this.#startupFailureCode;
         this.#failTransport(
           new Error(
-            `${this.#startupComplete ? "native_runner_process_exited" : this.#startupFailureCode}: runnerd process failed: ${error instanceof Error ? error.message : String(error)}`,
+            `${code}: runnerd ${handle.isExitConfirmed?.() === false ? "process supervision" : "process"} failed: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
           ),
         );
       },
@@ -7073,15 +7159,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#publish();
 
         let processSettled = false;
+        let observationError: unknown;
+        let observationDetail = "";
         const completion = recoveredHandle.completion.then(
           (result) => {
             processSettled = true;
-            lastDetail = result.stderr.trim() || result.stdout.trim();
+            observationDetail = result.stderr.trim() || result.stdout.trim();
+            lastDetail = observationDetail;
             return false;
           },
           (error) => {
             processSettled = true;
-            lastDetail = error instanceof Error ? error.message : String(error);
+            observationError = error;
+            observationDetail = error instanceof Error ? error.message : String(error);
+            lastDetail = observationDetail;
             return false;
           },
         );
@@ -7105,6 +7196,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         if (await Promise.race([completion, authenticated])) {
           this.#diagnostic("runner process restored its durable PRP session");
           this.#watchRunner(recoveredHandle);
+          return;
+        }
+        if (recoveredHandle.isExitConfirmed?.() === false) {
+          this.#failTransport(
+            new Error(
+              `runner_process_termination_unconfirmed: replacement runner health could not be verified${observationDetail ? `: ${observationDetail.slice(-1_000)}` : ""}`,
+              { cause: observationError },
+            ),
+          );
           return;
         }
         attempt += 1;
@@ -7157,6 +7257,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   #diagnostic(message: string): void {
+    message = redactObservabilityDiagnostic(message, this.options.environment, this.options.observability?.otelConfig);
     this.#evidence.diagnostics.push(message);
     if (this.#evidence.diagnostics.length > 64)
       this.#evidence.diagnostics.shift();
@@ -7419,6 +7520,7 @@ export const runnerdLaunchProfileInternals = Object.freeze({
 });
 
 export const runnerdRecoveryInternals = Object.freeze({
+  projectCopilotRunGrant,
   completedMaintenanceTerminalReceipt,
   completedMaintenanceTerminalReplayMatches,
   readControlPlaneState,

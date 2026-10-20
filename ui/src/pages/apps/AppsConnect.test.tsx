@@ -996,6 +996,49 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Connect for tool access instead");
   });
 
+  it.each([false, true])("opens Copilot with visible personal defaults and shares only by explicit choice (%s)", async (share) => {
+    mockSearch.value = "source=github&method=copilot-token";
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB] });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(queryKeys.environments.list("company-1"), [
+      { id: "local-env", name: "Local", driver: "local", status: "active", config: {} },
+    ]);
+    client.setQueryData(queryKeys.instance.settings, { defaultEnvironmentId: "local-env" });
+    const createAiAccount = vi.spyOn(aiConnectionsApi, "create").mockResolvedValue({
+      connectionId: "copilot-ai-account", grantId: "copilot-ai-grant",
+    });
+    await render(client);
+    await passAccessStep();
+    expect(container.textContent).toContain("personal fine-grained token with Copilot Requests permission");
+    expect(container.querySelector('input[placeholder="github_pat_..."]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="Copilot execution environment"]')).toBeTruthy();
+    expect(container.textContent).not.toContain("You must connect this instance to Paperclip");
+    expect(getCloudConnectorEnrollmentMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Connects as you");
+    expect(container.textContent?.match(/Connects as you/g)).toHaveLength(1);
+    expect(container.textContent).toContain("Connect GitHub Copilot");
+    await openAccessAdvanced();
+    expect(radioContaining("My GitHub account")?.getAttribute("aria-checked")).toBe("true");
+    expect(radioContaining("Only agents I choose")?.getAttribute("aria-checked")).toBe("true");
+    expect(radioContaining("Any agent")?.getAttribute("aria-checked")).toBe("false");
+    if (share) {
+      await act(async () => radioContaining("Shared organization GitHub account")!.click());
+      await act(async () => radioContaining("Any agent")!.click());
+    }
+    const key = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+    await act(async () => setInputValue(key, "fixture-copilot-token"));
+    await act(async () => buttonByText("Connect")!.click());
+    await flushReact();
+    expect(createAiAccount).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      provider: "github", method: "api_key", apiKey: "fixture-copilot-token",
+      ownership: share ? "shared" : "personal", allAgents: share, agentIds: [],
+      environmentId: "local-env",
+    }));
+    expect(mockNavigate).toHaveBeenCalledWith("/apps/copilot-ai-account/permissions");
+  });
+
   it("states the GitHub identity default and keeps its controls one click away", async () => {
     mockParams.appKey = "github";
     listGalleryMock.mockResolvedValue({ apps: [GITHUB_MANAGED] });
@@ -1793,7 +1836,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     "preserves personal Workspace access for $slug when changing method (enrollment return: $enrollmentReturn)",
     async ({ slug, enrollmentReturn }) => {
       const definition = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === slug)!;
-      const readMethod = definition.methods.find((method) => method.key === "paperclip-read")!;
+      const readMethod = definition.methods.find((method) => method.key === "paperclip-read" || method.key === "paperclip-workspace")!;
       mockSearch.value = enrollmentReturn
         ? `source=${slug}&stage=setup&cloud_connector=enrolled`
         : `source=${slug}`;
@@ -1814,7 +1857,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
         await flushReact();
       }
 
-      if (definition.methods.some((method) => method.capabilityProfile?.key !== "read")) {
+      if (definition.methods.some((method) => method.capabilityProfile?.key !== readMethod.capabilityProfile?.key)) {
         const readChoice = radioContaining(readMethod.capabilityProfile!.label);
         expect(readChoice).not.toBeNull();
         await act(async () => {
@@ -1851,8 +1894,12 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
         buttonByText("Continue to sign in")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
       await flushReact();
+      if (slug === "google-workspace") {
+        await act(async () => buttonByText("Continue")!.click());
+        await flushReact();
+      }
       expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
-        galleryKey: slug, connectionMethodKey: "paperclip-read", grantKind: "user",
+        galleryKey: slug, connectionMethodKey: readMethod.key, grantKind: "user",
       }));
   });
 
@@ -1889,6 +1936,45 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Before connecting, enroll the signed-in Workspace account");
     expect(container.textContent).toContain("Review requirements");
     expect(container.textContent).toContain("needs its own OAuth app");
+  });
+
+  it("selects Workspace service groups before creating a single connection", async () => {
+    mockSearch.value = "source=google-workspace&stage=setup";
+    const workspace = getAppStoreDefinition("google-workspace")!;
+    listGalleryMock.mockResolvedValue({ apps: [{
+      ...workspace, ownershipAvailability: { ...workspace.ownershipAvailability, platform_shared: true },
+    }] });
+    await render();
+
+    expect(container.textContent).toContain("Google Workspace");
+    expect(container.textContent).not.toContain("What should Paperclip be able to do?");
+    await openAccessAdvanced();
+    expect(buttonByText("Use your own Google OAuth app")).toBeDefined();
+    expect(buttonByText("Continue to sign in")?.disabled).toBe(false);
+    await act(async () => {
+      buttonByText("Continue to sign in")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(connectAppMock).not.toHaveBeenCalled();
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("Docs, Sheets, and Slides");
+    expect(dialog.querySelectorAll('[role="switch"]')).toHaveLength(3);
+    expect(dialog.textContent).not.toContain("Contacts");
+    expect(dialog.textContent).not.toContain("compose permission");
+    const gmail = dialog.querySelector('select[aria-label="Gmail access"]') as HTMLSelectElement;
+    await act(async () => {
+      gmail.value = "read";
+      gmail.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
+      Array.from(dialog.querySelectorAll("button")).find(button => button.textContent === "Continue")!.click();
+    });
+    await flushReact();
+    expect(connectAppMock).toHaveBeenCalledTimes(1);
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      galleryKey: "google-workspace", connectionMethodKey: "paperclip-workspace",
+      workspaceServices: { gmail: "read", drive: "write", calendar: "write" },
+    }));
   });
 
   it("renders Google Calendar as one minimal, unboxed setup screen", async () => {

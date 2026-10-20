@@ -4999,7 +4999,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_results_expose_only_reserved_schema_guidance() {
+    fn invalid_tool_results_expose_authorized_schema_guidance() {
         let finish_result = schema_rejection(
             "paperclip_finish",
             json!({"secretSubmittedValue": "must-not-appear"}),
@@ -5036,11 +5036,25 @@ mod tests {
         assert!(question_message.len() <= 512);
         assert_eq!(question_result.result["error"]["retryable"], false);
 
-        let ordinary_result = schema_rejection("get_task_context", json!({}));
-        assert_eq!(
-            ordinary_result.result["error"]["message"],
-            GENERIC_INVALID_TOOL_CALL_MESSAGE
+        let monitor_result = schema_rejection(
+            "set_task_monitor",
+            json!({"PRIVATE_FIELD": "PRIVATE_VALUE"}),
         );
+        let monitor_message = monitor_result.result["error"]["message"].as_str().unwrap();
+        assert!(monitor_message.contains("Put all scheduling fields inside monitor"));
+        assert!(monitor_message.contains("Correct the arguments and retry"));
+        assert!(monitor_message.contains("/required (missing \"requiredField\")"));
+        assert!(!monitor_message.contains("PRIVATE_FIELD"));
+        assert!(!monitor_result.result.to_string().contains("PRIVATE_VALUE"));
+        assert!(monitor_message.len() <= 512);
+        assert!(!monitor_message.chars().any(char::is_control));
+        assert_eq!(monitor_result.result["error"]["code"], "invalid_tool_call");
+        assert_eq!(monitor_result.result["error"]["retryable"], false);
+
+        let ordinary_result = schema_rejection("get_task_context", json!({}));
+        let ordinary_message = ordinary_result.result["error"]["message"].as_str().unwrap();
+        assert!(ordinary_message.contains("Correct the arguments and retry"));
+        assert!(ordinary_message.contains("/required (missing \"requiredField\")"));
 
         let unauthorized_error = ProviderToolBridge::default()
             .begin_call(
@@ -6524,3 +6538,11 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "tests/provider_api_validation.rs"]
+mod api_validation_tests;
+
+#[cfg(test)]
+#[path = "tests/provider_assigned_tool_validation.rs"]
+mod assigned_tool_validation_tests;

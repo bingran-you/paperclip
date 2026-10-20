@@ -301,6 +301,12 @@ completed lookups and the separate liveness backfill are not replayed. Projectio
 callers that use a transaction retain single-attempt reads. The opt-in is only
 for a pooled database handle outside a transaction.
 
+The heartbeat run read check uses the same bounded retries. Routes call it with
+the pooled database handle. Its issue existence lookup and its `issue:read`
+authorization decision retry separately, so a disconnect in the decision does not
+replay the completed lookup. Both steps only read. Missing issues, denied
+decisions, and other errors keep their usual behavior.
+
 ## Tool profile reads
 
 Tool profile list, detail, and new-tool review queries select only the catalog
@@ -488,10 +494,13 @@ is unique, so retries return the original accepted action. Provider source
 ordering fences duplicate and stale updates, and a cleared projection retains
 its revision/cursor tombstone so an older provider event cannot resurrect it.
 
-Issue `status_version` advances only when `status` changes. The JavaScript backup
-path includes user-defined functions and triggers so a restored database keeps
-that invariant. Removing or disabling a future native rollout flag must not
-delete these records; persisted experimental runs remain available for recovery
+Issue `status_version` advances when `status`, `assignee_agent_id`, or
+`assignee_user_id` changes. A combined status and assignment write advances it
+once. Writing the same assignee alone does not advance it. A new blocking
+decision can also advance the revision. The assignment trigger has its own name so replay of the historical status migration cannot remove it. The
+JavaScript backup path includes user-defined functions and triggers so a restored
+database keeps that invariant. Removing or disabling a future native rollout
+flag must not delete these records; persisted experimental runs remain available for recovery
 and inspection.
 
 `native_run_finalizations` also stores restart ownership and recovery state.
@@ -753,6 +762,13 @@ limits and the operator override.
 Project `privacy_owner_user_id` records who may manage its audience independently of project read membership. Creation assigns the authenticated user or run responsible user; migration recovers legacy ownership from creation audit evidence. Missing evidence leaves management with administrators.
 ## Internal agent commentary
 
+The Audit viewer uses the existing company/kind/created index.
+List reads select bounded previews; details load a single full body. Both reads
+and list counts apply company and source-task visibility. The viewer requires
+no experimental toggle. A permission-only migration grants `commentary:view` to
+existing active human company members, including viewers, without changing
+existing grants or the commentary schema.
+
 `agent_commentary` stores company-scoped, attributed complaints and suggestions
 as free-form text in the instance database. Legacy agents use the default
 `complain` and `suggestion-box` runtime skills; native runs use dedicated tools
@@ -924,7 +940,7 @@ Migration [0336_big_crystal.sql](../packages/db/src/migrations/0336_big_crystal.
 
 Migration [0337_exotic_proemial_gods.sql](../packages/db/src/migrations/0337_exotic_proemial_gods.sql) adds internal `execution_workspace_repository_roots` records. A company and hash of its canonical physical path uniquely identify a sticky `anonymous_only` or `managed` acquisition reservation. Short transactions serialize reservations with repository requests and credential promotion, preventing private publication after low-trust admission checks. Records have no workspace foreign key: mutable workspace metadata, relocation, archival or deletion cannot release a physical folder still accessible to an admitted run. There is no automatic mode change or reservation deletion.
 
-Migration [0338_absurd_vengeance.sql](../packages/db/src/migrations/0338_absurd_vengeance.sql) adds internal `execution_workspace_repository_access` provenance. Company/canonical-root source entries retain execution-workspace and source-project identities; reader entries retain the exact admitted run, task, agent and responsible user. New repository receipts also record their root at creation; legacy receipts receive no inferred origin. Shared project-source entries retain which physical owners require workspace write authority. Current admission, selection, requests and publication check the current task’s writer against those owners; retained past readers and file APIs still require only read authority. Genuine isolated copies retain source read access without requiring shared-folder write access. An existing linked worktree can recover a missing isolated-copy proof only after Git registration and its captured source owner are verified. Configured local sibling copies retain deny-only task/project source ownership on the bound task root before materialization; ordinary repository clones create no isolation proof. The shared root fence checks every reader against every source before admission and future publication, including tasks without repository requests. File APIs apply the same source privacy without writing provenance. These entries grant no authority and have no workspace or run deletion cascade; unavailable retained identity fails closed. Automatic provenance release is deferred, so a newly incompatible permission scope requires a separate physical root.
+Migration [0338_absurd_vengeance.sql](../packages/db/src/migrations/0338_absurd_vengeance.sql) adds internal `execution_workspace_repository_access` provenance. Company/canonical-root source entries retain execution-workspace and source-project identities; reader entries retain the exact admitted run, task, agent and responsible user. A retained reader's task must match the run's immutable task binding or its current context task; a wake coalesced into a running run can replace the context task without changing that binding. New repository receipts also record their root at creation; legacy receipts receive no inferred origin. Shared project-source entries retain which physical owners require workspace write authority. Current admission, selection, requests and publication check the current task’s writer against those owners; retained past readers and file APIs still require only read authority. Genuine isolated copies retain source read access without requiring shared-folder write access. An existing linked worktree can recover a missing isolated-copy proof only after Git registration and its captured source owner are verified. Configured local sibling copies retain deny-only task/project source ownership on the bound task root before materialization; ordinary repository clones create no isolation proof. The shared root fence checks every reader against every source before admission and future publication, including tasks without repository requests. File APIs apply the same source privacy without writing provenance. These entries grant no authority and have no workspace or run deletion cascade; unavailable retained identity fails closed. Automatic provenance release is deferred, so a newly incompatible permission scope requires a separate physical root.
 
 Repository admission loads retained workspace and task sources in bounded batches. Readers share source rows and privacy evaluation for identical principals, but each retained run receives its own trust and responsible-user decision. The snapshot lasts only for one read batch; later admission and publication reload current authority. Keep source-loading query counts bounded as both workspace history and retained reader counts grow.
 
@@ -1014,3 +1030,26 @@ company invalidation within the mutation transaction. Agent runtime journaling
 uses ordered `FOR NO KEY UPDATE` locks, which remain compatible with foreign-key
 references while excluding runtime readers' `FOR SHARE` locks. Connector feature
 switches use the same journal; process-start overlays receive a delivery baseline.
+
+Migration 0355 extends connector invalidation to tool definitions and
+configuration. Statement triggers cover applications, connections, catalogs,
+profiles and entries, bindings, policies, and MCP gateways. They ignore health
+bookkeeping and trust-rule usage counters. Profile creation alone does not change
+an agent's runtime; its assignment does. Entry changes resolve standing profile
+bindings; policies resolve old and new agent selectors. Both retain scoped
+recipients. Credential-only fields remain outside this migration's coverage.
+
+Migration 0356 adds access, referenced credentials and vaults, and chat/email
+endpoint configuration to connector runtime invalidation. Grant and membership
+changes retain company scope. Agent secret bindings and new personal delegations
+use agent scope. Credential values remain outside the journal. Endpoint activity,
+vault health, and other bookkeeping fields remain excluded.
+
+## Retired Pipelines storage
+
+The Pipelines experiment has been removed from the application, API, CLI, and
+experimental settings. Its `pipelines` and `pipeline_*` tables, schema definitions,
+and migration history remain so existing records, documents, and links are preserved
+and future schema generation does not drop them. No removal migration or data
+cleanup runs. These tables remain part of normal database backups; the separate
+Cases feature is unaffected.

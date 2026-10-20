@@ -1,4 +1,16 @@
 import type { NativeRunTrace } from "./native-run-trace.js";
+import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
+
+/** Qualified ACPX releases carry their Linux image manifest and daemon. */
+export function shouldUseBundledAcpxImageAssets(input: {
+  requiresRemoteProviderPack: boolean;
+  configuredProviderPackRoot: string | null;
+  provider: NativeExecutionInput["provider"];
+}): boolean {
+  return input.requiresRemoteProviderPack && !input.configuredProviderPackRoot &&
+    input.provider.kind === "acpx" &&
+    ["cursor", "copilot"].includes(input.provider.agent);
+}
 
 type VerificationCommandResult = {
   exitCode: number | null;
@@ -67,4 +79,18 @@ export async function prepareVerifiedRemoteProviderPack(input: {
   } finally {
     if (scope) await input.trace!.end(scope, { outcome: failed ? "failed" : "ok" });
   }
+}
+
+export async function useVerifiedPreinstalledRemoteProviderPack(input: {
+  candidates: readonly string[];
+  verifyAndLink: (root: string) => Promise<void>;
+}): Promise<boolean> {
+  for (const candidate of input.candidates) {
+    try {
+      await input.verifyAndLink(candidate);
+      return true;
+    } catch {
+    }
+  }
+  return false;
 }

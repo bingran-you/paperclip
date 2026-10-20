@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
-import { aiRuntimeConnectionBindingSchema, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
+import { aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { queryKeys } from "@/lib/queryKeys";
+import { COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS, copilotTaskModelCatalogOptions } from "@/lib/copilot-task-model-catalog";
 import { cn } from "@/lib/utils";
 import { useMobileEntityPickerViewportStyle } from "@/hooks/useMobileEntityPickerViewportStyle";
 import { getLastComposerEffort, rememberComposerEffort } from "@/lib/recent-composer-effort";
@@ -51,7 +52,7 @@ const HARNESS_LABELS: Record<string, string> = {
 
 function harnessLabel(agent: Agent | undefined): string {
   if (!agent) return "Choose an agent";
-  const harness = HARNESS_LABELS[agent.adapterType] ?? agent.adapterType;
+  const harness = HARNESS_LABELS[agentHarnessType(agent.adapterType, agent.adapterConfig)] ?? agent.adapterType;
   const provider = composerCatalogProvider(agent);
   const binding = aiRuntimeConnectionBindingSchema.safeParse(agent?.runtimeConfig?.aiConnection).data;
   const poolId = binding?.mode === "router" ? binding.connectionId : undefined;
@@ -112,15 +113,22 @@ export function ComposerRunSettingsPicker({
   }, [isMuseRunner, settings, onSettingsChange]);
   const binding = aiRuntimeConnectionBindingSchema.safeParse(agent?.runtimeConfig?.aiConnection).data;
   const poolId = binding?.mode === "router" ? binding.connectionId : undefined;
-  const { data: fetchedModels = [], isPending: modelsPending } = useQuery({
+  const copilotCatalog = copilotTaskModelCatalogOptions(agent);
+  const copilotCatalogScope = JSON.stringify(copilotCatalog ?? null);
+  const requestCopilotModels = Boolean(copilotCatalog && open && view !== "agents" && !modelOptionsOverride);
+  const { data: fetchedModels = [], isPending: modelsPending, refetch: refreshModels } = useQuery({
     queryKey: agent && modelSupported
-      ? [...queryKeys.agents.adapterModels(companyId, agent.adapterType, agent.defaultEnvironmentId ?? null, provider), poolId ?? null]
+      ? [...queryKeys.agents.adapterModels(companyId, agent.adapterType, agent.defaultEnvironmentId ?? null, provider), poolId ?? null, copilotCatalog ?? null]
       : ["agents", "composer-models", "none"],
     queryFn: () => agentsApi.adapterModels(companyId, agent!.adapterType, {
-      environmentId: agent!.defaultEnvironmentId ?? null, provider, poolId,
+      environmentId: agent!.defaultEnvironmentId ?? null, provider, poolId, ...copilotCatalog,
     }),
-    enabled: Boolean(agent && modelSupported && !modelOptionsOverride),
+    ...(copilotCatalog ? COPILOT_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
+    enabled: Boolean(agent && modelSupported && !modelOptionsOverride && (!copilotCatalog || requestCopilotModels)),
   });
+  useEffect(() => {
+    if (requestCopilotModels) void refreshModels();
+  }, [requestCopilotModels, copilotCatalogScope, companyId, agent?.defaultEnvironmentId, refreshModels]);
   // The server resolves instance-declared models first and otherwise returns the
   // adapter's curated catalog. Do not replace a declared Codex list locally.
   const models: readonly (AdapterModel & { detail?: string })[] = modelOptionsOverride

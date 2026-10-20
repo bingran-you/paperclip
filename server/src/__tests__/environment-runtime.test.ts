@@ -322,6 +322,64 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     } as unknown as PluginWorkerManager;
   }
 
+  it.each([["paperclip_runner", false, false], ["paperclip_runner", true, false], ["paperclip_runner", true, undefined], ["claude_local", false, false], [null, false, false]] as const)("pins qualified snapshots only for native execution (%s, warm=%s, savedReuse=%s)", async (adapterType, warm, savedReuse) => {
+    const pluginId = randomUUID();
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const config = { provider: "daytona", snapshot: "managed-snapshot", ...(savedReuse === undefined ? {} : { reuseLease: savedReuse }), timeoutMs: 1234 };
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{ driverKey: "daytona", kind: "sandbox_provider", displayName: "Daytona", configSchema: { type: "object" } }] });
+    await environmentService(db).update(baseEnvironment.id, { driver: "sandbox", config });
+    const environment = { ...baseEnvironment, driver: "sandbox", config };
+    const parsed = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment);
+    const snapshotId = "a6b9e7d0-f886-471a-b461-640dd03e8d0f";
+    environment.metadata = { paperclipSandboxPlatformProbes: { [companyId]: {
+      v: 2, companyId, snapshot: config.snapshot, template: null,
+      baseConfigFingerprint: createHash("sha256").update(stableStringify(config)).digest("hex"),
+      runtimeConfigFingerprint: createHash("sha256").update(stableStringify(parsed.config)).digest("hex"),
+      snapshotIdentity: { provider: "daytona", requestedRef: config.snapshot, id: snapshotId, name: config.snapshot, organizationId: "provider-account", createdAt: "2026-10-07T23:19:57.133Z" },
+    } } };
+    const worker = createFreshPluginLeaseWorker(pluginId);
+    vi.mocked(worker.call).mockImplementation(async (_id, method, params: any) => {
+      if (method !== "environmentAcquireLease") throw new Error(`Unexpected ${method}`);
+      return { providerLeaseId: "snapshot-lease", metadata: { provider: "daytona", snapshot: params.config.snapshot, remoteCwd: "/workspace" } };
+    });
+    const service = environmentRuntimeService(db, { pluginWorkerManager: worker });
+    const runtimeEnvironment = warm ? resolveRunnerEnvironmentForRun(environment, "paperclip_runner", { lifecycleMode: "warm" }) : environment;
+    const acquired = await service.acquireRunLease({ companyId, environment: runtimeEnvironment, configuredEnvironment: environment, issueId: null, heartbeatRunId: runId,
+      persistedExecutionWorkspace: null, adapterType, ...(adapterType === null ? { resolveSnapshotIdentity: true } : {}) });
+    const expectedSnapshot = adapterType === "paperclip_runner" ? snapshotId : config.snapshot;
+    expect(worker.call).toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.objectContaining({
+      config: expect.objectContaining({ snapshot: expectedSnapshot }),
+      ...(adapterType === null ? { resolveSnapshotIdentity: true } : {}),
+    }), expect.any(Number));
+    expect(acquired.lease.metadata?.snapshot).toBe(expectedSnapshot);
+  });
+
+  it.each(["failed-probe", "config-change", "config-and-metadata-change"] as const)("refuses a mutable snapshot after %s invalidates its proof", async invalidation => {
+    const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
+    const config = { provider: "daytona", snapshot: "managed-snapshot", reuseLease: false };
+    const svc = environmentService(db);
+    await svc.update(baseEnvironment.id, { driver: "sandbox", config });
+    const proof = { v: 2, companyId, snapshot: config.snapshot, template: null,
+      snapshotIdentity: { provider: "daytona", requestedRef: config.snapshot,
+        id: "a6b9e7d0-f886-471a-b461-640dd03e8d0f", name: config.snapshot,
+        organizationId: "provider-account", createdAt: "2026-10-07T23:19:57.133Z" },
+    };
+    expect(await svc.recordSandboxPlatformProbe({ environmentId: baseEnvironment.id, companyId, config, proof })).toBe(true);
+    if (invalidation === "failed-probe") {
+      await svc.recordSandboxPlatformProbe({ environmentId: baseEnvironment.id, companyId, config, proof: null });
+    } else {
+      await svc.update(baseEnvironment.id, { config: { ...config, snapshot: "replacement-name" },
+        ...(invalidation === "config-and-metadata-change" ? { metadata: { userNote: "retained" } } : {}) });
+    }
+    const environment = (await svc.getById(baseEnvironment.id))!;
+    expect((environment.metadata?.paperclipSandboxPlatformProbes as Record<string, any>)[companyId]).toMatchObject({ v: 2, invalidated: true });
+    const acquire = vi.fn();
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { call: acquire } as never });
+    await expect(runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: runId,
+      persistedExecutionWorkspace: null, adapterType: "paperclip_runner" })).rejects.toThrow("sandbox_snapshot_qualification_required");
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
   function insertReusableExecutionWorkspace(executionWorkspaceId: string, companyId: string, projectId: string) {
     return db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,

@@ -831,7 +831,15 @@ export interface IssueChangeReceiptEntry {
 
 export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
+export type IssueSummary = Pick<
+  Issue,
+  "id" | "companyId" | "title" | "identifier" | "status" | "updatedAt"
+> & {
+  externalConversationState: "active" | "waiting" | null;
+};
+
 export interface Issue {
+  statusVersion?: number;
   /** True only while the title is the provisional slice of the initial prompt. */
   titleNeedsGeneration?: boolean;
   conversationAgentId?: string | null;

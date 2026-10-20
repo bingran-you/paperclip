@@ -233,6 +233,8 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export type CancelRunOptions = {
+    /** Return null if a parked retry was promoted or settled before this cancellation. */
+    expectedStatus?: "scheduled_retry";
     budgetEnforcement?: BudgetEnforcementScope;
     /** Optional board request identity, atomically reserved for native Stop. */
     cancellationRequestId?: string;
@@ -899,6 +901,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   ) {
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
+    if (options.expectedStatus && run.status !== options.expectedStatus) return null;
     if (options.cancellationRequestId) {
       run = await claimCancellationRequest(db, runId, run.companyId, options.cancellationRequestId, options.cancellationRequestedByUserId ?? null);
     }
@@ -929,7 +932,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       return run;
     const agent = await getAgent(run.agentId);
     const errorCode = options.errorCode ?? "cancelled";
-    const cancellation = requestedRunCancellation(options.resultJson ?? {}, reason);
+    const cancellation = (options.expectedStatus && run.resultJson?.startupCancellation
+      ? readRunCancellation(run.resultJson) : null) ?? requestedRunCancellation(options.resultJson ?? {}, reason);
 
     const pendingProcessCancellation = processRunCancellationSettlements.get(
       run.id,
@@ -952,7 +956,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // Established legacy processes must still be stopped if the database is
     // unavailable. Only native or not-yet-dispatched preparation needs this
     // additional durable fence before its existing cancellation path.
-    if (options.budgetEnforcement || (!options.cancellationRequestId && (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control)))) {
+    if (options.expectedStatus || options.budgetEnforcement || (!options.cancellationRequestId && (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control)))) {
       const fence = async (tx: Db) => {
         const [fenced] = await tx.update(heartbeatRuns).set({
           // Record handoff intent before native cancellation can finalize and release
@@ -963,13 +967,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             ${JSON.stringify({ cancellation })}::jsonb ||
             jsonb_build_object('startupCancellation', jsonb_build_object(
               'requestedAt', ${new Date().toISOString()}::text,
+              'errorCode', ${errorCode}::text,
               'beforeNativeSelection', ${heartbeatRuns.runtimeMode} = 'legacy'
                 and ${heartbeatRuns.runtimeModeResolvedAt} is null
                 and ${heartbeatRuns.executionStage} = 'preparing'
                 and coalesce(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'paperclip_runner', false)
             ))`,
         }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status,
-          pendingNativeRetry ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
+          options.expectedStatus ? [options.expectedStatus] : pendingNativeRetry ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
         ))).returning();
         return fenced ?? null;
       };
@@ -984,7 +989,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       }
       if (!fenced) {
         stopOwnership?.release();
-        return getRun(runId);
+        return options.expectedStatus ? null : getRun(runId);
       }
       run = fenced;
     }

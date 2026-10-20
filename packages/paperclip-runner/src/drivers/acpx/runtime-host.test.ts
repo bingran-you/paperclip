@@ -316,6 +316,69 @@ describe("ACPX runtime host", () => {
     expect(openRuntime).not.toHaveBeenCalled();
   });
 
+  it("leaves an active Claude owner's effort settings unchanged when a second opener loses the lifetime lease", async () => {
+    const fixture = await hostFixture();
+    let settingsPath = "";
+    const openRuntime = vi.fn(async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }));
+    const dependencies = fixture.dependencies({ openRuntime });
+    const prepare = dependencies.prepareSandbox!;
+    dependencies.prepareSandbox = async input => {
+      const sandbox = await prepare(input);
+      settingsPath = join(sandbox.agentHomeDirectory, "settings.json");
+      return sandbox;
+    };
+    const options = { ...fixture.options, agent: "claude" as const, model: "claude-sonnet-5", permissionMode: "approve-all" as const };
+    const host = await AcpxRuntimeHost.open(options, dependencies);
+    try {
+      const ownedSettings = `${JSON.stringify({ ...JSON.parse(await readFile(settingsPath, "utf8")), effortLevel: "high", activeOwnerMarker: true })}\n`;
+      await writeFile(settingsPath, ownedSettings, { mode: 0o600 });
+      await expect(AcpxRuntimeHost.open(options, dependencies)).rejects.toThrow("already has an active lease");
+      expect(await readFile(settingsPath, "utf8")).toBe(ownedSettings);
+      expect(openRuntime).toHaveBeenCalledTimes(1);
+    } finally { await host.close({ reason: "ownership regression complete" }); }
+    const nextOwner = await waitForAcpxOperation(() => AcpxRuntimeHost.open(options, dependencies));
+    try {
+      expect(JSON.parse(await readFile(settingsPath, "utf8"))).not.toHaveProperty("activeOwnerMarker");
+      expect(openRuntime).toHaveBeenCalledTimes(2);
+    } finally { await nextOwner.close({ reason: "next owner complete" }); }
+  });
+
+  it.each([false, true])("cancels Claude startup promptly while retaining its settings write and lease (late failure: %s)", async failWrite => {
+    const fixture = await hostFixture();
+    const controller = new AbortController();
+    let announceWrite!: () => void;
+    let finishWrite!: () => void;
+    const writeStarted = new Promise<void>(resolve => { announceWrite = resolve; });
+    const writePending = new Promise<void>(resolve => { finishWrite = resolve; });
+    const openRuntime = vi.fn(async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) }));
+    const dependencies = fixture.dependencies({ openRuntime });
+    const prepare = dependencies.prepareSandbox!;
+    dependencies.prepareSandbox = async input => {
+      const sandbox = await prepare(input);
+      const initialize = sandbox.initializeOwnedConfiguration;
+      return { ...sandbox, initializeOwnedConfiguration: async () => {
+        announceWrite();
+        await writePending;
+        if (failWrite) throw new Error("settings write failed after cancellation");
+        await initialize?.();
+      } };
+    };
+    const options = { ...fixture.options, agent: "claude" as const, model: "claude-sonnet-5", permissionMode: "approve-all" as const };
+    const opening = AcpxRuntimeHost.open({ ...options, signal: controller.signal }, dependencies);
+    const rejected = expect(opening).rejects.toThrow("settings admission cancelled");
+    try {
+      await writeStarted;
+      controller.abort(new Error("settings admission cancelled"));
+      await runAcpxOperationAttempt(() => rejected, Date.now() + 1_000);
+      expect(openRuntime).not.toHaveBeenCalled();
+      await expect(AcpxRuntimeHost.open(options, fixture.dependencies({ openRuntime }))).rejects.toThrow("already has an active lease");
+    } finally { finishWrite(); }
+    await rejected;
+    expect(openRuntime).not.toHaveBeenCalled();
+    const nextOwner = await waitForAcpxOperation(() => AcpxRuntimeHost.open(options, fixture.dependencies({ openRuntime })));
+    await nextOwner.close({ reason: "cancelled initializer ownership released" });
+  });
+
   it("registers the assigned connection gateway alongside the Claude task bridge", async () => {
     const fixture = await hostFixture();
     let servers: AcpxRuntimePortOpenOptions["mcpServers"] = [];
@@ -841,6 +904,31 @@ describe("ACPX runtime host", () => {
     expect(assertWorkspaceHeld).toHaveBeenCalledTimes(2);
     expect(openRuntime).not.toHaveBeenCalled();
     expect(fixture.commandClose).toHaveBeenCalledOnce();
+  });
+
+  it.each(["claude", "codex", "copilot"] as const)("preloads essential task tools only for Claude through the host (%s)", async agent => {
+    const fixture = await hostFixture();
+    const model = agent === "claude" ? "claude-opus-5-5" : "gpt-5.6-sol";
+    let bridge: Extract<AcpxRuntimePortOpenOptions["mcpServers"][number], { url: string }> | undefined;
+    const environment = agent === "claude" ? { ANTHROPIC_API_KEY: "fixture-not-a-real-credential" }
+      : agent === "copilot" ? { COPILOT_GITHUB_TOKEN: "fixture-not-a-real-credential" }
+        : { PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "{}" };
+    const host = await AcpxRuntimeHost.open({
+      ...fixture.options, agent, model, permissionMode: "deny-all", environment,
+      semanticTools: { tools: [{ name: "set_task_title", inputSchema: { type: "object", properties: {} } }], handler: async () => ({}) },
+    }, fixture.dependencies({ openRuntime: async options => {
+      bridge = options.mcpServers.find((server): server is NonNullable<typeof bridge> => "url" in server && server.runnerOwned);
+      return runtimePort({ getStatus: async () => ({ models: { currentModelId: model, availableModelIds: [model] } }) });
+    } }));
+    try {
+      const response = await fetch(bridge!.url, {
+        method: "POST", headers: { Authorization: `Bearer ${bridge!.bearerToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      const listed = await response.json() as { result: { tools: Array<{ name: string; _meta?: Record<string, unknown> }> } };
+      expect(listed.result.tools.filter(tool => tool._meta?.["anthropic/alwaysLoad"] === true).map(({ name }) => name))
+        .toEqual(agent === "claude" ? ["set_task_title", "paperclip_finish", "paperclip_block"] : []);
+    } finally { await host.close({ reason: "tool preload verified" }); }
   });
 
   it("forwards semantic receipt capture through the real runtime host and authenticated bridge", async () => {
@@ -1387,7 +1475,7 @@ describe("ACPX runtime host", () => {
     ).rejects.toThrow("initialization and cleanup failed");
     expect(runtime.close).toHaveBeenCalledOnce();
     expect(credential.close).not.toHaveBeenCalled();
-    expect(fixture.commandClose).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).not.toHaveBeenCalled();
     expect(retainedAdmissionCleanup).not.toBeNull();
     let cleanupSettled = false;
     void retainedAdmissionCleanup!.finally(() => {
@@ -1400,6 +1488,7 @@ describe("ACPX runtime host", () => {
     await retainedAdmissionCleanup;
     expect(cleanupSettled).toBe(true);
     expect(credential.close).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
   });
 
   it("retains credential ownership when runtime shutdown fails until retry succeeds", async () => {
@@ -1477,7 +1566,7 @@ describe("ACPX runtime host", () => {
 
     const first = host.close({ reason: "runtime close pending" });
     await waitForAcpxOperation(() => expect(runtime.close).toHaveBeenCalledOnce());
-    await waitForAcpxOperation(() => expect(fixture.commandClose).toHaveBeenCalledOnce());
+    expect(fixture.commandClose).not.toHaveBeenCalled();
     const second = host.close({ reason: "same exact close" });
     await expect(readFile(authPath, "utf8")).resolves.toBe("{}");
     await expect(
@@ -1495,6 +1584,7 @@ describe("ACPX runtime host", () => {
       undefined,
       undefined,
     ]);
+    expect(fixture.commandClose).toHaveBeenCalledOnce();
     await expect(readFile(authPath)).rejects.toMatchObject({ code: "ENOENT" });
     const contender = await waitForAcpxOperation(() =>
       stageManagedCodexCredential({
@@ -1507,9 +1597,10 @@ describe("ACPX runtime host", () => {
     await contender.close();
   }, ACPX_LONG_WAIT_TEST_TIMEOUT_MS);
 
-  it("retains the exact pending cleanup while independent resources close", async () => {
+  it("retains the exact pending cleanup and command snapshot until runtime retirement", async () => {
     const fixture = await hostFixture();
-    const firstClose = new Promise<void>(() => undefined);
+    let resolveRuntimeClose!: () => void;
+    const firstClose = new Promise<void>(resolve => { resolveRuntimeClose = resolve; });
     const runtime = runtimePort({
       onClose: vi
         .fn()
@@ -1537,6 +1628,9 @@ describe("ACPX runtime host", () => {
     await Promise.resolve();
     expect(settled).toBe(false);
     expect(runtime.close).toHaveBeenCalledOnce();
+    expect(fixture.commandClose).not.toHaveBeenCalled();
+    resolveRuntimeClose();
+    await Promise.all([first, second]);
     expect(fixture.commandClose).toHaveBeenCalledOnce();
   }, ACPX_LONG_WAIT_TEST_TIMEOUT_MS);
 

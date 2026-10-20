@@ -14,7 +14,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer as createHttpServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
 import { getCACertificates } from "node:tls";
 import { join, resolve } from "node:path";
@@ -1993,6 +1994,9 @@ describe("OpenCodeServerDriver", () => {
         external_directory: { "*": "deny", [`${workspace}/**`]: "allow" },
       });
       expect(config.autoupdate).toBe(false);
+      expect(config.provider.openrouter.options.headers).toMatchObject({
+        "HTTP-Referer": "https://paperclip.ing", "X-Title": "Paperclip", "X-OpenRouter-Title": "Paperclip",
+      });
       expect(config.provider.openrouter.models).toHaveProperty(
         "deepseek/deepseek-v4-flash-0731",
       );
@@ -2549,6 +2553,79 @@ describe("OpenCodeServerDriver", () => {
     } finally {
       await session.close({ reason: "test complete" });
     }
+  });
+
+  it("fails the running turn with the exit cause when OpenCode stops mid-turn", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-server-lost-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-server-lost-workspace-"));
+    roots.push(root, workspace);
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    let streamOpened!: () => void;
+    const opened = new Promise<void>(resolve => { streamOpened = resolve; });
+    let serverPid: number | undefined;
+    let eventRequests = 0;
+    const refused = () => new TypeError("fetch failed", {
+      cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1"), { code: "ECONNREFUSED" }),
+    });
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731", runtimeDirectory: root, command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      onSpawn: async ({ pid }) => { serverPid = pid; },
+      // Own the event stream so the fixture cannot finish the turn on its own,
+      // then report the refused reconnects a dead server produces.
+      fetch: async (input, init) => {
+        if (!String(input).endsWith("/event")) return fetch(input, init);
+        eventRequests += 1;
+        if (eventRequests > 1) throw refused();
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) { stream = controller; streamOpened(); } }),
+          { headers: { "Content-Type": "text/event-stream" } });
+      },
+    });
+    const session = await driver.openSession({ runId: "server-lost", normalizedSessionId: "server-lost", workingDirectory: workspace });
+    try {
+      const events = collectTurnEvents(session.events());
+      const turn = await session.startTurn({ message: { role: "user", text: "install dependencies" } });
+      await opened;
+      process.kill(serverPid!, "SIGKILL");
+      stream.error(refused());
+      const observed = await events;
+      const failed = observed.at(-1);
+      expect(failed).toMatchObject({
+        eventType: "turn.failed",
+        turnId: turn.turnId,
+        payload: {
+          status: "failed",
+          providerTerminalObserved: false,
+          error: {
+            code: "opencode_server_exited",
+            opencodeFailure: { kind: "server_exited", signal: "SIGKILL", connectionError: "ECONNREFUSED" },
+          },
+        },
+      });
+      const diagnostic = observed.find(event => event.eventType === "harness.diagnostic" && event.payload.code === "opencode_sse_failed");
+      expect(diagnostic?.payload.failure).toEqual({ kind: "server_exited", signal: "SIGKILL", connectionError: "ECONNREFUSED" });
+      expect(eventRequests).toBe(4);
+    } finally {
+      await session.close({ reason: "test complete" });
+    }
+  });
+
+  it("classifies a lost event stream from closed error fields only", async () => {
+    const { openCodeEventStreamFailure } = openCodeServerDriverInternals;
+    const running = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) as unknown as ChildProcess;
+    const exited = Object.assign(new EventEmitter(), { exitCode: 137, signalCode: null }) as unknown as ChildProcess;
+    const reset = new TypeError("fetch failed", { cause: Object.assign(new Error("private socket detail"), { code: "ECONNRESET" }) });
+    expect(await openCodeEventStreamFailure(reset, exited)).toEqual({ kind: "server_exited", exitCode: 137, connectionError: "ECONNRESET" });
+    expect(await openCodeEventStreamFailure(Object.assign(new Error("HTTP 502"), { httpStatus: 502 }), running))
+      .toEqual({ kind: "http_error", httpStatus: 502 });
+    expect(await openCodeEventStreamFailure(Object.assign(new Error("closed"), { streamClosed: true }), running))
+      .toEqual({ kind: "stream_closed" });
+    expect(await openCodeEventStreamFailure(new Error("private provider text"), running)).toEqual({ kind: "stream_error" });
+    const unknownCode = new TypeError("fetch failed", { cause: Object.assign(new Error("x"), { code: "EPRIVATE" }) });
+    const started = Date.now();
+    expect(await openCodeEventStreamFailure(unknownCode, running)).toEqual({ kind: "connection_failed", connectionError: "unrecognized" });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
   });
 
   it("restarts OpenCode when session startup fails transiently", async () => {

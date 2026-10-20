@@ -54,7 +54,7 @@ import {
   readNativeBoardResponseWaitSource,
 } from "./native-board-response-wait.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
-import { reportRunFailure } from "../run-failure-report.js";
+import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import {
   authorizeNativeChatReviewPresentation,
@@ -720,9 +720,12 @@ async function projectCommittedRun(input: {
     )
     .returning();
   // Metadata repairs can preserve the terminal status. Only a genuine status
-  // transition should emit another terminal event.
+  // transition should emit another terminal event. A failed run that leaves a
+  // pending retry still needs its first failure report.
   if (updatedRun && updatedRun.status !== input.run.status) {
     await emitAgentTaskRun(input.db, updatedRun);
+    void reportRunFailure(input.db, updatedRun);
+  } else if (updatedRun && isNewTerminalRunFailure(input.run, updatedRun)) {
     void reportRunFailure(input.db, updatedRun);
   }
 }

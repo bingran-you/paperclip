@@ -1,4 +1,6 @@
 import { StepHeader } from "./ConnectionSetupHeader";
+import { GoogleWorkspaceServicesDialog } from "./GoogleWorkspaceServices";
+import type { GoogleWorkspaceServiceSelection } from "@paperclipai/shared";
 export { StepHeader } from "./ConnectionSetupHeader";
 import { ConnectionInstructionsEditor } from "./ConnectionInstructions";
 import { connectionInstructionsConfig, defaultConnectionAgentInstructions, type ConnectionAgentInstructions } from "@paperclipai/shared";
@@ -364,10 +366,17 @@ const OAUTH_SIGN_IN_STEP_LABELS = ["Sign in"];
  * original identity through the explicit reconnect hint.
  */
 function defaultGrantKindFor(method: ConnectionMethodDef | null, preferPersonal = false): ConnectionGrantKind {
+  // A Copilot PAT represents a person's paid runtime account. Sharing it must
+  // be an explicit choice, independent of GitHub repository connections.
+  if (method?.ai?.provider === "github") return "user";
   if (preferPersonal && method?.auth !== "none" && (!method?.grantKinds || method.grantKinds.includes("user"))) return "user";
   if (method?.grantKinds?.length === 1) return method.grantKinds[0]!;
   if (method?.grantKinds && !method.grantKinds.includes("organization")) return method.grantKinds[0]!;
   return "organization";
+}
+
+function defaultInstallChoiceFor(method: ConnectionMethodDef | null, requestedAgentId?: string): "specific" | "all" {
+  return requestedAgentId || method?.ai?.provider === "github" ? "specific" : "all";
 }
 
 function configuredAgentIdentity(connection: ToolConnection): string | undefined {
@@ -624,6 +633,10 @@ function StandardConnectionSetupFlow({
   onCancel,
   renderCredentialStep,
 }: ConnectionSetupFlowProps = {}) {
+  const workspaceSelectionRef = useRef<GoogleWorkspaceServiceSelection | null>(null);
+  const [workspaceConsent, setWorkspaceConsent] = useState<(() => void) | null>(null);
+  const [workspaceConnection, setWorkspaceConnection] = useState<ToolConnection | undefined>();
+  const [workspaceDraft, setWorkspaceDraft] = useState<GoogleWorkspaceServiceSelection | undefined>();
   const queryClient = useQueryClient();
   const routeNavigate = useNavigate();
   const navigate = useCallback((to: string, options?: { replace?: boolean }) => {
@@ -978,7 +991,7 @@ function StandardConnectionSetupFlow({
     setGoogleSheetsError(null);
     setConnectResult(null);
     setInstallAgentIds(new Set(requestedAgentId ? [requestedAgentId] : []));
-    setInstallChoice(requestedAgentId ? "specific" : "all");
+    setInstallChoice(defaultInstallChoiceFor(initialMethod, requestedAgentId));
     setGrantKind(reconnectGrantKind ?? defaultGrantKindFor(initialMethod, Boolean(requestedAgentId)));
     setStep("key");
     navigate(
@@ -1040,7 +1053,11 @@ function StandardConnectionSetupFlow({
     && !connectionMethodSupportsAutomaticOAuth(candidate),
   );
   const selectedCustomOAuth = Boolean(customOAuthMethod && connectionMethodKey === customOAuthMethod.key);
-  const requestedDefinitionUsesManagedConnector = !selectedCustomOAuth && Boolean(
+  const selectedRuntimeAuth = Boolean(fullRequestedDefinition?.methods.some(candidate =>
+    candidate.transport === "runtime_auth" && candidate.ai
+    && candidate.key === (connectionMethodKey || requestedMethodKey),
+  ));
+  const requestedDefinitionUsesManagedConnector = !selectedCustomOAuth && !selectedRuntimeAuth && Boolean(
     fullRequestedDefinition?.methods.some((candidate) =>
       candidate.oauthStrategy === "paperclip_cloud_connector"
       || candidate.oauthStrategy === "paperclip_id_connector"
@@ -1227,6 +1244,12 @@ function StandardConnectionSetupFlow({
     })
     : false;
   const identityConnection = resumeConnection ?? reconnectConnection;
+  useEffect(() => {
+    workspaceSelectionRef.current = null;
+    setWorkspaceConsent(null);
+    setWorkspaceConnection(undefined);
+    setWorkspaceDraft(undefined);
+  }, [selectedCompanyId, requestedAppKey, identityConnection?.id]);
   const reconnectGrantKind: ConnectionGrantKind | null = identityConnection
     ? identityConnection.credentialPolicy === "per_user"
       ? "user"
@@ -1302,6 +1325,7 @@ function StandardConnectionSetupFlow({
         await toolsApi.updateConnection(connection.id, { agentInstructions: instructionValue });
       }
       return toolsApi.startOAuth(connection.id, {
+      ...(connection.config?.sourceTemplateKey === "google-workspace" && workspaceSelectionRef.current ? { workspaceServices: workspaceSelectionRef.current } : {}),
       asCurrentUser: connection.credentialPolicy === "per_user",
       ...(connection.credentialPolicy === "per_agent"
         ? { asAgentId: configuredAgentIdentity(connection) ?? [...installAgentIds][0] }
@@ -1315,6 +1339,7 @@ function StandardConnectionSetupFlow({
         ? (error.body as { details?: { code?: unknown } }).details
         : null;
       setOAuthPhase("error");
+      workspaceSelectionRef.current = null;
       onPhaseChange?.("needs_retry");
       setOAuthError(
         details?.code === "invalid_grant"
@@ -1327,6 +1352,16 @@ function StandardConnectionSetupFlow({
   });
   const mutateOAuthStart = oauthStartMutation.mutate;
   const startOAuth = useCallback((connection: ToolConnection) => {
+    if (connection.config?.sourceTemplateKey === "google-workspace" && !workspaceSelectionRef.current) {
+      setWorkspaceConnection(connection);
+      setWorkspaceConsent(() => () => {
+        onPhaseChange?.("authorizing");
+        reserveOAuthPopup();
+        if (host === "dialog" && !connectionIntentId) setDialogOAuthConnectionId(connection.id);
+        mutateOAuthStart(connection);
+      });
+      return;
+    }
     onPhaseChange?.("authorizing");
     reserveOAuthPopup();
     if (host === "dialog" && !connectionIntentId) setDialogOAuthConnectionId(connection.id);
@@ -1369,6 +1404,7 @@ function StandardConnectionSetupFlow({
           requestedGrantKind,
         );
         result = await toolsApi.connectApp(selectedCompanyId!, {
+          ...(connectEntry.slug === "google-workspace" && workspaceSelectionRef.current ? { workspaceServices: workspaceSelectionRef.current } : {}),
           galleryKey: connectEntry.slug,
           ...(instructionValue ? { agentInstructions: instructionValue } : {}),
           ...(connectionMethodKey ? { connectionMethodKey } : {}),
@@ -1489,6 +1525,7 @@ function StandardConnectionSetupFlow({
       const details = error instanceof ApiError && error.body && typeof error.body === "object"
         ? (error.body as { details?: { code?: unknown } }).details
         : null;
+      if (entry?.slug === "google-workspace") workspaceSelectionRef.current = null;
       if (automaticOAuthEntry) {
         setOAuthPhase("error");
         onPhaseChange?.("needs_retry");
@@ -1530,11 +1567,19 @@ function StandardConnectionSetupFlow({
     const method = connectEntry
       ? availableToolConnectionMethod(connectEntry, connectionMethodKey || null)
       : null;
+    if (connectEntry?.slug === "google-workspace" && !workspaceSelectionRef.current) {
+      setWorkspaceConnection(identityConnection ?? undefined);
+      setWorkspaceConsent(() => () => {
+        reserveOAuthPopup();
+        mutateConnect(entryOverride);
+      });
+      return;
+    }
     if (method?.auth === "oauth") {
       reserveOAuthPopup();
     }
     mutateConnect(entryOverride);
-  }, [connectionMethodKey, entry, mutateConnect, reserveOAuthPopup]);
+  }, [connectionMethodKey, entry, identityConnection, mutateConnect, reserveOAuthPopup]);
 
   useEffect(() => {
     if (!requestedAppKey || galleryQuery.isLoading || !galleryQuery.data) return;
@@ -1659,7 +1704,7 @@ function StandardConnectionSetupFlow({
       setInstallAgentIds(new Set(
         matchingEnrollmentAccess?.agentIds ?? (requestedAgentId ? [requestedAgentId] : []),
       ));
-      setInstallChoice(matchingEnrollmentAccess?.installChoice ?? (requestedAgentId ? "specific" : "all"));
+      setInstallChoice(matchingEnrollmentAccess?.installChoice ?? defaultInstallChoiceFor(initialMethod, requestedAgentId));
       // Route/service selection initializes the wizard once. Later renders must
       // preserve the user's current step in both hosts instead of snapping back
       // to Access after they continue.
@@ -2109,7 +2154,7 @@ function StandardConnectionSetupFlow({
       capabilities={galleryQuery.data?.capabilities}
       githubIdentity={entry?.slug === "github"}
       identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
-      preserveAgentAccess={Boolean(automaticOAuthEntry && (resumableOAuthConnection || reconnectConnection))}
+      preserveAgentAccess={Boolean((automaticOAuthEntry && (resumableOAuthConnection || reconnectConnection)) || reconnectConnection?.connectionPurpose === "ai")}
       disabled={connectMutation.isPending || oauthStartMutation.isPending}
     />
     {entry && instructionTemplate && instructionValue && <div className="mt-6"><ConnectionInstructionsEditor provider={entry.name} template={instructionTemplate} value={instructionValue} onChange={(value) => setInstructionDraft({ slug: entry.slug, value })} disabled={connectMutation.isPending || oauthStartMutation.isPending} /></div>}
@@ -2171,6 +2216,19 @@ function StandardConnectionSetupFlow({
       || connectorEnrollmentQuery.data?.configured !== true
     )
   );
+
+  if (workspaceConsent) return <GoogleWorkspaceServicesDialog
+    connection={workspaceConnection}
+    initial={workspaceDraft}
+    onCancel={selection => { if (selection) setWorkspaceDraft(selection); setWorkspaceConsent(null); setOAuthPhase("entry"); onPhaseChange?.("requested"); }}
+    onContinue={selection => {
+      workspaceSelectionRef.current = selection;
+      setWorkspaceDraft(selection);
+      const proceed = workspaceConsent;
+      setWorkspaceConsent(null);
+      proceed();
+    }}
+  />;
 
   if (showCuratedOAuthState && automaticOAuthEntry) {
     return (
@@ -2399,7 +2457,7 @@ function StandardConnectionSetupFlow({
               zapierSource
                 ? { name: "Zapier", logoUrl: zapierEntry?.branding.logoUrl ?? null, darkLogoUrl: zapierEntry?.branding.darkLogoUrl ?? null }
                 : entry && step !== "gallery"
-                  ? { name: entry.name, logoUrl: entry.branding.logoUrl, darkLogoUrl: entry.branding.darkLogoUrl ?? null }
+                  ? { name: aiMethod?.provider === "github" ? "GitHub Copilot" : entry.name, logoUrl: entry.branding.logoUrl, darkLogoUrl: entry.branding.darkLogoUrl ?? null }
                 : undefined
             }
             unverifiedHost={!entry && !zapierSource && step !== "gallery" ? endpointHost(linkUrl) : null}
