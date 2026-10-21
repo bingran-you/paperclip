@@ -345,6 +345,37 @@ describe("materializePaperclipSkillCopy", () => {
     }
   });
 
+  it("does not lock an already-current materialized skill", async () => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-skill-copy-"),
+    );
+    try {
+      const source = path.join(root, "source");
+      const skillsHome = path.join(root, "skills");
+      const target = path.join(skillsHome, "skill");
+      const lock = `${target}.lock`;
+      await fs.mkdir(source, { recursive: true });
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n", "utf8");
+      await materializePaperclipSkillCopy(source, target);
+
+      await fs.mkdir(lock);
+      const owner = path.join(lock, "owner.json");
+      await fs.writeFile(
+        owner,
+        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+        "utf8",
+      );
+
+      await expect(
+        materializePaperclipSkillCopy(source, target),
+      ).resolves.toMatchObject({ copiedFiles: 0 });
+      expect((await fs.readdir(skillsHome)).sort()).toEqual(["skill", "skill.lock"]);
+      await expect(fs.readFile(owner, "utf8")).resolves.toContain(`"pid":${process.pid}`);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("breaks stale materialization locks left by dead processes", async () => {
     const root = await fs.mkdtemp(
       path.join(os.tmpdir(), "paperclip-skill-copy-"),

@@ -362,6 +362,7 @@ export function createInboundWakeups(db: Db, options: WakeupOptions) {
         requestedByActorId: request.requestedByActorId,
         taskKey: context.issue.identifier,
         wakeCommentId: request.commentId,
+        chatConversationId: context.conversation.id,
         attachmentOmissionReasons: claimed.payload.attachmentOmissionReasons as
           | Record<string, number>
           | undefined,

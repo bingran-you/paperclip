@@ -937,6 +937,29 @@ describe("admitWakeBehindIssueExecution", () => {
     expect(writer.insertNewDeferredWake).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { label: "another conversation's queued run", active: "conversation-a", incoming: "conversation-b", coalesces: false },
+    { label: "the same conversation's queued run", active: "conversation-a", incoming: "conversation-a", coalesces: true },
+    { label: "a queued run without a conversation", active: undefined, incoming: "conversation-b", coalesces: true },
+    { label: "a conversation's queued run from a non-chat wake", active: "conversation-a", incoming: undefined, coalesces: true },
+  ])("coalesces a chat reply into $label only when one conversation is attested", async ({ active, incoming, coalesces }) => {
+    const writer = createFakeAdmissionWriter();
+    const reader = createFakeAdmissionReader();
+    const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: createFakeAdmissionHelpers() });
+    await admit(SCOPE, admissionInput({
+      contextSnapshot: incoming ? { chatConversationId: incoming } : {},
+      activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, status: "queued",
+        contextSnapshot: active ? { chatConversationId: active } : {} },
+    }));
+    expect(writer.coalesceIntoActiveExecutionRun).toHaveBeenCalledTimes(coalesces ? 1 : 0);
+    if (!coalesces) {
+      // The separated reply still merges with its own conversation's deferred wake.
+      expect(reader.findExistingDeferredWake).toHaveBeenCalledExactlyOnceWith(SCOPE,
+        expect.objectContaining({ chatConversationId: incoming }));
+      expect(writer.insertNewDeferredWake).toHaveBeenCalledOnce();
+    }
+  });
+
   it("partitions durable admission by the exact actor before considering a deferred merge", async () => {
     const durableReceipt = {
       id: "other-actor-receipt",
@@ -983,6 +1006,7 @@ describe("admitWakeBehindIssueExecution", () => {
         companyId: "company-1",
         agentId: "wake-agent",
         issueId: "issue-1",
+        chatConversationId: null,
         durableActor: { type: "user", id: "other-user" },
       },
     );

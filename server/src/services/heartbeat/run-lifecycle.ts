@@ -1,3 +1,4 @@
+import os from "node:os";
 import {
   DEFERRED_WAKE_CONTEXT_KEY,
   EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
@@ -231,6 +232,14 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
   "cost.reported",
+];
+
+const LIVENESS_BOOKKEEPING_EVENT_TYPES = [
+  "lifecycle",
+  "adapter.invoke",
+  "error",
+  "legacy.case_handoff_cleanup_intent",
+  "legacy.case_handoff_cleanup_verified",
 ];
 
 export const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
@@ -569,10 +578,13 @@ export async function persistHeartbeatRunProcessMetadata(
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
-    if (run?.runtimeMode === "native") await appendHeartbeatRunEvent(tx as unknown as Db, {
+    if (run) await appendHeartbeatRunEvent(tx as unknown as Db, {
       companyId: run.companyId, runId, agentId: run.agentId,
       eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info",
       message: "Process identity recorded; prior stop evidence no longer applies.",
+      payload: { targetKind: meta.targetKind ?? "local", hostname: os.hostname(),
+        processPid: meta.pid, processGroupId: meta.processGroupId,
+        processStartedAt: run.processStartedAt?.toISOString() ?? null },
     });
     return run;
   });
@@ -2883,14 +2895,15 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
 
     const [eventStats] = await db
       .select({
-        count: sql<number>`count(*) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))::int`,
-        latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt}) filter (where ${heartbeatRunEvents.eventType} not in ('lifecycle', 'adapter.invoke', 'error'))`,
+        count: sql<number>`count(*)::int`,
+        latestAt: sql<Date | null>`max(${heartbeatRunEvents.createdAt})`,
       })
       .from(heartbeatRunEvents)
       .where(
         and(
           eq(heartbeatRunEvents.companyId, run.companyId),
           eq(heartbeatRunEvents.runId, run.id),
+          notInArray(heartbeatRunEvents.eventType, LIVENESS_BOOKKEEPING_EVENT_TYPES),
         ),
       );
 

@@ -30,8 +30,6 @@ import {
   ToggleField,
 } from "../components/agent-config-primitives";
 import { InstanceGeneralSettings } from "./InstanceGeneralSettings";
-import { DecisionModelSettingsSection } from "../components/decision-models/DecisionModelSettings";
-import { useFastResponsesEnabled } from "../hooks/useFastResponsesEnabled";
 
 export function CompanySettings() {
   const {
@@ -45,7 +43,6 @@ export function CompanySettings() {
   const navigate = useNavigate();
   const toastActions = useOptionalToastActions();
   const cloud = useCloudInstance();
-  const fastResponses = useFastResponsesEnabled();
   // Managed instances derive the task ID prefix from the company name, so a
   // rename here also renumbers the existing task IDs.
   const isCloudManaged = Boolean(cloud);
@@ -371,10 +368,6 @@ export function CompanySettings() {
             : null
         }
       />
-
-      {fastResponses.loaded && !fastResponses.enabled && (
-        <DecisionModelSettingsSection key={selectedCompanyId} companyId={selectedCompanyId!} />
-      )}
 
       <AgentObservabilitySettingsSection companyId={selectedCompanyId!} />
 

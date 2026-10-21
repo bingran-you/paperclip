@@ -1,4 +1,8 @@
+import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
+import { recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
+import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
 import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
 import {
@@ -11,7 +15,9 @@ import { readNativeWorkspaceSyncReference } from "../native-runtime/native-works
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import {
   nativeRetryCancellationCommitCondition,
+  nativeRetryCancellationEligible,
   claimCancellationRequest,
+  rethrowNativeCancellationLockConflict,
 } from "../native-runtime/native-cancellation-request.js";
 import {
   canContinueCancelledRun,
@@ -441,7 +447,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       await isCancelledNativeStartup(db, run, preparationCoordinator);
     if (run.runtimeMode !== "native" && !cancelledPreparation &&
         parseObject(run.resultJson?.startupCancellation).beforeNativeSelection !== true &&
-        !(await remoteExecutionHasStopped(db, run.companyId, run.id))) return;
+        !(await remoteExecutionHasStopped(db, run.companyId, run.id)) &&
+        !(await recordedLocalExecutionStopped(db, run))) return;
     const issueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     if (!issueId) return;
     const currentRun = run.runtimeMode === "native" ? await getRun(run.id, { includeExecutionEvidence: true }) : null;
@@ -471,6 +478,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(50);
     for (const wake of pending) {
       if (wake.idempotencyKey?.startsWith("chat-inbound:")) continue;
+      if (readTaskRetryIntent(wake.payload)) { await resumeTaskRetry(wake.companyId, wake.id); continue; }
       let payload = parseObject(wake.payload);
       if (payload.queuedCommentInterrupt) {
         await resumeQueuedCommentInterrupt(wake.companyId, wake.id);
@@ -510,7 +518,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         const admitted = await admitExplicitNativeContinuation({ db, companyId: run.companyId, issueId,
           agentId: run.agentId, actorType: wake.requestedByActorType, actorId: requestedByActorId,
           reason, commentId, successorRunId: randomUUID(), dryRun: true,
-          ...((run.runtimeMode === "native" || cancelledPreparation) ? { queuedCommentRequestId: wake.id } : {}),
+          queuedCommentRequestId: wake.id,
           onBlocked: (reason, message) => { wait = { reason, message }; },
         });
         if (!admitted) {
@@ -528,7 +536,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       await enqueueWakeup(run.agentId, { source: wake.source as WakeupOptions["source"], triggerDetail: (wake.triggerDetail ?? undefined) as WakeupOptions["triggerDetail"],
         reason, payload, contextSnapshot: context,
         requestedByActorType: "user", requestedByActorId,
-        ...((run.runtimeMode === "native" || cancelledPreparation) ? { queuedCommentRequestId: wake.id } : {}),
+        queuedCommentRequestId: wake.id,
         idempotencyKey: `remote-stop-comment:${run.id}:${wake.id}` }, wake.id);
       break;
     }
@@ -654,8 +662,42 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     }, queueId);
   }
 
+  async function resumeTaskRetry(companyId: string, requestId: string) {
+    if ((await getSchedulingSuppression()).suppressed) return;
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.reason, "task_retry"),
+      eq(agentWakeupRequests.requestedByActorType, "user"),
+    ));
+    const intent = readTaskRetryIntent(wake?.payload);
+    if (!wake || !intent || intent.chatActionId || intent.canonicalIntentId || intent.generationId !== wake.id ||
+        intent.actorId !== wake.requestedByActorId) return;
+    const issueId = readNonEmptyString(wake.payload?.issueId);
+    if (!issueId) return;
+    await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
+      requestedByActorType: "user", requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
+      payload: { issueId }, contextSnapshot: { issueId, triggeredBy: "board", actorId: intent.actorId,
+        responsibleUserId: intent.actorId },
+      issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
+      idempotencyKey: `task-retry-dispatch:${wake.id}` }, wake.id);
+  }
+
   async function resumeExecutionWaitComments() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await reconcileTaskChatRetryReceipts(db);
+    const retries = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
+      .from(agentWakeupRequests).innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->'taskRetry'->>'chatActionId' is null`,
+        notInArray(issues.status, ["done", "cancelled"])))
+      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    for (const retry of retries) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(eq(agentWakeupRequests.id, retry.id));
+      await resumeTaskRetry(retry.companyId, retry.id).catch(err => logger.warn({ err, requestId: retry.id }, "Task retry dispatch deferred"));
+    }
     const waits = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
@@ -710,13 +752,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   ) {
     try {
       const source = await getRun(run.id);
+      const sourceHandoff = await pendingCaseHandoffForRun(db, run.id, run.companyId);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
-        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
+        suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source) || Boolean(sourceHandoff),
         ...(options.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
       });
       if (options.deferredPostCommitEffects) {
@@ -727,6 +770,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       const completed = await getRun(run.id);
       const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
         ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
+      if (sourceHandoff && completed?.status === "cancelled" && !completed.startedAt && issueId) {
+        // A cancelled queue entry has no executeRun.finally. The canonical
+        // bootstrap proof still needs to release and wake its durable handoff.
+        await isCaseHandoffSourceReleased(db, { runId: completed.id, issueId });
+      }
       if (completed?.status === "succeeded" && issueId) {
         await settleSlackConversation(db, run.companyId, issueId).catch((err) => {
           logger.warn({ err, runId: run.id }, "Slack conversation settlement deferred to reconciliation");
@@ -902,7 +950,72 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (options.expectedStatus && run.status !== options.expectedStatus) return null;
-    if (options.cancellationRequestId) {
+    const handoffIssueId = run.nativeIssueId ?? run.issueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
+    const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
+    let cancellationClaimed = false;
+    let caseHandoffRetryClaimed = false;
+    if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
+      const publications: ActivityPublication[] = [];
+      const supersessionApplied = await db.transaction(async tx => {
+        const [issue] = await tx.select({ id: issues.id, executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
+          assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId }).from(issues)
+          .where(and(eq(issues.companyId, run!.companyId), eq(issues.id, handoffIssueId))).for("update");
+        const [current] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, run!.companyId))).for("update");
+        if (!current || (options.expectedStatus && current.status !== options.expectedStatus)) return false;
+        run = current;
+        if (options.cancellationRequestId) {
+          run = await claimCancellationRequest(tx as unknown as Db, runId, run!.companyId, options.cancellationRequestId,
+            options.cancellationRequestedByUserId ?? null);
+          cancellationClaimed = true;
+        }
+        // Acceptance takes task -> run locks too. Revoke the source's write
+        // authority in the same commit that cancels its outstanding intents,
+        // before waiting for process/native Stop. Otherwise a handoff can be
+        // accepted in the gap after this cancellation sweep.
+        const currentRun = run!;
+        const cancellableStatuses: string[] = options.expectedStatus ? [options.expectedStatus] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES];
+        if (!options.expectedStatus && currentRun.runtimeMode === "native" && currentRun.status === "failed" && currentRun.nativeIssueId) {
+          // Failed native runs may still own a retry. As in correlated Stop,
+          // lock the coordinator NOWAIT so a coordinator-only writer wins
+          // safely instead of deadlocking with its run-row claim.
+          const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
+            eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.companyId, currentRun.companyId),
+            eq(nativeRunFinalizations.issueId, currentRun.nativeIssueId))).for("update", { noWait: true }).limit(1);
+          caseHandoffRetryClaimed = nativeRetryCancellationEligible({ runId, companyId: currentRun.companyId,
+            issueId: currentRun.nativeIssueId, resultJson: currentRun.resultJson, requestId: options.cancellationRequestId }, coordinator);
+          if (caseHandoffRetryClaimed) cancellableStatuses.push("failed");
+        }
+        const requestedAt = new Date().toISOString();
+        const guardedCancellation = options.expectedStatus ? {
+          cancellation: (currentRun.resultJson?.startupCancellation ? readRunCancellation(currentRun.resultJson) : null)
+            ?? requestedRunCancellation(options.resultJson ?? {}, reason),
+          // Promotion must remain fenced after this transaction releases the
+          // run lock, before the ordinary Stop path performs its settlement.
+          startupCancellation: { requestedAt, beforeNativeSelection: currentRun.runtimeMode === "legacy" && !currentRun.runtimeModeResolvedAt
+            && currentRun.executionStage === "preparing" && parseObject(currentRun.runnerProfileJson?.adapterDispatch).adapterType === "paperclip_runner" },
+        } : {};
+        const [fenced] = await tx.update(heartbeatRuns).set({
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+            executionCancellation: { state: "requested", requestedAt }, ...guardedCancellation,
+          })}::jsonb`,
+        }).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, run!.companyId),
+          inArray(heartbeatRuns.status, cancellableStatuses))).returning();
+        if (options.expectedStatus && !fenced) return false;
+        if (fenced) run = fenced;
+        // A board terminal request deliberately has no source run. It belongs
+        // to the current task execution, not whichever historical run is stopped.
+        // Queue admission may bind execution before adopting an old checkout.
+        const ownsTask = issue && issue.assigneeAgentId === currentRun.agentId && !issue.assigneeUserId &&
+          (issue.executionRunId ? issue.executionRunId === runId : issue.checkoutRunId === runId);
+        await cancelCaseHandoffsForIssue(tx as unknown as Db, { companyId: run!.companyId, issueId: handoffIssueId,
+          sourceRunId: runId, includeUnboundTerminalIntent: Boolean(fenced && ownsTask), reason, publications });
+        return true;
+      }).catch(rethrowNativeCancellationLockConflict);
+      publications.forEach(publishActivity);
+      if (!supersessionApplied) return null;
+    }
+    if (options.cancellationRequestId && !cancellationClaimed) {
       run = await claimCancellationRequest(db, runId, run.companyId, options.cancellationRequestId, options.cancellationRequestedByUserId ?? null);
     }
     // The caller claim checked retry eligibility under both durable row locks.
@@ -911,7 +1024,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // retry fence. Re-reading only retryable_failure here would strand replay.
     const pendingNativeRetry =
       run.runtimeMode === "native" && run.status === "failed" && (
-        Boolean(options.cancellationRequestId) || await db
+        caseHandoffRetryClaimed || Boolean(options.cancellationRequestId) || await db
           .select({ runId: nativeRunFinalizations.runId })
           .from(nativeRunFinalizations)
           .where(
@@ -1338,6 +1451,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     resumeExecutionWaitComments,
     resumeQueuedCommentInterrupt,
     resumeSavedLegacyComments,
+    resumeTaskRetry,
     cancelActiveForAgentInternal,
     cancelInvocationsForAgentsInternal,
   };

@@ -1,4 +1,5 @@
-import { enrichPromotedWakeContext } from "../domain/context.js";
+import { readWakeChatConversationId } from "../../run-dispatch/index.js";
+import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -11,7 +12,6 @@ import {
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
   readNonEmptyString,
-  parseObject,
 } from "../domain/values.js";
 import type {
   AdmitWakeBehindIssueExecutionResult,
@@ -840,11 +840,10 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
       }));
-    // Each resolved card has its own immutable decision and continuation. Never
-    // merge it with comments or another card, in either arrival order.
+    // A resolved card never merges with comments or another card.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || parseObject(input.activeExecutionRun.contextSnapshot).interactionId
+      allowRunCoalescing: wakeMustNotJoinActiveRun(input.activeExecutionRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,
@@ -893,6 +892,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
             companyId: input.companyId,
             agentId: input.agentId,
             issueId: input.issueId,
+            chatConversationId: readWakeChatConversationId(input.contextSnapshot),
             ...(input.durableReceipt
               ? {
                   durableActor: {

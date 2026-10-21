@@ -1566,7 +1566,7 @@ function checkpointCursor(cursor: string | null | undefined): number {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-async function reconcileRecoveryCursor(input: {
+async function reconcileRecoveryCheckpoint(input: {
   controlPlane: ControlPlanePort;
   checkpoint: PersistedNativeSession;
   runId: string;
@@ -1576,6 +1576,8 @@ async function reconcileRecoveryCursor(input: {
   const checkpointHighWater = checkpointCursor(input.checkpoint.cursor);
   let afterSourceSeq = checkpointHighWater;
   let persistedHighWater = checkpointHighWater;
+  let proposalTurnId = input.checkpoint.activeTurnId ?? null;
+  let recoveredResult: PrpStructuredRunResult | null = null;
   while (true) {
     const replay = await input.controlPlane.replayEvents(
       {
@@ -1588,6 +1590,34 @@ async function reconcileRecoveryCursor(input: {
     );
     input.signal.throwIfAborted();
     if (replay.events.length === 0) break;
+    for (const event of replay.events) {
+      if (event.eventType === "turn.started" && event.turnId !== proposalTurnId) {
+        proposalTurnId = null;
+        recoveredResult = null;
+      }
+      if (
+        proposalTurnId &&
+        event.turnId === proposalTurnId &&
+        event.eventType === "run.result.proposed"
+      ) {
+        const validation = validatePrpStructuredRunResult(event.payload);
+        if (
+          !validation.ok ||
+          event.runId !== input.runId ||
+          event.normalizedSessionId !== input.checkpoint.identity.sessionId ||
+          event.sourceInstanceId !== input.sourceInstanceId
+        ) {
+          throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+        }
+        const previous = recoveredResult ?? input.checkpoint.semanticResult;
+        const normalize = (result: PrpStructuredRunResult) =>
+          canonicalJson(input.controlPlane.normalizeReplayPayload?.(result) ?? result);
+        if (previous && normalize(previous) !== normalize(validation.result)) {
+          throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+        }
+        recoveredResult = validation.result;
+      }
+    }
     const pageHighWater = replay.events.reduce(
       (highest, event) => Math.max(highest, event.sourceSeq),
       afterSourceSeq,
@@ -1600,11 +1630,16 @@ async function reconcileRecoveryCursor(input: {
   }
   if (
     persistedHighWater === checkpointHighWater &&
-    input.checkpoint.cursor === String(checkpointHighWater)
+    input.checkpoint.cursor === String(checkpointHighWater) &&
+    recoveredResult === null
   ) {
     return input.checkpoint;
   }
-  return { ...input.checkpoint, cursor: String(persistedHighWater) };
+  return {
+    ...input.checkpoint,
+    cursor: String(persistedHighWater),
+    ...(recoveredResult === null ? {} : { semanticResult: recoveredResult }),
+  };
 }
 
 async function replayCheckpointedTurnTerminal(input: {
@@ -2036,7 +2071,7 @@ export async function executeNativeSession(
       timeoutMs: recoveryTimeoutMs,
       timeoutMessage: `native session recovery replay timed out after ${recoveryTimeoutMs}ms`,
       operation: (signal) =>
-        reconcileRecoveryCursor({
+        reconcileRecoveryCheckpoint({
           controlPlane: options.controlPlane,
           checkpoint: recoveryCheckpoint,
           runId: input.binding.runId,

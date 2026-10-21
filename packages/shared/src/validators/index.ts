@@ -443,6 +443,7 @@ export {
   isValidExistingBranchName,
   retryWorkspaceExportSchema,
   recoverWorkspaceSchema,
+  taskRetrySchema,
   reconstructWorkspaceSchema,
   resumeWorkspaceFinalizationSchema,
   issueReviewRequestSchema,

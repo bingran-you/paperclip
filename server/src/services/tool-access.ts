@@ -31,6 +31,8 @@ import {
 } from "./connector-telemetry.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
+import { measureRunPhase } from "./execution-preparation-timing.js";
+import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -12141,31 +12143,33 @@ export function toolAccessService(
     initialGrant: typeof connectionGrants.$inferSelect,
     actor?: ActorInfo,
   ) {
-    try {
-      return await refreshManagedGitHubGrantAccessOnce(
-        connection,
-        initialGrant,
-        actor,
-      );
-    } catch (error) {
-      if (
-        !(error instanceof HttpError) ||
-        asRecord(error.details).code !== "github_access_changed"
-      )
-        throw error;
-      const [current] = await db
-        .select()
-        .from(connectionGrants)
-        .where(
-          and(
-            eq(connectionGrants.id, initialGrant.id),
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-          ),
+    return measureRunPhase("connectors.github.refresh", async () => {
+      try {
+        return await refreshManagedGitHubGrantAccessOnce(
+          connection,
+          initialGrant,
+          actor,
         );
-      if (!current || current.status !== "active") throw error;
-      return refreshManagedGitHubGrantAccessOnce(connection, current, actor);
-    }
+      } catch (error) {
+        if (
+          !(error instanceof HttpError) ||
+          asRecord(error.details).code !== "github_access_changed"
+        )
+          throw error;
+        const [current] = await measureRunPhase("connectors.github.grants", () => db
+          .select()
+          .from(connectionGrants)
+          .where(
+            and(
+              eq(connectionGrants.id, initialGrant.id),
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+            ),
+          ));
+        if (!current || current.status !== "active") throw error;
+        return refreshManagedGitHubGrantAccessOnce(connection, current, actor);
+      }
+    });
   }
 
   async function refreshManagedGitHubGrantAccessOnce(
@@ -12173,13 +12177,13 @@ export function toolAccessService(
     initialGrant: typeof connectionGrants.$inferSelect,
     actor?: ActorInfo,
   ) {
-    let grant = await refreshOAuthGrantCredentials({
+    let grant = await measureRunPhase("connectors.github.credentials", () => refreshOAuthGrantCredentials({
       companyId: connection.companyId,
       connectionId: connection.id,
       grantId: initialGrant.id,
       actor,
-    });
-    const resolveAccessToken = async () => {
+    }));
+    const resolveAccessToken = async () => measureRunPhase("connectors.github.credentials", async () => {
       const accessRef = grant.credentialSecretRefs.find(
         (ref) => ref.configPath === "oauth.access_token",
       );
@@ -12196,15 +12200,15 @@ export function toolAccessService(
           undefined,
         )
       ).value;
-    };
+    });
     let metadata;
     let accessToken = await resolveAccessToken();
     try {
-      metadata = await loadGitHubGrantMetadata(
+      metadata = await measureRunPhase("connectors.github.repositories", () => loadGitHubGrantMetadata(
         accessToken,
         fetch,
         grant.providerTenant?.github?.appSlug,
-      );
+      ));
     } catch (error) {
       const providerCode =
         error instanceof HttpError ? asRecord(error.details).code : null;
@@ -12212,27 +12216,27 @@ export function toolAccessService(
       // GitHub may invalidate an access token before its recorded expiry. If an
       // expiring token pair exists, rotate it once under the same durable lease
       // and CAS path, then repeat /user before surfacing reconnect-required.
-      grant = await refreshOAuthGrantCredentials({
+      grant = await measureRunPhase("connectors.github.credentials", () => refreshOAuthGrantCredentials({
         companyId: connection.companyId,
         connectionId: connection.id,
         grantId: initialGrant.id,
         forceRefresh: true,
         actor,
-      });
+      }));
       accessToken = await resolveAccessToken();
       try {
-        metadata = await loadGitHubGrantMetadata(
+        metadata = await measureRunPhase("connectors.github.repositories", () => loadGitHubGrantMetadata(
           accessToken,
           fetch,
           grant.providerTenant?.github?.appSlug,
-        );
+        ));
       } catch (retryError) {
         const retryCode =
           retryError instanceof HttpError
             ? asRecord(retryError.details).code
             : null;
         if (retryCode === "oauth_reauthorization_required") {
-          await db
+          await measureRunPhase("connectors.github.grant_write", () => db
             .update(connectionGrants)
             .set({ status: "needs_reauthorization", updatedAt: now() })
             .where(
@@ -12240,13 +12244,13 @@ export function toolAccessService(
                 eq(connectionGrants.id, grant.id),
                 eq(connectionGrants.companyId, grant.companyId),
               ),
-            );
+            ));
         }
         throw retryError;
       }
     }
-    const { updated, previousGitHub } = await db.transaction(async (tx) => {
-      const [currentGrant] = await tx
+    const { updated, previousGitHub } = await measureRunTransaction(db, "connectors.github.refresh", async (tx) => {
+      const [currentGrant] = await measureRunPhase("connectors.github.grant_lock", () => tx
         .select()
         .from(connectionGrants)
         .where(
@@ -12256,7 +12260,7 @@ export function toolAccessService(
           ),
         )
         .for("update")
-        .limit(1);
+        .limit(1));
       if (!currentGrant || currentGrant.status === "revoked")
         throw notFound("GitHub authorization not found");
       const previousGitHub = currentGrant.providerTenant?.github;
@@ -12284,7 +12288,7 @@ export function toolAccessService(
             previousGitHub?.webhookHealth ?? metadata.webhookHealth,
         },
       };
-      const [updated] = await tx
+      const [updated] = await measureRunPhase("connectors.github.grant_write", () => tx
         .update(connectionGrants)
         .set({
           providerTenant,
@@ -12297,7 +12301,7 @@ export function toolAccessService(
             eq(connectionGrants.companyId, grant.companyId),
           ),
         )
-        .returning();
+        .returning());
       if (!updated) throw notFound("GitHub authorization not found");
       return { updated, previousGitHub };
     });
@@ -12312,7 +12316,7 @@ export function toolAccessService(
     if (cloudConnector && subject) {
       const previous = new Set(previousGitHub?.installationIds ?? []);
       const current = new Set(metadata.installationIds);
-      await Promise.all([
+      await measureRunPhase("connectors.github.webhooks", () => Promise.all([
         ...metadata.installationIds.map((installationId) =>
           cloudConnector.setWebhookBinding({
             subject,
@@ -12338,7 +12342,7 @@ export function toolAccessService(
               active: false,
             }),
           ),
-      ]);
+      ]));
     }
     return updated;
   }
@@ -17473,6 +17477,178 @@ export function toolAccessService(
     };
   }
 
+  async function resolveEffectiveProfiles<TEntry extends ProfileCatalogEntry, TAllowedTool>(
+    companyId: string,
+    agentId: string,
+    loadCatalog: () => PromiseLike<TEntry[]>,
+    toAllowedTool: (entry: TEntry) => TAllowedTool,
+  ): Promise<Omit<ToolProfileEffectiveSummary, "allowedTools"> & { allowedTools: TAllowedTool[] }> {
+    await assertOptionalAgent(
+      companyId,
+      agentId,
+      "Tool profile effective agent",
+    );
+    const allBindings = await db
+      .select()
+      .from(toolProfileBindings)
+      .where(eq(toolProfileBindings.companyId, companyId))
+      .orderBy(
+        asc(toolProfileBindings.priority),
+        asc(toolProfileBindings.createdAt),
+      );
+    const matchingBindings = allBindings.filter(
+      (binding) =>
+        (binding.targetType === "company" &&
+          binding.targetId === companyId) ||
+        (binding.targetType === "agent" && binding.targetId === agentId),
+    );
+    if (matchingBindings.length === 0) {
+      return {
+        agentId,
+        profiles: [],
+        entries: [],
+        bindings: [],
+        allowedTools: [],
+        allowedToolNames: [],
+        installedConnections: await resolveInstalledConnectionsForAgent(
+          companyId,
+          agentId,
+        ),
+      };
+    }
+    const candidateProfileIds = profileIdsInBindingOrder(matchingBindings);
+    const candidateProfiles = await db
+      .select()
+      .from(toolProfiles)
+      .where(
+        and(
+          eq(toolProfiles.companyId, companyId),
+          inArray(toolProfiles.id, candidateProfileIds),
+        ),
+      );
+    const bindings = effectiveToolProfileBindings(
+      matchingBindings,
+      candidateProfiles,
+    );
+    const profileIds = profileIdsInBindingOrder(bindings);
+    const profilesById = new Map(
+      candidateProfiles.map((profile) => [profile.id, profile]),
+    );
+    const activeProfiles = profileIds
+      .map((profileId) => profilesById.get(profileId) ?? null)
+      .filter((profile): profile is typeof toolProfiles.$inferSelect =>
+        Boolean(profile && profile.status === "active"),
+      );
+    if (activeProfiles.length === 0) {
+      return {
+        agentId,
+        profiles: [],
+        entries: [],
+        bindings: bindings.map(toProfileBinding),
+        allowedTools: [],
+        allowedToolNames: [],
+        installedConnections: await resolveInstalledConnectionsForAgent(
+          companyId,
+          agentId,
+        ),
+      };
+    }
+    const activeProfileIds = activeProfiles.map((profile) => profile.id);
+    const [entries, catalog, companyAgents] = await Promise.all([
+      db
+        .select()
+        .from(toolProfileEntries)
+        .where(
+          and(
+            eq(toolProfileEntries.companyId, companyId),
+            inArray(toolProfileEntries.profileId, activeProfileIds),
+          ),
+        )
+        .orderBy(asc(toolProfileEntries.createdAt)),
+      loadCatalog(),
+      db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.companyId, companyId)),
+    ]);
+    const entriesByProfile = new Map<
+      string,
+      Array<typeof toolProfileEntries.$inferSelect>
+    >();
+    for (const entry of entries) {
+      const list = entriesByProfile.get(entry.profileId) ?? [];
+      list.push(entry);
+      entriesByProfile.set(entry.profileId, list);
+    }
+    const allowedCatalogIds = new Set<string>();
+    const allowedToolNames = new Set<string>();
+    for (const profile of activeProfiles) {
+      const profileEntries = entriesByProfile.get(profile.id) ?? [];
+      const includes = profileEntries.filter(
+        (entry) => entry.effect === "include",
+      );
+      const excludes = profileEntries.filter(
+        (entry) => entry.effect === "exclude",
+      );
+      for (const catalogEntry of catalog) {
+        if (
+          excludes.some((entry) =>
+            profileEntryMatchesCatalog(entry, catalogEntry),
+          )
+        )
+          continue;
+        if (
+          profile.defaultAction === "allow" ||
+          includes.some((entry) =>
+            profileEntryMatchesCatalog(entry, catalogEntry),
+          )
+        ) {
+          allowedCatalogIds.add(catalogEntry.id);
+          allowedToolNames.add(catalogEntry.toolName);
+        }
+      }
+      for (const entry of includes.filter(
+        (item) => item.selectorType === "tool_name" && item.toolName,
+      )) {
+        const matchingExclude = excludes.some(
+          (item) =>
+            item.selectorType === "tool_name" &&
+            item.toolName === entry.toolName,
+        );
+        if (!matchingExclude) allowedToolNames.add(entry.toolName!);
+      }
+    }
+    const agentIds = companyAgents.map((agent) => agent.id);
+    const details: ToolProfileWithDetails[] = activeProfiles.map((profile) =>
+      buildProfileDetails({
+        profile,
+        entries: entriesByProfile.get(profile.id) ?? [],
+        bindings: bindings.filter(
+          (binding) => binding.profileId === profile.id,
+        ),
+        catalog,
+        agentIds,
+      }),
+    );
+    const allowedTools = catalog
+      .filter((entry) => allowedCatalogIds.has(entry.id))
+      .map(toAllowedTool);
+    return {
+      agentId,
+      profiles: details,
+      entries: entries.map(toProfileEntry),
+      bindings: bindings.map(toProfileBinding),
+      allowedTools,
+      allowedToolNames: [...allowedToolNames].sort((a, b) =>
+        a.localeCompare(b),
+      ),
+      installedConnections: await resolveInstalledConnectionsForAgent(
+        companyId,
+        agentId,
+      ),
+    };
+  }
+
   return {
     /** Identity-only verification: no bot installation/repository access required. */
     verifyPersonalGitHubIdentity: async (companyId: string, connectionId: string, userId: string) => {
@@ -18088,9 +18264,9 @@ export function toolAccessService(
       companyId: string,
       userId: string | null,
       localTrusted = false,
-    ) => {
+    ) => measureRunPhase("connectors.github.catalog", async () => {
       const [connections, grants, members, memberships] = await Promise.all([
-        db
+        measureRunPhase("connectors.github.connections", () => db
           .select()
           .from(toolConnections)
           .where(
@@ -18098,17 +18274,17 @@ export function toolAccessService(
               eq(toolConnections.companyId, companyId),
               eq(toolConnections.enabled, true),
             ),
-          ),
-        db
+          )),
+        measureRunPhase("connectors.github.grants", () => db
           .select()
           .from(connectionGrants)
-          .where(eq(connectionGrants.companyId, companyId)),
-        db
+          .where(eq(connectionGrants.companyId, companyId))),
+        measureRunPhase("connectors.github.grant_members", () => db
           .select()
           .from(connectionGrantMembers)
-          .where(eq(connectionGrantMembers.companyId, companyId)),
+          .where(eq(connectionGrantMembers.companyId, companyId))),
         userId
-          ? db
+          ? measureRunPhase("connectors.github.membership", () => db
               .select()
               .from(companyMemberships)
               .where(
@@ -18118,7 +18294,7 @@ export function toolAccessService(
                   eq(companyMemberships.principalId, userId),
                   eq(companyMemberships.status, "active"),
                 ),
-              )
+              ))
           : Promise.resolve([]),
       ]);
       const repositories = new Map<
@@ -18185,8 +18361,8 @@ export function toolAccessService(
               );
               rows = grant.providerTenant?.github?.repositories ?? [];
             } else {
-              const headers = initialGrant
-                ? await (async () => {
+              const headers = await measureRunPhase("connectors.github.credentials", () => initialGrant
+                ? (async () => {
                     const ref = initialGrant.credentialSecretRefs.find(
                       (ref) =>
                         ref.configPath === "oauth.access_token" ||
@@ -18205,8 +18381,8 @@ export function toolAccessService(
                     );
                     return { Authorization: `Bearer ${secret.value}` };
                   })()
-                : await resolveCredentialHeaders(connection, actor);
-              rows = await loadGitHubTokenRepositories(headers);
+                : resolveCredentialHeaders(connection, actor));
+              rows = await measureRunPhase("connectors.github.repositories", () => loadGitHubTokenRepositories(headers));
             }
             for (const row of rows) {
               mergeProjectRepository(repositories, row, connection.name, connection.id);
@@ -18227,7 +18403,7 @@ export function toolAccessService(
         connectionCount,
         failedConnectionCount,
       };
-    },
+    }),
 
     listConnections: async (
       companyId: string,
@@ -20291,184 +20467,35 @@ export function toolAccessService(
       return { unbound: rows.length };
     }),
 
-    getEffectiveProfilesForAgent: async (
-      companyId: string,
-      agentId: string,
-    ): Promise<ToolProfileEffectiveSummary> => {
-      await assertOptionalAgent(
+    getEffectiveProfilesForAgent: (companyId: string, agentId: string) =>
+      resolveEffectiveProfiles(
         companyId,
         agentId,
-        "Tool profile effective agent",
-      );
-      const allBindings = await db
-        .select()
-        .from(toolProfileBindings)
-        .where(eq(toolProfileBindings.companyId, companyId))
-        .orderBy(
-          asc(toolProfileBindings.priority),
-          asc(toolProfileBindings.createdAt),
-        );
-      const matchingBindings = allBindings.filter(
-        (binding) =>
-          (binding.targetType === "company" &&
-            binding.targetId === companyId) ||
-          (binding.targetType === "agent" && binding.targetId === agentId),
-      );
-      if (matchingBindings.length === 0) {
-        return {
-          agentId,
-          profiles: [],
-          entries: [],
-          bindings: [],
-          allowedTools: [],
-          allowedToolNames: [],
-          installedConnections: await resolveInstalledConnectionsForAgent(
-            companyId,
-            agentId,
-          ),
-        };
-      }
-      const candidateProfileIds = profileIdsInBindingOrder(matchingBindings);
-      const candidateProfiles = await db
-        .select()
-        .from(toolProfiles)
-        .where(
-          and(
-            eq(toolProfiles.companyId, companyId),
-            inArray(toolProfiles.id, candidateProfileIds),
-          ),
-        );
-      const bindings = effectiveToolProfileBindings(
-        matchingBindings,
-        candidateProfiles,
-      );
-      const profileIds = profileIdsInBindingOrder(bindings);
-      const profilesById = new Map(
-        candidateProfiles.map((profile) => [profile.id, profile]),
-      );
-      const activeProfiles = profileIds
-        .map((profileId) => profilesById.get(profileId) ?? null)
-        .filter((profile): profile is typeof toolProfiles.$inferSelect =>
-          Boolean(profile && profile.status === "active"),
-        );
-      if (activeProfiles.length === 0) {
-        return {
-          agentId,
-          profiles: [],
-          entries: [],
-          bindings: bindings.map(toProfileBinding),
-          allowedTools: [],
-          allowedToolNames: [],
-          installedConnections: await resolveInstalledConnectionsForAgent(
-            companyId,
-            agentId,
-          ),
-        };
-      }
-      const activeProfileIds = activeProfiles.map((profile) => profile.id);
-      const [entries, catalog, companyAgents] = await Promise.all([
-        db
-          .select()
-          .from(toolProfileEntries)
-          .where(
-            and(
-              eq(toolProfileEntries.companyId, companyId),
-              inArray(toolProfileEntries.profileId, activeProfileIds),
-            ),
-          )
-          .orderBy(asc(toolProfileEntries.createdAt)),
-        db
+        () => db
           .select()
           .from(toolCatalogEntries)
-          .where(
-            and(
-              eq(toolCatalogEntries.companyId, companyId),
-              eq(toolCatalogEntries.status, "active"),
-            ),
-          )
+          .where(and(
+            eq(toolCatalogEntries.companyId, companyId),
+            eq(toolCatalogEntries.status, "active"),
+          ))
           .orderBy(asc(toolCatalogEntries.toolName)),
-        db
-          .select({ id: agents.id })
-          .from(agents)
-          .where(eq(agents.companyId, companyId)),
-      ]);
-      const entriesByProfile = new Map<
-        string,
-        Array<typeof toolProfileEntries.$inferSelect>
-      >();
-      for (const entry of entries) {
-        const list = entriesByProfile.get(entry.profileId) ?? [];
-        list.push(entry);
-        entriesByProfile.set(entry.profileId, list);
-      }
-      const allowedCatalogIds = new Set<string>();
-      const allowedToolNames = new Set<string>();
-      for (const profile of activeProfiles) {
-        const profileEntries = entriesByProfile.get(profile.id) ?? [];
-        const includes = profileEntries.filter(
-          (entry) => entry.effect === "include",
-        );
-        const excludes = profileEntries.filter(
-          (entry) => entry.effect === "exclude",
-        );
-        for (const catalogEntry of catalog) {
-          if (
-            excludes.some((entry) =>
-              profileEntryMatchesCatalog(entry, catalogEntry),
-            )
-          )
-            continue;
-          if (
-            profile.defaultAction === "allow" ||
-            includes.some((entry) =>
-              profileEntryMatchesCatalog(entry, catalogEntry),
-            )
-          ) {
-            allowedCatalogIds.add(catalogEntry.id);
-            allowedToolNames.add(catalogEntry.toolName);
-          }
-        }
-        for (const entry of includes.filter(
-          (item) => item.selectorType === "tool_name" && item.toolName,
-        )) {
-          const matchingExclude = excludes.some(
-            (item) =>
-              item.selectorType === "tool_name" &&
-              item.toolName === entry.toolName,
-          );
-          if (!matchingExclude) allowedToolNames.add(entry.toolName!);
-        }
-      }
-      const agentIds = companyAgents.map((agent) => agent.id);
-      const details: ToolProfileWithDetails[] = activeProfiles.map((profile) =>
-        buildProfileDetails({
-          profile,
-          entries: entriesByProfile.get(profile.id) ?? [],
-          bindings: bindings.filter(
-            (binding) => binding.profileId === profile.id,
-          ),
-          catalog,
-          agentIds,
-        }),
-      );
-      const allowedTools = catalog
-        .filter((entry) => allowedCatalogIds.has(entry.id))
-        .map(toCatalogEntry);
-      return {
+        toCatalogEntry,
+      ),
+
+    getEffectiveToolAssignmentsForAgent: (companyId: string, agentId: string) =>
+      resolveEffectiveProfiles(
+        companyId,
         agentId,
-        profiles: details,
-        entries: entries.map(toProfileEntry),
-        bindings: bindings.map(toProfileBinding),
-        allowedTools,
-        allowedToolNames: [...allowedToolNames].sort((a, b) =>
-          a.localeCompare(b),
-        ),
-        installedConnections: await resolveInstalledConnectionsForAgent(
-          companyId,
-          agentId,
-        ),
-      };
-    },
+        () => db
+          .select(profileCatalogColumns)
+          .from(toolCatalogEntries)
+          .where(and(
+            eq(toolCatalogEntries.companyId, companyId),
+            eq(toolCatalogEntries.status, "active"),
+          ))
+          .orderBy(asc(toolCatalogEntries.toolName)),
+        ({ id, applicationId, connectionId, toolName }) => ({ id, applicationId, connectionId, toolName }),
+      ),
 
     mintConnectionTokenForAgent: async (input: {
       connectionId: string;

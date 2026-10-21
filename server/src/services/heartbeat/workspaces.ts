@@ -1,4 +1,5 @@
-import { assertIsolatedWorkspaceSourceReadAccess, retainIsolatedWorkspaceSourceAccess } from "../execution-workspace-repositories.js";
+import { canonicalRepositoryRoot } from "../execution-workspace-source-roots.js";
+import { assertTaskWorkspaceExecutionAccess } from "../task-workspace-access.js";
 import { selectRestoredProjectRepositories, type GitWorkspaceContents } from "../git-workspace-contents.js";
 import { GitCacheRestorationFailure } from "../git-workspace-restoration.js";
 import { deriveRepoNameFromRepoUrl, managedProjectCheckoutName, projectRepositoryIdentity } from "../managed-project-checkout-name.js";
@@ -499,7 +500,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   workspaces: Array<Pick<typeof projectWorkspaces.$inferSelect, "id" | "repoUrl" | "repoRef"> & { cwd?: string | null }>;
   resolveGitAuth?: GitRemoteAuthProvider | null;
   beforePublish?: () => Promise<void>;
-  prepareLocalSource?: (sourceCwd: string) => Promise<() => Promise<void>>;
+  prepareLocalSource?: (sourceCwd: string, projectWorkspaceId: string) => Promise<() => Promise<void>>;
   restoredContents?: GitWorkspaceContents;
 }): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null }>> {
   const identity = projectRepositoryIdentity;
@@ -532,7 +533,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     const urlLocalSource = localRepositoryPath(repoUrl);
     const sourceToAuthorize = localSource ?? urlLocalSource;
     const recheckLocalSource = sourceToAuthorize
-      ? await input.prepareLocalSource?.(sourceToAuthorize) : undefined;
+      ? await input.prepareLocalSource?.(sourceToAuthorize, workspace.id) : undefined;
     const beforePublish = async () => {
       await recheckLocalSource?.();
       await input.beforePublish?.();
@@ -3256,7 +3257,7 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
     issueId: string | null,
     runId: string | null,
   ): PrepareManagedLocalSource {
-    return async (sourceCwd) => {
+    return async (sourceCwd, targetCwd) => {
       const [run] = runId
         ? await db.select().from(heartbeatRuns).where(and(
             eq(heartbeatRuns.id, runId),
@@ -3277,21 +3278,38 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
         runId: run.id,
         onBehalfOfUserId: run.responsibleUserId === "local-board" ? null : run.responsibleUserId,
       };
-      const captured = await assertIsolatedWorkspaceSourceReadAccess(db, {
-        companyId: agent.companyId,
-        sourceCwd,
-        actor,
-        copyKind: "repository",
-      });
-      return targetCwd => retainIsolatedWorkspaceSourceAccess(db, {
-        companyId: agent.companyId,
-        sourceCwd,
-        targetCwd,
-        actor,
-        captured,
-        issueId: issueId ?? undefined,
-        copyKind: "repository",
-      });
+      if (!issueId) throw forbidden("Local repository source requires a current task");
+      const sourceIdentity = await fs.realpath(sourceCwd);
+      const targetIdentity = await canonicalRepositoryRoot(targetCwd);
+      const selected = await assertTaskWorkspaceExecutionAccess(db, actor, agent.companyId, { issueId });
+      const [sourceConfiguration] = selected.task.projectWorkspaceId
+        ? await db.select({ id: projectWorkspaces.id, cwd: projectWorkspaces.cwd,
+            repoUrl: projectWorkspaces.repoUrl, repoRef: projectWorkspaces.repoRef })
+          .from(projectWorkspaces).where(and(eq(projectWorkspaces.id, selected.task.projectWorkspaceId),
+            eq(projectWorkspaces.companyId, agent.companyId)))
+        : [];
+      const validate = async () => {
+        if (await fs.realpath(sourceCwd) !== sourceIdentity
+          || await canonicalRepositoryRoot(targetCwd) !== targetIdentity) {
+          throw forbidden("Local repository copy identity changed during preparation");
+        }
+        const current = await assertTaskWorkspaceExecutionAccess(db, actor, agent.companyId, { issueId });
+        if (current.task.projectWorkspaceId !== selected.task.projectWorkspaceId
+          || current.task.projectId !== selected.task.projectId) {
+          throw forbidden("Local repository source configuration changed during preparation");
+        }
+        if (sourceConfiguration) {
+          const [source] = await db.select({ id: projectWorkspaces.id, cwd: projectWorkspaces.cwd,
+            repoUrl: projectWorkspaces.repoUrl, repoRef: projectWorkspaces.repoRef }).from(projectWorkspaces)
+            .where(and(eq(projectWorkspaces.id, sourceConfiguration.id), eq(projectWorkspaces.companyId, agent.companyId)));
+          if (!source || source.cwd !== sourceConfiguration.cwd || source.repoUrl !== sourceConfiguration.repoUrl
+            || source.repoRef !== sourceConfiguration.repoRef) {
+            throw forbidden("Local repository source configuration changed during preparation");
+          }
+        }
+      };
+      await validate();
+      return validate;
     };
   }
 
@@ -3306,6 +3324,12 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
     immutableNativeBinding: boolean;
   }): Promise<ResolvedAnchorWorkspaceForRun> {
     const { workspace, agent } = input;
+    if (workspace.providerType === "plugin") {
+      return { cwd: `/workspaces/${workspace.id}`, source: "task_session" as const,
+        projectId: workspace.projectId, workspaceId: workspace.projectWorkspaceId,
+        repoUrl: workspace.repoUrl, repoRef: workspace.baseRef, workspaceHints: [], warnings: [],
+        baseCwdFallback: false, materializationFailures: [] };
+    }
     // Configuration preparation may have awaited credentials and skills since
     // issueRef was read. Match the ordinary anchor resolver's fresh selection
     // check; only an already-admitted native input owns immutable source scope.
@@ -3462,7 +3486,14 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning = `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
+      const [sourceProject] = projectWorkspaceRows.length ? await db.select({ policy: projects.executionWorkspacePolicy }).from(projects)
+        .where(and(eq(projects.id, workspaceProjectId!), eq(projects.companyId, agent.companyId))) : [];
       for (const workspace of projectWorkspaceRows) {
+        if (sourceProject?.policy?.storageProviderPluginId) {
+          return { cwd: `/workspaces/${workspace.id}`, source: "project_primary" as const,
+            projectId: workspace.projectId, workspaceId: workspace.id, repoUrl: workspace.repoUrl,
+            repoRef: workspace.repoRef, workspaceHints, warnings: [], baseCwdFallback: false, materializationFailures: [] };
+        }
         let projectCwd: string;
         let managedWorkspaceWarning: string | null = null;
         try {

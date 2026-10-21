@@ -40,7 +40,7 @@ import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { extractWakeCommentIds } from "../../run-dispatch/index.js";
+import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -890,7 +890,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
 
     async findExistingDeferredWake(
       scope,
-      { companyId, agentId, issueId, durableActor },
+      { companyId, agentId, issueId, chatConversationId, durableActor },
     ) {
       const tx = requireAdmissionTx(scope, companyId);
       const row = await tx
@@ -902,6 +902,11 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            ...(chatConversationId
+              ? [
+                  sql`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> ${CHAT_CONVERSATION_ID_KEY}::text, ${chatConversationId}) = ${chatConversationId}`,
+                ]
+              : []),
             ...(durableActor
               ? [
                   durableActor.type === null

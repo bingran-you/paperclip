@@ -33,6 +33,8 @@ export {
 export * from "./native-session-runtime.js";
 export {
   DurablePrpControlPlane,
+  RUNNER_PRP_PROTOCOL_MIN,
+  RUNNER_PRP_PROTOCOL_MAX,
   inspectWarmRunTransition,
   type DurablePrpControlPlaneOptions,
   type PrpWireConnection,
@@ -96,3 +98,6 @@ export { RunnerdMuseDriver, describeRunnerdMuseDriver, type RunnerdMuseDriverOpt
 export { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./drivers/dot/runnerd-dot-driver.js";
 
 export type { RunnerExecutionDriver } from "./control-plane/runner-execution-driver.js";
+
+export { bindRunnerLaunchResources, createRunnerProviderLaunch, runnerProviderLaunchRequirements, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch } from "./live/runner-provider-launch.js";
+export type { RunnerProviderLaunchRequirements, RunnerProviderLaunchEnvironment, PreparedRunnerProviderLaunch, RunnerLaunchPreparer } from "./live/runner-provider-launch.js";

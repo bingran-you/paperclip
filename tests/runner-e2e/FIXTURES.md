@@ -179,7 +179,9 @@ canonical Plan revision, capture its pending UI, approve in the browser, and
 prove exactly two successful runs. `warm_three_turn` provides exactly two
 browser follow-up messages, preserves one project/execution-workspace scope,
 verifies host file contents after every turn, and finishes within three
-ten-minute turn deadlines. The ordinary warm fixture uses managed instructions,
+ten-minute turn deadlines. Warm prompts define each newline as the actual LF
+byte 10 and require byte verification independent of the write expression;
+literal backslash-plus-n remains a failing output. The ordinary warm fixture uses managed instructions,
 updates AGENT_HOME each turn, and verifies memory, an unchanged 8 MiB binary and
 a deletion through public file APIs. Native turns 2 and 3 must copy/hash only the
 changed memory file, with a saved receipt and the same provider PID. Journal and
@@ -198,7 +200,12 @@ Native turns 1 and 2 include an actionable human review in the completion report
 Every selected case runs in its own isolated Paperclip process, and independent
 cases may run concurrently. Follow-up turns inside one case retain their shared
 task state. Each case creates and tears down its own company, secrets,
-environment selection, agent, and browser-created task. The current plan case
+environment selection, agent, and browser-created task. Strict Copilot command,
+denial, pending-permission Stop and provider-death fixtures create an explicit
+title through the production search composer and bind the task to the public
+browser creation response ID. Automatic prompt-only naming must not add a
+native semantic operation or break task correlation. Command, permission,
+receipt, ordering and cleanup assertions remain unchanged. The current plan case
 proves three runs on the same issue: publish a two-step Plan,
 request a three-step revision through the UI, and accept the exact new revision
 through the UI before verifying implementation and Done.
@@ -608,7 +615,7 @@ provider timeout, 300s attempt budget). `native-permission-deny-write` denies on
 exact native edit through its browser card, waits for the delivered rejection and
 failed tool, then cancels through the public run API. Its expected outcome is a
 cancelled run and an unfinished task, not successful task completion.
-The retained `paperclip.e2e.copilot-denial-settlement.v3` proof separates the exact
+The current `paperclip.e2e.copilot-denial-settlement.v4` proof separates the exact
 provider terminal from the audited controller Stop. It records either
 `provider_cancelled_or_interrupted` or `provider_completed_observed_before_stop`.
 The latter requires the exact terminal row to be returned by the operator API
@@ -717,12 +724,27 @@ actor receives HTTP409; local trusted board uses the `local-board` user ID.
 Default clients may omit the field; they preserve and join an existing reserved
 intent rather than overwrite it.
 
-The denial fixture generates its UUID before observation, retains it in
-`paperclip.e2e.copilot-pre-stop-observation.v2`, and requires the same intent in
-the response and final `paperclip.e2e.copilot-denial-settlement.v3` receipt.
-It refuses a non-running controller or existing Stop marker before dispatch.
-The completed-provider branch still requires a running controller that this
-request can stop; it does not accept a no-op Stop of an already terminal run.
+The current Copilot fixture invokes the ordinary cancel endpoint without supplying
+its observation UUID. It retains that UUID only as fixture correlation in
+`paperclip.e2e.copilot-pre-stop-observation.v2`. The actual API response supplies
+the server's intent and audit IDs; `paperclip.e2e.copilot-stop-acknowledgement.v1`
+binds and hashes the returned cancellation metadata, exact caller and scope.
+The final `paperclip.e2e.copilot-denial-settlement.v4` receipt verifies that same
+response metadata and the observation's monotonic order. The public API's optional
+`cancellationRequestId` support is separate from this fixture correlation.
+
+The fixture refuses a non-running controller or existing Stop marker before
+sending the request. A completed-provider branch requires the exact canonical
+terminal retained before Stop; only that branch can accept an acknowledgement
+with no provider dispatch. Active-permission Stop still requires dispatch.
+The unfinished task may be blocked only when its exact missing-result lifecycle
+row was retained before Stop and matches the final rows, and its recovery action
+is bound to the same company, issue and cancelled run. A late row, foreign action,
+missing hash or cancelled/interrupted-provider branch cannot use this exception.
+The observer refreshes and retains completion or missing-result evidence that
+arrives while an earlier receipt is being written. Scope, no-extra-run, no-effect
+and independently retired-process checks remain mandatory. Historical failed
+attempts and v3 receipts are retained without regrading.
 
 ## Definitely-active native Stop
 
@@ -825,7 +847,8 @@ result is one separate complete read lifecycle: pending and any progress name th
 started shell, and its successful terminal also names the original command. A
 completed-only read or a second shell read cannot inherit that exemption.
 
-Denial case version 5 and denial settlement schema v3 are unchanged.
+Denial case version 5 retains its definition and prompt. The current denial
+settlement is schema v4; historical v3 receipts are not relabelled.
 
 ## Direct blocker fixtures
 
@@ -897,3 +920,74 @@ execution-workspace file reads and run-attributed artifact downloads verify byte
 Calibration rejects wrong roots, missing history, changed pins, duplicate receipts,
 extra wakes, incomplete persistence, tool bypass and missing remote leases. Partial
 observations remain in retained attempt evidence; missing evidence cannot pass.
+
+The Copilot `extended-harnesses` file case supplies a portable read-only validation command with hexadecimal expected bytes. The provider still creates and edits the file itself. The command must exit zero before registration and semantic completion; independent workspace and downloaded-artifact byte matchers remain authoritative. The explicit command avoids ambiguous shell operands and escaped-newline literals. Original prompt measurements retain their original grade and source; only the two Copilot file prompts change. Other providers, deadlines and matchers remain unchanged.
+
+## Same-task case handoffs
+
+The suite contains three local cells: `receipt-smoke` under both `runner-codex`
+(API key) and `runner-codex-subscription`, plus the original subscription-only
+`same-task-roundtrip`. The API profile uses the same model and workflow
+definition with ordinary encrypted `OPENAI_API_KEY` secret references, including
+the provider's `CODEX_API_KEY` alias. It does not stage a subscription login.
+Receipt smoke has exactly four successful native task work runs, with triage,
+builder, verifier and a return to the builder. Ordinary case document writes save
+`receipt` as `{total:6}`, then `review` as
+`{totalCorrect:true,missing:["currency"]}`, then a second receipt revision as
+`{total:6,currency:"USD"}`. The independent oracle requires both receipt writes
+by the builder in distinct runs, the review by the verifier, observed reads of
+the prior documents, four delivered agent handoffs and fresh case/task context for
+each phase. The final builder requests `to: "done"` before normal task completion;
+the fifth handoff becomes `completed` and the case closes atomically with the task.
+This terminal destination does not create another run or bypass completion gates.
+
+Before kickoff, its isolated company and every agent have 100-cent budgets,
+90-second native Codex work-run timeouts and low reasoning effort. Daily task-run limits
+are triage one, builder two and verifier one. Setup applies the initial triage
+limits before creating that agent; the flow applies and reads back every role's
+limits before work begins. The attempt is five minutes and has no automatic
+retry. Pristine production-default instruction evidence is captured before
+adding the declared role routing prompt. These settings apply to receipt smoke;
+the original arithmetic cell retains its 1,000-cent budgets and four-to-six-run
+contract.
+
+Initial production lifecycle setup performs hello inference outside heartbeat
+counts and budget accounting. Up to three initial probes are expected, one for
+each agent; detailed setup tokens and cost are unavailable. The flow observes
+readiness serially, waits up to 45 seconds per agent and fails immediately on a
+reported lifecycle error, then pauses the agents to prevent routine 60-second
+setup retries. Timing out does not immediately cancel an in-flight hello probe.
+The four-run limit therefore covers task work, not every provider inference.
+The ordinary work-run usage report excludes setup probes, and unknown usage
+must not be reported as zero or free. Setup observations are retained separately
+in `receipt-setup.json`.
+
+Two passive cases are created through public APIs for browser list filtering.
+They remain unchanged and start no work. Public screenshots use the primary
+case detail route, document dialogs on that route and the primary task route.
+List navigation itself produces no screenshot.
+
+Both case fixtures supply required `workflow_document_text` through the handoff
+API; it becomes the ordinary task's `workflow` document before dispatch. Receipt
+role prompts tell each phase to read that document. Older recorded campaigns
+precede this new required field and remain evidence of their original version.
+API/tool authoring guidance recommends both a Mermaid `stateDiagram-v2` map and
+prose explaining transition conditions, evidence, ownership and wait/retry rules;
+the small fixture may use prose only because the recommendation is not validation.
+
+The original arithmetic `case-handoffs` fixture uses ordinary agent creation and the
+public case-handoff API for initial kickoff. Subsequent routing is performed by
+the agents through the production native tool. Four phase documents record
+fresh case/task/version observations; the oracle checks these against the
+public ledger and independently specified arithmetic result. Its company-wide run
+collection accounts for all three agents and fails above six turns. Only
+allowlisted state, the synthetic document contents and correlated tool-presence
+booleans enter the workflow snapshot; provider event bodies are not republished.
+Final UI screenshots cover the persistent case history and original task.
+
+The `runner-codex-subscription` profile consumes explicit `CODEX_AUTH_JSON` and
+never creates a fake API key. Login setup uses the production company Codex
+home, refuses nonisolated or redirected roots and occupied auth files, and
+registers cleanup before agent setup. It copies no operator config, sessions,
+plugins or unrelated files. The shared fixture registry owns that dependency;
+there is no private runtime injection.

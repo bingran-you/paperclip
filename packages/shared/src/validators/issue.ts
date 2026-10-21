@@ -1,3 +1,4 @@
+import { CHAT_PROVIDERS } from "../types/chat-channels.js";
 import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
 import { ISSUE_SUMMARIES_MAX_IDS } from "../constants.js";
@@ -581,6 +582,11 @@ export const retryWorkspaceExportSchema = z.object({
   repairNote: z.string().trim().min(20).max(12000),
 }).strict();
 
+export const taskRetrySchema = z.object({
+  idempotencyKey: z.string().guid(),
+  observedRunId: z.string().guid().nullable(),
+}).strict();
+
 export const recoverWorkspaceSchema = z.object({
   actionId: z.string().guid(),
   runId: z.string().guid(),
@@ -1081,7 +1087,8 @@ export const issueCommentMetadataSectionSchema = z
 export const issueCommentMetadataSchema = z
   .object({
     version: z.literal(1),
-    sourceChannel: z.literal("imessage-photon").optional(),
+    recoveryResponsibility: z.enum(["system", "user"]).optional(),
+    sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z
       .string()
