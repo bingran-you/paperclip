@@ -13,7 +13,8 @@ import { conflict, forbidden, notFound, unprocessable } from "../../errors.js";
 import { museIdentity, museCredentialHash, assertMuseCurrentAuthority, assertMuseSubjectCredential, inspectMuseConnectionCredential, assertMuseCleanupCredential, museCleanupBoundaryIds, assertMuseDisabledStopControlCredential, museStopControlBoundaryIds } from "../../services/muse-identity.js";
 import { instanceSettingsService } from "../../services/instance-settings.js";
 import { updateAgentConfigurationInTransaction } from "../../services/agent-configuration-transaction.js";
-import { canConfigureAgentConnection, scheduleAgentLifecycle } from "../agent-lifecycle/index.js";
+import { AgentLifecycleConflict, canConfigureAgentConnection } from "../agent-lifecycle/index.js";
+import { createAgentLifecycle } from "../../services/agent-lifecycle.js";
 import { authorizationService, issueReadSqlCondition, type AuthorizationActor } from "../../services/authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../../services/activity-log.js";
 import { issueService } from "../../services/issues.js";
@@ -383,7 +384,18 @@ function createMuseBroker(db:Db, publicOrigin?:string) {
           await logActivity(tx as unknown as Db,{companyId:b.companyId,actorType:"agent",actorId:b.agentId,agentId:b.agentId,responsibleUserIdOverride:b.operatorId,action:"muse.background_reply_verified",entityType:"agent",entityId:b.agentId,details:{bindingId:b.id,generation:b.generation,authorizingUserId:b.operatorId,requestId:c.requestId}},publications);
         });
         publications.forEach(publishActivity);
-        void scheduleAgentLifecycle(db,b.agentId);
+        // The completed challenge changes this hire's verification facts. Clear
+        // its deferred retry durably; a wake alone cannot bypass that deadline.
+        const lifecycle=createAgentLifecycle(db),agent=await lifecycle.get(b.agentId);
+        if(agent&&["preparing","verifying"].includes(agent.lifecycleState)) {
+          try { await lifecycle.retry(b.agentId); }
+          catch(error) {
+            // A concurrent lifecycle completion or Stop owns the newer phase.
+            // Confirmation remains accepted; it must not restart that phase.
+            const current=error instanceof AgentLifecycleConflict?await lifecycle.get(b.agentId):null;
+            if(!current||["preparing","verifying"].includes(current.lifecycleState))throw error;
+          }
+        }
         return {status:"ready",bindingId:b.id,generation:b.generation};
       }
       if(c.command==="task.create"||c.command==="task.comment")return idleMutation(s,c);

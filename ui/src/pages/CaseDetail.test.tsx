@@ -49,7 +49,7 @@ function detail(): CaseDetailData {
 }
 
 function handoff(overrides: Partial<CaseHandoffView> = {}): CaseHandoffView {
-  return { id: "handoff-1", companyId: "company-1", caseId: "case-1", issueId: "task-1", version: 1, destinationKind: "agent", completedAt: null, fromAgentId: "agent-1", toAgentId: "agent-2", phase: "verification", instructions: "Check the saved draft independently.", commentId: null, actorType: "agent", actorId: "agent-1", sourceRunId: null, responsibleUserId: null, expectedIssueStatusVersion: 1, appliedIssueStatusVersion: null, wakeupRequestId: "wake-1", idempotencyKey: "handoff-key", inputFingerprint: "fingerprint", state: "awaiting_release", attemptCount: 0, nextAttemptAt: "2026-10-19T10:00:00Z", leaseExpiresAt: null, lastErrorCode: null, lastError: null, createdAt: "2026-10-19T10:00:00Z", assignmentAppliedAt: null, deliveredAt: null, cancelledAt: null, updatedAt: "2026-10-19T10:00:00Z", fromAgentName: "Writer", toAgentName: "Verifier", ...overrides };
+  return { id: "handoff-1", companyId: "company-1", caseId: "case-1", issueId: "task-1", version: 1, destinationKind: "agent", completedAt: null, workflowTransition: null, fromAgentId: "agent-1", toAgentId: "agent-2", phase: "verification", instructions: "Check the saved draft independently.", commentId: null, actorType: "agent", actorId: "agent-1", sourceRunId: null, responsibleUserId: null, expectedIssueStatusVersion: 1, appliedIssueStatusVersion: null, wakeupRequestId: "wake-1", idempotencyKey: "handoff-key", inputFingerprint: "fingerprint", state: "awaiting_release", attemptCount: 0, nextAttemptAt: "2026-10-19T10:00:00Z", leaseExpiresAt: null, lastErrorCode: null, lastError: null, createdAt: "2026-10-19T10:00:00Z", assignmentAppliedAt: null, deliveredAt: null, cancelledAt: null, updatedAt: "2026-10-19T10:00:00Z", fromAgentName: "Writer", toAgentName: "Verifier", ...overrides };
 }
 
 async function settle() {
@@ -204,12 +204,17 @@ describe("read-only CaseDetail", () => {
   });
 
   it("shows assignment separately from a waiting successor and reads paginated handoff history", async () => {
-    const pending = handoff();
-    cases.get.mockResolvedValue({ ...detail(), workIssueId: "task-1", phase: "implementation", workIssue: { id: "task-1", identifier: "PAP-123", title: "Implement the launch", status: "in_progress", statusVersion: 1, assigneeAgentId: "agent-1", assigneeAgentName: "Writer" }, pendingHandoff: pending });
+    const pending = handoff({ workflowTransition: { from: { workflowId: "workflow-a", name: "Research before rename", phase: "implementation" },
+      to: { workflowId: "workflow-b", name: "Publish", phase: "verification" }, documentRevisionId: "revision-1" } });
+    cases.get.mockResolvedValue({ ...detail(), workflowId: "workflow-a", workflow: { id: "workflow-a", name: "Research renamed" }, workIssueId: "task-1", phase: "implementation", workIssue: { id: "task-1", identifier: "PAP-123", title: "Implement the launch", status: "in_progress", statusVersion: 1, assigneeAgentId: "agent-1", assigneeAgentName: "Writer" }, pendingHandoff: pending });
     cases.listHandoffs.mockImplementation((_id: string, cursor: string | null) => Promise.resolve(cursor ? { items: [handoff({ id: "handoff-0", phase: "triage", state: "cancelled" })], nextCursor: null } : { items: [pending], nextCursor: "older" }));
     render(); await waitFor(() => expect(container.textContent).toContain("Waiting for Writer to finish."));
     expect(container.querySelector('a[href="/issues/PAP-123"]')).not.toBeNull();
     const handoffs = container.querySelector('[aria-label="Case handoffs"]')!;
+    expect(container.querySelector('[aria-label="Case work"]')?.textContent).toContain("Research renamed");
+    expect(container.querySelector('[aria-label="Case work"]')?.textContent).toContain("Next: Publish · verification");
+    expect(handoffs.textContent).toContain("Research before rename · implementation → Publish · verification");
+    expect(handoffs.textContent).toContain("Pending transfer");
     expect(handoffs.querySelector('a[href="/issues/PAP-123"]')).not.toBeNull();
     click(button("Load older handoffs"));
     await waitFor(() => expect(container.textContent).toContain("Cancelled"));

@@ -19,7 +19,8 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
-import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
+import { createAgentLifecycle, configureAgentLifecycle, startAgentLifecycle } from "../../../services/agent-lifecycle.js";
+import { projectCompanyHolds } from "../adapters/company-policy.js";
 import { createLifecycleStore as createStore } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
 import type { LifecycleAgent } from "../application/ports.js";
@@ -46,6 +47,15 @@ const support = await getEmbeddedPostgresTestSupport();
   }
   async function hire(status = "idle") { return createAgentLifecycle(db).requestHire(companyId, { name: "Agent", status, adapterType: "process" }); }
   async function current(id: string) { return (await db.select().from(agents).where(eq(agents.id, id)))[0]!; }
+
+  it("rejects an outdated configuration snapshot under the write lock", async () => {
+    const agent = await hire();
+    const snapshot = await current(agent.id);
+    const expectedConfiguration = { adapterType: snapshot.adapterType, adapterConfig: snapshot.adapterConfig, runtimeConfig: snapshot.runtimeConfig, defaultEnvironmentId: snapshot.defaultEnvironmentId };
+    await createAgentLifecycle(db).updateConfiguration(agent.id, { runtimeConfig: { heartbeat: { intervalSec: 42 } } });
+    await expect(createAgentLifecycle(db).updateConfiguration(agent.id, { runtimeConfig: { aiConnection: {} } }, { expectedConfiguration })).rejects.toThrow("configuration changed while saving");
+    expect((await current(agent.id)).runtimeConfig).toEqual({ heartbeat: { intervalSec: 42 } });
+  });
 
   it("maps existing states without starting setup or clearing pause reasons", async () => {
     const rows = await db.insert(agents).values(["idle", "running", "error", "paused", "pending_approval", "terminated"].map(status => ({
@@ -394,6 +404,25 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await db.select().from(companies).where(eq(companies.id, companyId))).toHaveLength(0);
   });
 
+  it("awaits only the deleted company's agents when a coordinator owns lifecycle wakeups", async () => {
+    const agent = await hire();
+    const [otherCompany] = await db.insert(companies).values({ name: "Unaffected", issuePrefix: `U${companyId.slice(0, 7)}` }).returning();
+    const [otherAgent] = await db.insert(agents).values({ companyId: otherCompany.id, name: "Pending elsewhere",
+      lifecycleState: "preparing", lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const phases: string[] = [];
+    const work = startAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete",
+      runHost: async snapshot => { expect(snapshot.id).toBe(agent.id); phases.push(snapshot.lifecycleState); return "complete"; } }, () => true);
+    const wake = vi.fn();
+    work.setWake(wake);
+    try {
+      await deleteCompany(db, companyId);
+      expect(phases).toEqual(["terminating", "cleaning_up"]);
+      expect(wake).toHaveBeenCalled();
+      expect(await db.select().from(companies).where(eq(companies.id, companyId))).toHaveLength(0);
+      expect((await current(otherAgent.id)).lifecycleState).toBe("preparing");
+    } finally { await work.stop(); }
+  });
+
   it("requires a transaction for the company deletion integration", async () => {
     await expect(agentLifecycleCompanyDeletion.deleteCompanyData(db as never, companyId))
       .rejects.toThrow("Company deletion requires a database transaction");
@@ -603,16 +632,17 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
     if (command === "updateConfiguration") await lifecycle.updateConfiguration(one.id, { budgetMonthlyCents: 1000 });
     else await lifecycle.updateAndTransition(one.id, "pause", { budgetMonthlyCents: 1000 });
-    expect((await current(one.id)).lifecycleHolds).toContain("company_paused");
+    // Company state blocks admission; its inherited holds project separately.
+    expect((await current(one.id)).lifecycleHolds).not.toContain("company_paused");
     expect((await current(two.id)).lifecycleHolds).toEqual([]);
   });
 
-  it("limits invocation policy checks to the requested agent", async () => {
+  it("blocks invocation without synchronously projecting inherited company holds", async () => {
     const one = await hire();
     const two = await createAgentLifecycle(db).requestHire(companyId, { name: "Another agent" });
     await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
-    await budgetService(db).getInvocationBlock(companyId, one.id);
-    expect((await current(one.id)).lifecycleHolds).toContain("company_paused");
+    expect(await budgetService(db).getInvocationBlock(companyId, one.id)).not.toBeNull();
+    expect((await current(one.id)).lifecycleHolds).toEqual([]);
     expect((await current(two.id)).lifecycleHolds).toEqual([]);
   });
 
@@ -620,9 +650,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const work = worker(); const lifecycle = createAgentLifecycle(db); const agent = await hire(); await work.process(agent.id);
     await lifecycle.pauseAgent(agent.id); await work.process(agent.id);
     await db.update(companies).set({ status: "archived" }).where(eq(companies.id, companyId));
-    await createAgentLifecycle(db).reconcilePolicyHolds(companyId); await work.process(agent.id);
+    await projectCompanyHolds(db, createAgentLifecycleEffects(), companyId); await work.process(agent.id);
     await db.update(companies).set({ status: "active" }).where(eq(companies.id, companyId));
-    await createAgentLifecycle(db).reconcilePolicyHolds(companyId); await work.process(agent.id);
+    await projectCompanyHolds(db, createAgentLifecycleEffects(), companyId); await work.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["manual"] });
     await lifecycle.resumeAgent(agent.id); await work.process(agent.id);
     expect((await current(agent.id)).lifecycleState).toBe("ready");

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { RunnerProviderLaunchRequirements } from "@paperclipai/paperclip-runner";
 import type { RunnerProcessLaunchSpec } from "../../vendor/paperclip-runner/index.js";
@@ -272,5 +273,33 @@ describe("plugin native Runner ownership", () => {
       expect(ingress.connect).not.toHaveBeenCalled();
       await registration.release(); await registration.checkpoint("settled"); await process.completion;
     } finally { process.child.kill(); await process.completion.catch(() => {}); }
+  });
+});
+
+
+describe("plugin task workspace file transfer", () => {
+  it("reads only a submitted task, validates bytes, and rejects late responses after release", async () => {
+    const {task}=provider(); const perform=task.getMockImplementation()!;
+    const bytes=Buffer.from("VM proof\n");
+    let file={kind:"file",taskId:"task",base64:bytes.toString("base64"),byteSize:bytes.length,sha256:createHash("sha256").update(bytes).digest("hex")};
+    let afterRead=async()=>{};
+    task.mockImplementation(async op=>{if(op.kind==="read_file"){await afterRead();return file;}return perform(op);});
+    const owner=createPluginRunnerTaskOwner({projectAuthCheckVersion:1,task,projectIds:[],harness:"codex",pollMs:1});
+    await expect(owner.readWorkspaceFile("proof.txt",1024)).rejects.toThrow("unavailable");
+    await prepare(owner);
+    ingress.connect.mockReturnValue({ready:Promise.resolve(),close:async()=>{}});
+    const registration=await owner.registration({} as never,"run");
+    const handle=owner.launcher(launchSpec());registration.activate();await registration.ready();
+    try {
+      await expect(owner.readWorkspaceFile("proof.txt",1024)).resolves.toEqual(bytes);
+      await expect(owner.readWorkspaceFile("/home/agent/proof.txt",1024)).resolves.toEqual(bytes);
+      expect(task.mock.calls.find(([op])=>op.kind==="read_file")?.[0]).toMatchObject({identity:requirements.identity,path:"proof.txt",projectIds:[]});
+      for(const path of ["../escape","//etc/passwd","file:/secret","a/../b","a\\b"]) await expect(owner.readWorkspaceFile(path,1024)).rejects.toThrow();
+      await expect(owner.readWorkspaceFile("proof.txt",1)).rejects.toThrow("unavailable");
+      file={...file,sha256:"f".repeat(64)};
+      await expect(owner.readWorkspaceFile("proof.txt",1024)).rejects.toThrow("integrity");
+      afterRead=()=>registration.release();
+      await expect(owner.readWorkspaceFile("proof.txt",1024)).rejects.toThrow("unavailable");
+    } finally {await registration.release();await registration.checkpoint("unsettled");await handle.completion;}
   });
 });

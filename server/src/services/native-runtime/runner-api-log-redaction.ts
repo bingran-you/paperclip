@@ -3,7 +3,7 @@ import { nativeSha256 } from "./canonical.js";
 
 const RECEIPT_FIELDS = new Set(["operationId", "apiOperationId", "callId", "ok", "status", "contentType"]);
 const REDACTED_FIELDS = new Set([...RECEIPT_FIELDS, "data", "apiPayloadRedacted", "apiPayloadSha256"]);
-const CASE_OPERATIONS = new Set(["create_case", "read_case", "update_case", "read_case_document", "write_case_document"]);
+const CASE_OPERATIONS = new Set(["create_case", "read_case", "update_case", "read_case_document", "write_case_document", "list_workflows", "read_workflow", "create_workflow", "update_workflow"]);
 
 function redactedPayload(value: unknown) {
   const entry = value && typeof value === "object" ? value as Record<string, unknown> : {};

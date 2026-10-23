@@ -14,7 +14,7 @@ completion of its primary task. Existing completion and review gates remain
 authoritative; an open case alone never creates an execution requirement.
 
 Native agents have dedicated case creation/read/update and handoff tools.
-Native creation requires first-task kickoff and explicit `workflow_document_text`,
+Native creation requires first-task kickoff and either `workflowId` or explicit `workflow_document_text`,
 stored as the primary task's `workflow` Markdown document, with optional additional
 initial documents. Recommend both a Mermaid `stateDiagram-v2` map and prose
 defining every transition's conditions, evidence, destination and wait/retry rules;
@@ -27,6 +27,14 @@ fresh routing information and changed facts, with full context retained for
 new sessions and resume failure.
 
 ---
+
+Reusable workflows stay inside the Cases experiment. A workflow is a company-shared
+name and Markdown prompt; a case may adopt, leave and revisit workflows without
+changing its primary task. The task's workflow document is the effective copy,
+so shared edits affect future adoptions and explicit refreshes. Existing handoffs
+record workflow/phase movement and document revisions, including names as they
+were at the time. Authoring starts with agents/APIs; the case UI reads current
+workflow information and history.
 
 ## 1. Company Model [DRAFT]
 

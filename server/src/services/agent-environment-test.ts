@@ -548,7 +548,10 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
     // requirement stays for subscriptions: a stored login is a file layout
     // only a provider CLI reads, so proving the runtime lane can consume it
     // takes a real hello turn.
-    if (resolvedMethod === "api_key" && !context.config.managedAiRouting) {
+    const nativePiOpenRouter = adapterType === "paperclip_runner" && context.config.provider === "acpx"
+      && context.config.acpxAgent === "pi" && binding.provider === "openrouter"
+      && asRecord(context.config.managedAiRouting)?.kind === "openrouter";
+    if (resolvedMethod === "api_key" && (!context.config.managedAiRouting || nativePiOpenRouter)) {
       const envKey = AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
       const key = envKey ? parseObject(context.config.env)[envKey] : undefined;
       try {

@@ -7,6 +7,7 @@ import {
   projectHistoricalHeartbeatRunComment,
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
+  isChatOriginPublicationCandidate,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
@@ -58,6 +59,19 @@ describe("scheduled continuation presentation", () => {
 
   it("lets the run's question own its response", () => {
     expect(resolveHeartbeatRunResponse({ resultJson, interactionOwnsResponse: true }).text).toBeNull();
+  });
+});
+
+describe("continuation origin verification", () => {
+  it.each(["native_status_decision", "issue.monitor", "tool_action_review", "issue.comment", "issue.comment.created", "issue.update"])
+    ("checks %s without treating candidacy as publication authority", source => {
+      expect(isChatOriginPublicationCandidate({ source })).toBe(true);
+      expect(isExternalChatPresentationContext({ source })).toBe(false);
+      expect(isExternalChatPresentationContext({ source }, true)).toBe(true);
+    });
+  it("keeps internal work internal", () => {
+    expect(isChatOriginPublicationCandidate({ source: "issue.assigned" })).toBe(false);
+    expect(isExternalChatPresentationContext({ source: "issue.assigned" }, true)).toBe(false);
   });
 });
 

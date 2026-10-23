@@ -29,6 +29,9 @@ export function createDeliveryWorkCoordinator(input: {
       // An empty queue's maintenance may wait until dispatch admission reopens.
       // Notifications and unresolved producer writes still reconcile in drain.
       pausePassiveMaintenance?: boolean;
+      // Accounting and stop delivery finish already-admitted obligations;
+      // they must continue during admission drain, never warm standby.
+      runDuringDrain?: boolean;
     }) {
       if (stopped) throw new Error("Delivery coordinator is stopped");
       if (workers.has(queue)) throw new Error(`Delivery worker already registered: ${queue}`);
@@ -64,7 +67,7 @@ export function createDeliveryWorkCoordinator(input: {
         const attempt = new AbortController();
         controller = attempt;
         running = Promise.resolve().then(() => reconcileDatabaseWork(input.owner, queue))
-          .then(() => workerStopped || !input.canRun() ? undefined : task.run(attempt.signal)).then(() => workerStopped ? false : task.hasPending()).then(pending => {
+          .then(() => workerStopped || !(input.canRun() || (task.runDuringDrain && input.canReconcile?.())) ? undefined : task.run(attempt.signal)).then(() => workerStopped ? false : task.hasPending()).then(pending => {
           pendingWork = pending || databaseWorkPending(input.owner, queue);
           if (pendingWork) schedule(task.retryMs);
           else { finishIntent?.(); finishIntent = undefined; }

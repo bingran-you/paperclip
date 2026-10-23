@@ -4,66 +4,12 @@ import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, 
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
-import { createRunDispatch } from "../../modules/run-dispatch/index.js";
-import type { createWakeQueue } from "../../modules/wake-queue/index.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
-import { createHeartbeatRunState } from "./run-state.js";
-import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatQueue, type HeartbeatQueueDependencies } from "./queue.js";
 
-type Run = typeof heartbeatRuns.$inferSelect;
-function callbacks(db: Db) {
-  const state = createHeartbeatRunState(db);
-  const preparation = createHeartbeatRunPreparation(db);
-  return {
-    ...preparation,
-    ...state,
-    getAgent: vi.fn<HeartbeatQueueDependencies["getAgent"]>(async () => { throw new Error("Unexpected agent lookup"); }),
-    options: {},
-    setRunStatus: vi.fn<HeartbeatQueueDependencies["setRunStatus"]>(async (id, status, patch) =>
-      db.update(heartbeatRuns).set({ ...patch, status }).where(eq(heartbeatRuns.id, id)).returning().then(rows => rows[0] ?? null)),
-    setWakeupStatus: vi.fn<HeartbeatQueueDependencies["setWakeupStatus"]>(async () => undefined),
-    appendRunEvent: vi.fn<HeartbeatQueueDependencies["appendRunEvent"]>(async () => undefined),
-    finalizeAgentStatus: vi.fn(async () => undefined),
-    getAgentInvokability: vi.fn<HeartbeatQueueDependencies["getAgentInvokability"]>(async () => ({ invokable: true })),
-    getWorktreeExecutionCutoff: vi.fn(async () => null),
-    applyRunDispatchPostCommitEffects: vi.fn(),
-    issuesSvc: {
-      getDependencyReadiness: vi.fn<HeartbeatQueueDependencies["issuesSvc"]["getDependencyReadiness"]>(),
-      listDependencyReadiness: vi.fn(async () => new Map()),
-    },
-    treeControlSvc: { getActivePauseHoldGate: vi.fn(async () => null) },
-    budgets: { getInvocationBlock: vi.fn(async () => null) },
-    instanceSettings: { getExperimental: vi.fn<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>() },
-    runDispatch: createRunDispatch(db),
-    wakeQueue: {
-      createAdmissionTransactionScope: vi.fn<ReturnType<typeof createWakeQueue>["createAdmissionTransactionScope"]>(),
-      admitWakeBehindIssueExecution: vi.fn<ReturnType<typeof createWakeQueue>["admitWakeBehindIssueExecution"]>(),
-    },
-    activeRunExecutions: new Set<string>(),
-    activeRunExecutionPromises: new Set<Promise<void>>(),
-    activeWakeupPromises: new Set<Promise<unknown>>(),
-    liveRunExecutions: { has: vi.fn(() => false) },
-    isHeartbeatRunTerminalStatus: (status: string | null | undefined) => ["succeeded", "failed", "cancelled", "timed_out"].includes(status ?? ""),
-    isSameTaskScope: (left: string | null, right: string | null) => left === right,
-    runTaskKey: (run: Run) => typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null,
-    filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null) => run,
-    getSchedulingSuppression: vi.fn(async () => ({ suppressed: false, reason: null } as Awaited<ReturnType<HeartbeatQueueDependencies["getSchedulingSuppression"]>>)),
-    canStartNewExternalBotWork: vi.fn(async () => true),
-    executeRun: vi.fn(async () => undefined),
-    applyWakeQueuePostCommitEffects: vi.fn(async () => undefined),
-    releaseIssueExecutionAndPromote: vi.fn<HeartbeatQueueDependencies["releaseIssueExecutionAndPromote"]>(async () => undefined),
-    publishRunLifecyclePluginEvent: vi.fn(),
-    cancelRunInternal: vi.fn(async () => undefined),
-    cancelActiveForAgentInternal: vi.fn(async () => undefined),
-    resumeExecutionWaitComments: vi.fn(async () => undefined),
-    resumeQueuedCommentInterrupt: vi.fn(async () => undefined),
-    resumeSavedLegacyComments: vi.fn(async () => undefined),
-    formatIssueIdentifierLink: (_identifier: string | null, fallback: string) => fallback,
-    sweepPendingCleanupLeases: vi.fn<HeartbeatQueueDependencies["sweepPendingCleanupLeases"]>(),
-  } satisfies HeartbeatQueueDependencies;
-}
+import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests__/helpers/heartbeat-queue.js";
+
 function guardedDatabase() {
   const access = vi.fn(() => { throw new Error("Unexpected queue database access"); });
   return { db: new Proxy({}, { get: access }) as Db, access };

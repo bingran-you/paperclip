@@ -205,7 +205,7 @@ export function paperclipRunnerTransitionConfig(
   providerOverride?: unknown,
 ): Record<string, unknown> {
   const previousProvider =
-    previousAdapterType === "claude_local"
+    (previousAdapterType === "claude_local" || previousAdapterType === "pi_local")
       ? "acpx"
       : previousAdapterType === "opencode_local"
         ? "opencode"
@@ -218,11 +218,13 @@ export function paperclipRunnerTransitionConfig(
       : previousProvider;
   return {
     provider,
-    model: resolvePaperclipRunnerModel(
+    model: provider === "acpx" && previousAdapterType === "pi_local"
+      ? typeof previousModel === "string" ? previousModel.trim() : ""
+      : resolvePaperclipRunnerModel(
       provider,
       provider === previousProvider ? previousModel : undefined,
     ),
-    ...(provider === "acpx" ? { acpxAgent: "claude" } : {}),
+    ...(provider === "acpx" ? { acpxAgent: previousAdapterType === "pi_local" ? "pi" : "claude" } : {}),
     [PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].configKey]:
       PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].defaultMode,
     lifecycleMode: "per_turn",

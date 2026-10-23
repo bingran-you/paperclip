@@ -57,7 +57,7 @@ const {
     retryMs?: number;
     run: (signal?: AbortSignal) => Promise<unknown>;
     hasPending?: () => Promise<boolean>;
-  }) => ({ ready: task.run().catch(() => undefined), wake: vi.fn() }));
+  }) => ({ ready: task.run(new AbortController().signal).catch(() => undefined), wake: vi.fn() }));
   const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
     locals: {
       fastResponses: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => undefined) },
@@ -249,7 +249,8 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
+vi.mock("@paperclipai/db", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@paperclipai/db")>(),
   createDb: createDbMock,
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
@@ -259,14 +260,22 @@ vi.mock("@paperclipai/db", () => ({
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
   closeLivenessDb: vi.fn(async () => {}),
-  authUsers: {},
-  companies: {},
-  companyMemberships: {},
-  instanceUserRoles: {},
 }));
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
+}));
+
+// Startup owns registration. Durable budget/accounting state and coordinator
+// retry delivery are exercised against PostgreSQL in the worker suites.
+vi.mock("../services/budgets.js", () => ({
+  deliverBudgetEnforcement: vi.fn(async () => undefined),
+  hasPendingBudgetEnforcement: vi.fn(async () => false),
+  nextBudgetReconciliationAt: vi.fn(async () => null),
+  reconcileDueBudgetPolicies: vi.fn(async () => ({ nextCursor: null })),
+}));
+vi.mock("../services/run-cost-accounting.js", () => ({
+  readCostAccountingWork: vi.fn(async () => ({ pending: false, nextRunAt: null })),
 }));
 
 // This suite exercises startup coordination; source persistence and authority
@@ -773,7 +782,7 @@ describe("startServer feedback export wiring", () => {
       intervalCallback?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
-      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
       expect(retiredDetector).not.toHaveBeenCalled();
     } finally {
       delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
@@ -781,16 +790,9 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
-  it("reconciles native replacements at startup and on the execution-control interval", async () => {
+  it("registers native replacement recovery without an execution-control interval", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
-    let executionControlTick: (() => void) | undefined;
-    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
-      callback: () => void,
-      interval: number,
-    ) => {
-      if (interval === EXECUTION_RECONCILIATION_INTERVAL_MS) executionControlTick = callback;
-      return 1 as unknown as ReturnType<typeof setInterval>;
-    }) as typeof setInterval);
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     try {
       await startServer();
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -799,11 +801,8 @@ describe("startServer feedback export wiring", () => {
         expect.any(Date),
         { verifyStoppedSession: expect.any(Function) },
       );
-
-      expect(executionControlTick).toBeDefined();
-      executionControlTick?.();
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(reconcileSafeNativeReplacements).toHaveBeenCalledTimes(2);
+      expect(deliveryWorkRegisterMock.mock.calls.some(([queue]) => queue === DELIVERY_QUEUES.executionReplacement)).toBe(true);
+      expect(setIntervalSpy.mock.calls.some(([, interval]) => interval === EXECUTION_RECONCILIATION_INTERVAL_MS)).toBe(false);
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -879,14 +878,14 @@ describe("startServer feedback export wiring", () => {
 
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
-      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
     } finally {
       setIntervalSpy.mockRestore();
     }
   });
 
-  it.each([false, true])("retries failed accounting recovery with heartbeat scheduling enabled: %s", async (enabled) => {
+  it.each([false, true])("registers failed accounting recovery for delivery, independent of heartbeat scheduling: %s", async (enabled) => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: enabled }));
     heartbeatServiceMock.reconcileCostAccounting.mockRejectedValueOnce(new Error("temporary ledger outage"));
     let tick: (() => void) | undefined;
@@ -901,6 +900,10 @@ describe("startServer feedback export wiring", () => {
       expect(tick).toBeDefined();
       tick?.();
       await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
+      const registration = deliveryWorkRegisterMock.mock.calls.find(([queue]) => queue === DELIVERY_QUEUES.accounting);
+      expect(registration?.[1]).toMatchObject({ retryMs: 5_000, runDuringDrain: true });
+      await registration?.[1].run(new AbortController().signal);
       expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
     } finally {
       timer.mockRestore();

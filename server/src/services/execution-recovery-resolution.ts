@@ -1,3 +1,5 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { canonicalExecutionUuid } from "./execution-identity.js";
@@ -201,38 +203,43 @@ export async function markExecutionReconciliation(
       throw conflict("The authorized chat retry owner is no longer valid.");
     }
   }
-  await db
-    .update(nativeRunFinalizations)
-    .set({
-      failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
-    })
-    .where(
-      and(
-        eq(nativeRunFinalizations.companyId, action.companyId),
-        eq(nativeRunFinalizations.runId, decision.runId),
-      ),
-    );
-  await db
-    .update(issueRecoveryActions)
-    .set({
-      evidence: {
-        ...action.evidence,
-        automaticRecovery: undefined,
-        executionReconciliation: {
-          ...decision,
-          actorId,
-          recordedAt: new Date().toISOString(),
+  await db.transaction(async tx => {
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+    await tx
+      .update(nativeRunFinalizations)
+      .set({
+        failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
+      })
+      .where(
+        and(
+          eq(nativeRunFinalizations.companyId, action.companyId),
+          eq(nativeRunFinalizations.runId, decision.runId),
+        ),
+      );
+    await tx
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...action.evidence,
+          automaticRecovery: undefined,
+          executionReconciliation: {
+            ...decision,
+            actorId,
+            recordedAt: new Date().toISOString(),
+          },
+          continuationDelivery: options?.workspaceRepairOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
+          ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
         },
-        continuationDelivery: options?.workspaceRepairOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
-        ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
-      },
-    })
-    .where(
-      and(
-        eq(issueRecoveryActions.companyId, action.companyId),
-        eq(issueRecoveryActions.id, action.id),
-      ),
-    );
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, action.companyId),
+          eq(issueRecoveryActions.id, action.id),
+        ),
+      );
+  });
 }
 
 export async function deliverReconciledExecutions(
@@ -337,60 +344,8 @@ export async function deliverReconciledExecutions(
   }
 }
 
-/**
- * Failed execution is a system responsibility, not a user questionnaire. After
- * automatic recovery is ruled out, preserve evidence and stop without replay.
- * This is NOT evidence that an external action succeeded or never happened.
- * The resolved record retains a dispatch hold until actual evidence clears it.
- */
-export async function settleUnrecoverableExecutions(
-  db: Db,
-  now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
-) {
-  // Fold obsolete conversation holds without waking historical work on upgrade.
-  // Keep their evidence and record the policy change in the task's activity log.
-  const obsoleteConversationHold = and(
-    conversationRecoveryActionPredicate(),
-    sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`,
-    or(
-      inArray(issueRecoveryActions.status, ["active", "escalated"]),
-      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
-    ),
-  );
-  await db.transaction(async tx => {
-    const foldable = await tx.select().from(issueRecoveryActions).where(obsoleteConversationHold)
-      .limit(25).for("update", { skipLocked: true });
-    for (const candidate of foldable) {
-      if (await getConversationOwnershipBlocker(tx as unknown as Db, candidate.companyId, candidate.sourceIssueId)) continue;
-      const [action] = await tx.update(issueRecoveryActions).set({
-        status: "resolved",
-        outcome: "cancelled",
-        resolvedAt: now,
-        updatedAt: now,
-        nextAction: "Automatic attempts stopped. Send a new message to continue the conversation.",
-        resolutionNote: "Conversation continuation does not replay prior tool calls.",
-        wakePolicy: null,
-        monitorPolicy: null,
-        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
-          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
-          else ${issueRecoveryActions.evidence} end`,
-      }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
-      if (!action) continue;
-      await persistActivity(tx as unknown as Db, {
-        companyId: action.companyId,
-        actorType: "system",
-        actorId: "execution-recovery",
-        action: "issue.execution_recovery_settled",
-        entityType: "issue",
-        entityId: action.sourceIssueId,
-        details: { recoveryActionId: action.id, outcome: "cancelled", continuation: "conversation" },
-      });
-    }
-  });
-  // Filter eligibility before applying the batch limit. A queue of sessions
-  // awaiting replacement must not starve settled incidents behind it.
-  const candidates = await db
+export function unresolvedExecutionDispositions(db: Db, limit: number) {
+  return db
     .select({ action: issueRecoveryActions })
     .from(issueRecoveryActions)
     .innerJoin(
@@ -437,7 +392,67 @@ export async function settleUnrecoverableExecutions(
         or coalesce(${nativeRunFinalizations.failureDetail}->>'replacementDenied', '') <> '')`,
       ),
     )
-    .limit(25);
+    .limit(limit);
+}
+
+export function obsoleteExecutionConversationHold() {
+  return and(
+    conversationRecoveryActionPredicate(),
+    sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`,
+    or(
+      inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+    ),
+  );
+}
+
+/**
+ * Failed execution is a system responsibility, not a user questionnaire. After
+ * automatic recovery is ruled out, preserve evidence and stop without replay.
+ * This is NOT evidence that an external action succeeded or never happened.
+ * The resolved record retains a dispatch hold until actual evidence clears it.
+ */
+export async function settleUnrecoverableExecutions(
+  db: Db,
+  now = new Date(),
+  options: { failpoint?: (phase: "persisted") => void } = {},
+) {
+  // Fold obsolete conversation holds without waking historical work on upgrade.
+  // Keep their evidence and record the policy change in the task's activity log.
+  const obsoleteConversationHold = obsoleteExecutionConversationHold();
+  await db.transaction(async tx => {
+    const foldable = await tx.select().from(issueRecoveryActions).where(obsoleteConversationHold)
+      .limit(25).for("update", { skipLocked: true });
+    for (const candidate of foldable) {
+      if (await getConversationOwnershipBlocker(tx as unknown as Db, candidate.companyId, candidate.sourceIssueId)) continue;
+      const [action] = await tx.update(issueRecoveryActions).set({
+        status: "resolved",
+        outcome: "cancelled",
+        resolvedAt: now,
+        updatedAt: now,
+        nextAction: "Automatic attempts stopped. Send a new message to continue the conversation.",
+        resolutionNote: "Conversation continuation does not replay prior tool calls.",
+        wakePolicy: null,
+        monitorPolicy: null,
+        evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+          then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"conversation_continuation"'::jsonb)
+          else ${issueRecoveryActions.evidence} end`,
+      }).where(and(obsoleteConversationHold, eq(issueRecoveryActions.id, candidate.id))).returning();
+      if (!action) continue;
+      await persistActivity(tx as unknown as Db, {
+        companyId: action.companyId,
+        actorType: "system",
+        actorId: "execution-recovery",
+        action: "issue.execution_recovery_settled",
+        entityType: "issue",
+        entityId: action.sourceIssueId,
+        details: { recoveryActionId: action.id, outcome: "cancelled", continuation: "conversation" },
+      });
+    }
+  });
+  // Filter eligibility before applying the batch limit. A queue of sessions
+  // awaiting replacement must not starve settled incidents behind it.
+  const candidates = await unresolvedExecutionDispositions(db, 25);
   for (const { action: candidate } of candidates) {
     const runId = candidate.evidence.runId;
     if (typeof runId !== "string") continue;
@@ -586,6 +601,7 @@ export async function settleUnrecoverableExecutions(
             replay: "not_authorized",
           },
         });
+        await notifyExecutionRunWork(tx);
         await tx
           .update(heartbeatRuns)
           .set({ executionStatusDeliveryId: randomUUID() })

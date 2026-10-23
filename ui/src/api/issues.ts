@@ -490,6 +490,8 @@ export const issuesApi = {
       `/issues/${id}/interactions/${interactionId}/skip`,
       reason ? { reason } : {},
     ),
+  dismissInteraction: (id: string, interactionId: string) =>
+    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/dismiss`, {}),
   respondToInteraction: (
     id: string,
     interactionId: string,

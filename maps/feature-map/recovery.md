@@ -222,6 +222,22 @@ cover quiet live recovery, read-only access, stale or missing stop proof,
 source-only repair, and preserved task status. These tests use fixtures; separately
 verify original files and their attached artifact before recording a real repair.
 
+For a source with a retained-file protection marker, exercise recovery through
+the assembled environment runtime. Its exact preservation owner may reopen the
+stopped allocation to read saved files; ordinary resume stays blocked. Reject a
+changed claim, missing stop intent, wrong lease or wrong environment before a
+provider call. Verify saved and newer local files, one preservation receipt, and
+no additional agent turn. The PostgreSQL regression covers this boundary; the
+opt-in provider probe also uses this runtime path with the protection marker.
+
+For a missing managed allocation, verify a fresh Cloud-signed absence observation
+under the exact physical recovery owner. The existing Retry may then select an
+independent workspace through normal admission. Verify that the original run
+stays failed and missing files are not called recovered. Refuse a foreign stack,
+source, allocation or owner, expired signatures, changed provider organizations,
+permission failures and provider outages. Local PostgreSQL and signed-protocol
+regressions cover these boundaries; deployed recovery requires separate proof.
+
 Repeat source-only repair with a `succeeded` legacy run that still has a retained
 file obligation. Its result must remain successful, its current task owner and
 status must stay unchanged, and later saved input must become eligible for normal

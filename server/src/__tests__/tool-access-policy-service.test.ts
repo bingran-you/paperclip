@@ -18,6 +18,7 @@ import {
   toolCallEvents,
   toolConnections,
   toolInvocations,
+  toolMcpGateways,
   toolPolicies,
   toolProfileBindings,
   toolProfileEntries,
@@ -217,6 +218,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     await db.delete(toolPolicies);
     await db.delete(toolProfileEntries);
     await db.delete(toolProfileBindings);
+    await db.delete(toolMcpGateways);
     await db.delete(toolProfiles);
     await db.delete(toolCatalogEntries);
     await db.delete(toolConnections);
@@ -951,6 +953,113 @@ describeEmbeddedPostgres("tool access policy service", () => {
 
     expect(decisions.filter((decision) => decision.allowed)).toHaveLength(1);
     expect(decisions.filter((decision) => decision.reasonCode === "rate_limited")).toHaveLength(1);
+  });
+
+  async function admittedRateLimitedInvocation(limit = 1) {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const issue = await createIssue(db, company.id);
+    const run = await createRun(db, company.id, agent.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    const [profile] = await db.insert(toolProfiles).values({ companyId: company.id,
+      profileKey: "admitted-gateway", name: "Admitted gateway", defaultAction: "deny" }).returning();
+    const [gateway] = await db.insert(toolMcpGateways).values({ companyId: company.id,
+      name: "Admitted gateway", slug: "admitted-gateway", profileId: profile.id }).returning();
+    await db.insert(principalPermissionGrants).values(sendEmailGrantRow(company, agent));
+    const [ratePolicy] = await db.insert(toolPolicies).values({ companyId: company.id, name: "One admitted send",
+      policyType: "rate_limit", selectors: { toolName: "send_email" }, priority: 1,
+      config: { limit, windowSeconds: 3600, keyBy: ["agent", "tool"] } }).returning();
+    const input = { ...sendEmailDecisionInput(company, agent, connection, catalogEntry),
+      runContext: { heartbeatRunId: run.id, issueId: issue.id, gatewayId: gateway.id }, consumeRateLimit: true,
+      request: { connectionId: connection.id, catalogEntryId: catalogEntry.id, toolName: "send_email", arguments: { to: "recipient@example.test" } } };
+    const svc = toolAccessPolicyService(db);
+    const initial = await svc.decide(input);
+    expect(initial.allowed).toBe(true);
+    const { invocation } = await svc.recordInvocation(input, initial);
+    expect(invocation.gatewayId).toBe(gateway.id);
+    await db.update(toolInvocations).set({ status: "executing" }).where(eq(toolInvocations.id, invocation.id));
+    return { company, agent, input: { ...input, consumeRateLimit: false }, invocation, ratePolicy, svc };
+  }
+
+  it.each(["allow", "approved"] as const)("retains the consumed final rate-limit slot for the same executing %s invocation", async authorization => {
+    const { input, invocation, ratePolicy, svc } = await admittedRateLimitedInvocation();
+    if (authorization === "approved") await db.update(toolInvocations).set({ policyDecision: "require_approval", approvalState: "approved" })
+      .where(eq(toolInvocations.id, invocation.id));
+    expect(await svc.decide(input)).toMatchObject({ decision: "rate_limited" });
+    expect(invocation.policyExplanation?.consumedRateAdmissions).toEqual([
+      { policyId: ratePolicy.id, versionHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    ]);
+    const counters = await db.select().from(toolRateLimitCounters);
+    expect(await svc.decide(input, { admittedInvocationId: invocation.id })).toMatchObject({ allowed: true });
+    expect(await svc.decide(input, { admittedInvocationId: invocation.id })).toMatchObject({ allowed: true });
+    expect(await db.select().from(toolRateLimitCounters)).toEqual(counters);
+    expect((await db.select().from(toolRateLimitCounters))[0].remaining).toBe(0);
+    // Neither a new invocation nor an accidental consuming recheck can borrow
+    // another invocation's already-spent slot.
+    expect(await svc.decide(input, { admittedInvocationId: randomUUID() })).toMatchObject({ decision: "rate_limited" });
+    expect(await svc.decide({ ...input, consumeRateLimit: true }, { admittedInvocationId: invocation.id }))
+      .toMatchObject({ decision: "rate_limited" });
+  });
+
+  it("rechecks a newly added rate policy rather than borrowing an older policy's consumed slot", async () => {
+    const { company, input, invocation, svc } = await admittedRateLimitedInvocation();
+    await svc.createPolicy(company.id, { name: "New send limit", policyType: "rate_limit", priority: 0,
+      selectors: { toolName: "send_email" }, config: { limit: 1, windowSeconds: 3600, keyBy: ["agent", "tool"] } });
+    // Consume the new rule through normal admission; the exhausted original
+    // rule then denies this separate request before any provider dispatch.
+    expect(await svc.decide({ ...input, consumeRateLimit: true })).toMatchObject({ decision: "rate_limited" });
+    const counters = await db.select().from(toolRateLimitCounters);
+    expect(counters).toHaveLength(2);
+    expect(await svc.decide(input, { admittedInvocationId: invocation.id })).toMatchObject({ decision: "rate_limited" });
+    expect(await db.select().from(toolRateLimitCounters)).toEqual(counters);
+  });
+
+  it("rechecks an edited rate-policy generation without consuming another slot", async () => {
+    const { company, input, invocation, ratePolicy, svc } = await admittedRateLimitedInvocation(2);
+    expect(await svc.decide({ ...input, consumeRateLimit: true })).toMatchObject({ allowed: true });
+    await svc.updatePolicy({ companyId: company.id, policyId: ratePolicy.id,
+      body: { config: { limit: 1, windowSeconds: 3600, keyBy: ["agent", "tool"] } } });
+    const counters = await db.select().from(toolRateLimitCounters);
+    expect(await svc.decide(input, { admittedInvocationId: invocation.id })).toMatchObject({ decision: "rate_limited" });
+    expect(await db.select().from(toolRateLimitCounters)).toEqual(counters);
+  });
+
+  it("rechecks rate limits for historical executing invocations without durable consumption proof", async () => {
+    const { input, invocation, svc } = await admittedRateLimitedInvocation();
+    await db.update(toolInvocations).set({ policyExplanation: null }).where(eq(toolInvocations.id, invocation.id));
+    expect(await svc.decide(input, { admittedInvocationId: invocation.id })).toMatchObject({ decision: "rate_limited" });
+  });
+
+  it("reevaluates current blocks, grants, and approval policies for admitted work", async () => {
+    const { company, input, invocation, svc } = await admittedRateLimitedInvocation();
+    const options = { admittedInvocationId: invocation.id };
+    const [block] = await db.insert(toolPolicies).values({ companyId: company.id, name: "Block admitted sends",
+      policyType: "block", priority: 0, selectors: { toolName: "send_email" } }).returning();
+    expect(await svc.decide(input, options)).toMatchObject({ decision: "deny", reasonCode: "deny_policy_block" });
+    await db.delete(toolPolicies).where(eq(toolPolicies.id, block.id));
+    await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, company.id));
+    expect(await svc.decide(input, options)).toMatchObject({ decision: "deny", reasonCode: "deny_default" });
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Require new review",
+      policyType: "require_approval", priority: 2, selectors: { toolName: "send_email" } });
+    expect(await svc.decide(input, options)).toMatchObject({ decision: "require_approval" });
+  });
+
+  it("does not retain rate admission for a mismatched or no-longer-authorized invocation", async () => {
+    const { input, invocation, svc } = await admittedRateLimitedInvocation();
+    const options = { admittedInvocationId: invocation.id };
+    const mutations: Partial<typeof toolInvocations.$inferInsert>[] = [
+      { actorType: "system" }, { actorId: randomUUID() }, { agentId: null }, { runId: null }, { issueId: null }, { gatewayId: null },
+      { applicationId: null }, { connectionId: null }, { catalogEntryId: null }, { toolName: "different_tool" },
+      { providerType: null }, { applicationKey: null }, { upstreamToolName: null }, { argumentsHash: "different" },
+      { status: "authorized" }, { policyDecision: "deny" }, { policyDecision: "require_approval", approvalState: "pending" },
+    ];
+    for (const mutation of mutations) {
+      await db.update(toolInvocations).set(mutation).where(eq(toolInvocations.id, invocation.id));
+      expect(await svc.decide(input, options), JSON.stringify(mutation)).toMatchObject({ decision: "rate_limited" });
+      await db.update(toolInvocations).set({ ...invocation, status: "executing" }).where(eq(toolInvocations.id, invocation.id));
+    }
+    expect(await svc.decide({ ...input, request: { ...input.request, arguments: { to: "another@example.test" } } }, options))
+      .toMatchObject({ decision: "rate_limited" });
   });
 
   it("rejects unsupported policy semantics at create and update time", async () => {

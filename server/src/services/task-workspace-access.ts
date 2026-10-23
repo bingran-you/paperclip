@@ -5,7 +5,7 @@ import { forbidden } from "../errors.js";
 import { accessService } from "./access.js";
 import { executionWorkspaceReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
-import { assertSelectedWorkspaceTrust, runRetainsIssueIdentity, taskRepositoryRunColumns } from "./task-repository-acquisition.js";
+import { assertSelectedWorkspaceTrust, runRetainsIssueIdentity, taskRepositoryRunColumns, taskRepositoryResponsibleUserMatches } from "./task-repository-acquisition.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isDeepStrictEqual } from "node:util";
 import { taskWorkspaceSelectionSchema, type TaskWorkspaceSelection } from "@paperclipai/shared";
@@ -78,7 +78,7 @@ export async function assertTaskWorkspaceExecutionAccess(
       || run.agentId !== actor.agentId || !runRetainsIssueIdentity(run, task.id)))) {
       throw forbidden("Task workspace run identity is unavailable");
     }
-    if (run && (actor.onBehalfOfUserId ?? null) !== (run.responsibleUserId === "local-board" ? null : run.responsibleUserId)) {
+    if (run && !taskRepositoryResponsibleUserMatches(actor.onBehalfOfUserId, run.responsibleUserId)) {
       throw forbidden("Task workspace responsible user changed");
     }
     const decision = await measureRunPhase("workspace.access.task_authorization", () => access.decide({ actor, action: "issue:read", resource: { type: "issue", companyId, issueId: task.id } }));

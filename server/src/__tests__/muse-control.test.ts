@@ -40,6 +40,7 @@ import { assertNoExternalOverlap, withExternalAdmissionGuard } from "../modules/
 import { digestPaperclipSemanticContent, externalOperationDigest, parseNativeExecutionInput, canonicalNativeRuntimeContextDigest, nativeRuntimePromptDigest, NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, type ExternalProviderOperation } from "../vendor/paperclip-runner/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 
 /** Real database/transport authority tests; synthetic provider receipts do not
  * count as live Muse/native qualification evidence. */
@@ -2388,14 +2389,21 @@ describe("personal Muse control plane",()=>{
     await db.update(agents).set({status:"paused",lifecycleState:"verifying",lifecycleOperation:{id:randomUUID(),hostComplete:false,completedPluginIds:[],attempts:0,responsibleUserId:f.operatorId},lifecycleRequiredPluginIds:[]}).where(eq(agents.id,f.agent.id));
     const harness=agentHarnessVerificationService(db,{} as PluginWorkerManager),onReady=vi.fn();
     const lifecycle=startAgentLifecycle(db,{requiredPluginIds:async()=>[],runPlugin:async()=>"complete",runHost:snapshot=>harness.verify(snapshot),onReady},()=>true);
+    const deliveryErrors=vi.fn(),coordinator=createDeliveryWorkCoordinator({owner:db,canRun:()=>true,onError:deliveryErrors});
+    const delivery=coordinator.register(DELIVERY_QUEUES.agentLifecycle,{retryMs:1000,run:()=>lifecycle.sweep(),hasPending:()=>lifecycle.hasPending(),nextRunAt:()=>lifecycle.nextRunAt()});
+    lifecycle.setWake(delivery.wake);
     try {
-      await lifecycle.sweep();expect((await db.select().from(agents).where(eq(agents.id,f.agent.id)))[0].lifecycleState).toBe("verifying");
+      await delivery.ready;expect((await db.select().from(agents).where(eq(agents.id,f.agent.id)))[0].lifecycleState).toBe("verifying");
+      // The authenticated confirmation must retry this hire, not wait for a
+      // periodic scan or a previously persisted long backoff to expire.
+      await db.update(agents).set({lifecycleOperation:sql`${agents.lifecycleOperation} || jsonb_build_object('retryAt', ${new Date(Date.now()+60_000).toISOString()}::text)`}).where(eq(agents.id,f.agent.id));
       await museReceiver(db).signal(f.binding.id);await museReceiver(db).flush();
       const items=await f.broker.inspect(f.subject,{version:1,query:"mailbox",after:0}) as {items:Array<{references:{nonce:string}}>};
       await f.broker.act(f.subject,{version:1,command:"challenge.confirm",nonce:items.items[0].references.nonce,requestId:randomUUID()});
       await expect.poll(async()=> (await db.select().from(agents).where(eq(agents.id,f.agent.id)))[0].lifecycleState,{timeout:8000,interval:100}).toBe("ready");
       expect((await db.select().from(agents).where(eq(agents.id,f.agent.id)))[0].status).toBe("idle");expect(onReady).toHaveBeenCalledOnce();
-    }finally{await lifecycle.stop();}
+      expect(deliveryErrors).not.toHaveBeenCalled();
+    }finally{await coordinator.stop();await lifecycle.stop();}
   });
 
   it("serves opaque public wake digests while worker and cleanup APIs still require private bearer authority",async()=>{

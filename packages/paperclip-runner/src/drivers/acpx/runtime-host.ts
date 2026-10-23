@@ -254,6 +254,7 @@ export interface OpenAcpxRuntimeHostOptions {
   /** Abort admission without admitting resources that resolve afterward. */
   signal?: AbortSignal;
   semanticTools?: AcpxSemanticToolSession;
+  assignedMcpTransport?: "prp";
   onGoalUpdate?: (goal: AcpxRuntimeGoalSnapshot | null) => void;
 }
 
@@ -349,7 +350,8 @@ export class AcpxRuntimeHost {
     if (nativeMcp?.name === "paperclip") {
       throw new Error("assigned native MCP name conflicts with the task bridge");
     }
-    if (!preconfigured && options.runtimeContext?.mcp.bindingId && !nativeMcp) {
+    if (!preconfigured && options.runtimeContext?.mcp.bindingId && !nativeMcp
+      && !(options.assignedMcpTransport === "prp" && options.semanticTools)) {
       throw new Error("assigned native MCP launch binding is unavailable");
     }
     const profile = resolveQualifiedAcpxProfile(options.agent, options.model);
@@ -588,6 +590,7 @@ export class AcpxRuntimeHost {
             signal: options.signal,
             acquire: () => startRunnerToolBridge({
               ...options.semanticTools!,
+              preserveToolNames: options.assignedMcpTransport === "prp",
               preloadClaudeTaskTools: options.agent === "claude",
             }),
             resource: "tool_bridge",

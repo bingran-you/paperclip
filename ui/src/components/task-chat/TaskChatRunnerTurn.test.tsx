@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import { TaskChatRunnerTurn } from "./TaskChatRunnerTurn";
+import { TaskChatRequestHistoryContext } from "./TaskChatComposerTakeoverContext";
 import { transcriptToTaskChatItems } from "./transcript-adapter";
 import type {
   TaskChatItem,
@@ -47,6 +48,7 @@ describe("TaskChatRunnerTurn", () => {
       root.render(
         <MemoryRouter>
           <ThemeProvider>
+            <TaskChatRequestHistoryContext.Provider value="issue-1">
             <TaskChatRunnerTurn
               runId={runId}
               agentName="Runner"
@@ -58,6 +60,7 @@ describe("TaskChatRunnerTurn", () => {
               continuedAfterSteering={continuedAfterSteering}
               onRuntimeRequestDecision={onRuntimeRequestDecision}
             />
+            </TaskChatRequestHistoryContext.Provider>
           </ThemeProvider>
         </MemoryRouter>,
       ),
@@ -1253,7 +1256,7 @@ describe("TaskChatRunnerTurn", () => {
     ).toBe(true);
   });
 
-  it("does not leave a pending runtime marker after action moves to the composer", async () => {
+  it("keeps a compact pending runtime entry without duplicating composer controls", async () => {
     const onDecision = vi.fn();
     render(
       [
@@ -1285,6 +1288,7 @@ describe("TaskChatRunnerTurn", () => {
     expect(
       container.querySelector('[data-testid="task-chat-runtime-request"]'),
     ).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-pending-runtime-request"]')?.textContent).toContain("Allow command?");
     expect(onDecision).not.toHaveBeenCalled();
   });
 

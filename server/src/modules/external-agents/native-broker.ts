@@ -186,6 +186,7 @@ export function createNativeExternalBroker<S>(db:Db,provider:Provider,identity:I
       return (await tx.execute<Assignment>(sql`select ${assignmentColumns} from ${assignmentTable} where run_id=${b.runId}::uuid and company_id=${b.companyId}::uuid and agent_id=${b.agentId}::uuid and binding_id=${b.bindingId}::uuid and binding_generation=${b.bindingGeneration} and normalized_session_id=${b.normalizedSessionId} and turn_id=${b.turnId} and revision=${b.assignmentRevision} for update`))[0];
     }
     async function reserveRevocationEvent(tx:ExternalAdmissionTransaction,a:Assignment,sourceEventId:string,references:Record<string,unknown>) {
+      if (provider === "openai_dot") await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `binding:${a.bindingId}`);
       const [created]=await tx.execute(sql`insert into ${mailboxTable} (company_id,binding_id,binding_generation,assignment_id,kind,source_event_id,"references") values (${a.companyId}::uuid,${a.bindingId}::uuid,${a.bindingGeneration},${a.id}::uuid,'authority_revoked',${sourceEventId},${JSON.stringify(references)}::jsonb) on conflict do nothing returning id`);
       if(created)return true;
       const [old]=await tx.execute<{companyId:string;assignmentId:string|null;kind:string}>(sql`select company_id as "companyId",assignment_id as "assignmentId",kind from ${mailboxTable} where binding_id=${a.bindingId}::uuid and binding_generation=${a.bindingGeneration} and source_event_id=${sourceEventId}`);
@@ -271,6 +272,7 @@ export function createNativeExternalBroker<S>(db:Db,provider:Provider,identity:I
           if (!old && provider === "muse") await notifyDeliveryWork(tx, DELIVERY_QUEUES.museMaintenance);
           const [a]=old?[old]:await tx.execute<Assignment>(sql`insert into ${assignmentTable} (company_id,binding_id,binding_generation,run_id,agent_id,normalized_session_id,turn_id,revision,controller_generation,catalog_digest,status,projection,accept_by,expires_at) values (${b.companyId}::uuid,${b.bindingId}::uuid,${b.bindingGeneration},${runId}::uuid,${b.agentId}::uuid,${b.normalizedSessionId},${b.turnId},${b.assignmentRevision},${owner.controllerGeneration},${externalOperationDigest("tool",{tools:p.tools})},'offered',${JSON.stringify(projection)}::jsonb,${new Date(Number(p.acceptByUnixMs)).toISOString()}::timestamptz,${new Date(Number(p.expiresAtUnixMs)).toISOString()}::timestamptz) returning ${assignmentColumns}`);
           if(!a)throw conflict("Assignment creation failed.");
+          if (provider === "openai_dot") await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `binding:${a.bindingId}`);
           await tx.execute(sql`insert into ${mailboxTable} (company_id,binding_id,binding_generation,assignment_id,kind,source_event_id,"references") values (${a.companyId}::uuid,${a.bindingId}::uuid,${a.bindingGeneration},${a.id}::uuid,'assignment',${event.sourceEventId},${JSON.stringify({assignmentId:a.id,runId,revision:a.revision})}::jsonb) on conflict do nothing`);
           if(binding.providerKind==="grok_bot"){
             const [run]=await tx.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns).where(eq(heartbeatRuns.id,runId));
@@ -296,6 +298,7 @@ export function createNativeExternalBroker<S>(db:Db,provider:Provider,identity:I
             // the same fact must preserve later work and its original evidence.
             return;
           }
+          if (provider === "openai_dot") await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `binding:${a.bindingId}`);
           await tx.execute(sql`update ${operationTable} set status=${provider==="muse"&&outcome.status==="rejected"?"rejected":store.completed},outcome=${JSON.stringify(outcome)}::jsonb,source_event_id=${event.sourceEventId},updated_at=now() where id=${op.id}::uuid`);
           const action=op.command.action;
           await tx.execute(sql`update ${assignmentTable} set last_activity_at=now() where id=${a.id}::uuid`);

@@ -1,6 +1,22 @@
 import { z } from "zod";
 import { workspaceProviderBindingSchema } from "@paperclipai/shared";
 
+const recoveryFile = z.object({
+  path: z.string().min(1),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  byteSize: z.number().int().positive(),
+}).strict();
+export const freshWorkspaceSchema = z.object({
+  attemptId: z.string().uuid(),
+  sourceRunId: z.string().uuid(),
+  previousWorkspaceId: z.string().uuid().nullable(),
+  recoverySnapshots: z.array(z.object({
+    operationId: z.string().uuid(), sourceRunId: z.string().uuid(),
+    archive: recoveryFile, manifest: recoveryFile,
+  }).strict()),
+}).strict();
+export type PluginFreshWorkspace = z.infer<typeof freshWorkspaceSchema>;
+
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/);
 export const workspaceProviderOperationSchema = z.discriminatedUnion("kind", [
   z
@@ -25,6 +41,7 @@ export const workspaceProviderOperationSchema = z.discriminatedUnion("kind", [
       branchMode: z.enum(["create", "existing"]).optional(),
       baseRef: z.string().nullable(),
       existing: workspaceProviderBindingSchema.nullable(),
+      fresh: freshWorkspaceSchema.optional(),
     })
     .strict(),
   z

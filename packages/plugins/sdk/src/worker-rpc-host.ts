@@ -1,3 +1,4 @@
+import { freshWorkspaceSchema } from "./workspace-provider.js";
 import { workspaceProviderBindingSchema } from "@paperclipai/shared";
 import { pluginWorkspaceParamsSchema, parseWorkspaceProviderResult } from "./workspace-provider.js";
 import { environmentTaskOperationSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskParams } from "./environment-tasks.js";
@@ -1697,6 +1698,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         if (!plugin.definition.onEnvironmentTask) throw methodNotImplemented("environmentTask");
         const input = params as PluginEnvironmentTaskParams;
         if (input.workspace !== undefined) workspaceProviderBindingSchema.parse(input.workspace);
+        if (input.fresh !== undefined) freshWorkspaceSchema.parse(input.fresh);
         const operation = environmentTaskOperationSchema.parse(input.operation);
         return parseEnvironmentTaskResult(operation, input.taskId, await plugin.definition.onEnvironmentTask({ ...input, operation }));
       }

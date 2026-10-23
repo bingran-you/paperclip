@@ -33,6 +33,12 @@ The source recovery action holds a validated `systemRecovery` record. Its
 revision and generation fence late bookkeeping writes. Physical exports still
 use the existing workspace ownership lock and controller stop receipts.
 
+The export owner can reopen its exact stopped sandbox through the environment
+runtime's recovery path. This path checks the current source action, run,
+environment, allocation, stop-only intent, and physical ownership claim before
+calling the provider. The retained-source fence still blocks ordinary resume
+and destruction. Recovery does not clear it to gain access to the saved files.
+
 Execution containment and file preservation are independent facts:
 
 - Another agent needs authoritative containment of the old executor.
@@ -40,6 +46,19 @@ Execution containment and file preservation are independent facts:
 - A fresh attempt uses a new execution workspace and the separate
   `isolated-workspace-attempts` namespace. It does not modify the original
   directory or satisfy that source's preservation/cleanup obligation.
+
+A missing managed sandbox cannot answer another stop request. Core can request
+a signed absence observation from Cloud under a host-bound server capability.
+Cloud reads the exact allocation in the historical credential's organization.
+Only a fresh signature for the exact stack, company, issue, run, lease,
+allocation and physical recovery owner can settle execution absence. Permission
+failures, a changed organization, unsigned answers and provider timeouts remain
+inconclusive. This protocol requires Cloud support before the Core consumer.
+
+An absence receipt does not recover files or complete the task. The original run
+stays failed and its source remains protected. Existing authorized input may use
+normal fresh workspace admission only after every executor is contained. Known
+publications and uncertain external effects retain their normal receipt fences.
 
 Fresh attempts currently require Core-managed storage. Plugin-owned storage
 does not yet support importing these preserved snapshots. Preparation stops
@@ -113,6 +132,8 @@ Run the focused PostgreSQL/filesystem suites from `server/`:
 `server/scripts/workspace-recovery-provider.test.mjs` is an opt-in controlled
 Daytona probe. It requires `PAPERCLIP_RECOVERY_LIVE=1`, `DAYTONA_API_KEY`,
 `PAPERCLIP_DAYTONA_SDK_PATH` and an immutable `PAPERCLIP_RECOVERY_IMAGE`.
+An immutable provider snapshot UUID in `PAPERCLIP_RECOVERY_SNAPSHOT_ID` can
+replace the image digest. The probe checks its ID and active state first.
 It interrupts export,
 joins the first controller, starts a second controller and verifies files,
 preservation receipts, agent-start count and external-operation count before

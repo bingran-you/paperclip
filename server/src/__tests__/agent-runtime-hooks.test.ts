@@ -155,6 +155,13 @@ describeDatabase("agent runtime synchronization hooks", () => {
     expect(await fs.readFile(path.join(state!.instructionsRootPath!, state!.instructionsEntryFile), "utf8")).toBe("restored instructions");
   });
 
+  it("supplies default instructions when the agent has no instruction directory", async () => {
+    await db.update(agents).set({ adapterConfig: { promptTemplate: "Fallback task instructions" } }).where(eq(agents.id, agentId));
+    expect(await pluginAgentRuntimeState(db, pluginId, companyId, agentId)).toMatchObject({
+      instructionsRootPath: null, instructionsEntryFile: "AGENTS.md", instructionsEntryContent: "Fallback task instructions",
+    });
+  });
+
   it("resolves instructions without reading or hashing bundle contents", async () => {
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     const root = resolveManagedInstructionsRoot(agent);

@@ -1282,6 +1282,7 @@ fn sidecar_run_tool_operations(run_tool_set: &AuthorizedToolSet) -> Vec<Value> {
     run_tool_set
         .operations
         .iter()
+        .filter(|tool| !is_reserved_terminal_operation(&tool.operation_id))
         .map(|tool| {
             json!({
                 "name": tool.operation_id,
@@ -1694,13 +1695,22 @@ mod tests {
 
     #[test]
     fn sidecar_catalog_leaves_reserved_terminal_tools_to_the_trusted_bridge() {
-        let operations = vec![AuthorizedTool {
+        let mut operations = vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
             version: 1,
             description: "Read the task context.".to_owned(),
             input_schema: json!({"type":"object"}),
             response_schema: json!({"type":"object"}),
         }];
+        for name in [PRP_BLOCK_TOOL_NAME, PRP_COMPLETION_TOOL_NAME] {
+            operations.push(AuthorizedTool {
+                operation_id: name.to_owned(),
+                version: 1,
+                description: "Trusted terminal operation.".to_owned(),
+                input_schema: json!({"type":"object"}),
+                response_schema: json!({"type":"object"}),
+            });
+        }
         let run_tool_set = AuthorizedToolSet {
             schema: TOOL_SET_SCHEMA.to_owned(),
             schema_version: 1,
@@ -1716,7 +1726,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["get_task_context"]
         );
-        assert_eq!(run_tool_set.operations.len(), 1);
+        assert_eq!(run_tool_set.operations.len(), 3);
         assert_eq!(
             sidecar_tools[0],
             json!({

@@ -214,6 +214,24 @@ describe("delivery work coordinator", () => {
     expect(t.run).toHaveBeenCalledTimes(2);
     expect(idleWorkSnapshot().active).toBe(0);
   });
+  it("delivers already-admitted stop work during drain while respecting warm standby", async () => {
+    const s = setup(), t = task();
+    await s.coordinator.register(DELIVERY_QUEUES.budgetEnforcement, { ...t, runDuringDrain: true }).ready;
+    s.canRun.mockReturnValue(false);
+    s.canReconcile.mockReturnValue(true);
+    await s.enqueue(DELIVERY_QUEUES.budgetEnforcement);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.run).toHaveBeenCalledTimes(2);
+    expect(s.coordinator.nextWakeAt()).toBeNull();
+    s.canReconcile.mockReturnValue(false);
+    await s.enqueue(DELIVERY_QUEUES.budgetEnforcement);
+    await vi.advanceTimersByTimeAsync(5001);
+    expect(t.run).toHaveBeenCalledTimes(2);
+    s.canReconcile.mockReturnValue(true);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(t.run).toHaveBeenCalledTimes(3);
+    expect(idleWorkSnapshot().active).toBe(0);
+  });
   it("bounds an expired deadline retry during idle reconciliation and resumes after drain", async () => {
     const s = setup(), t = task();
     const due = Date.now() + 10_000;

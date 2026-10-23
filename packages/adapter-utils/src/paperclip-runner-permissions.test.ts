@@ -43,8 +43,14 @@ describe("Paperclip Runner permission defaults", () => {
     ["claude_local", "acpxPermissionMode", "approve-all"],
     ["codex_local", "codexPermissionMode", "never"],
     ["opencode_local", "opencodePermissionMode", "allow"],
+    ["pi_local", "acpxPermissionMode", "approve-all"],
   ])("uses full auto when converting %s to the new runner", (adapter, key, value) => {
     expect(paperclipRunnerTransitionConfig(adapter, undefined)).toMatchObject({ [key]: value });
+  });
+
+  it("keeps Pi models explicit during conversion", () => {
+    expect(paperclipRunnerTransitionConfig("pi_local", undefined)).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: "" });
+    expect(paperclipRunnerTransitionConfig("pi_local", "openrouter/provider/model")).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: "openrouter/provider/model" });
   });
 
   it("recognizes only exact provider identifiers", () => {

@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, caseEvents, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
-import { eq, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { activityLog, agents, agentWakeupRequests, caseEvents, caseHandoffs, cases, companies, environmentLeases, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { eq, inArray } from "drizzle-orm";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runningProcesses } from "../../adapters/index.js";
 import {
   adapterExecutionControls,
@@ -16,14 +15,14 @@ import { HttpError } from "../../errors.js";
 import { captureException } from "../../sentry.js";
 import { terminateLocalService } from "../local-service-supervisor.js";
 import { createHeartbeatRunState } from "./run-state.js";
-import { createHeartbeatRunPreparation } from "./run-preparation.js";
-import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
-import { createHeartbeatRunControl, type HeartbeatRunControlDependencies } from "./run-control.js";
+import { createHeartbeatRunControl } from "./run-control.js";
 import { preserveCancelledNativeWorkspaces } from "../native-runtime/native-failed-workspace-recovery.js";
 import { createPostgresRunDispatchAdapter } from "../../modules/run-dispatch/adapters/postgres.js";
 import { caseHandoffService } from "../case-handoffs.js";
+import { withQueuedCommentIdsInWakePayload } from "../issue-queued-comment-queue.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
+import { callbacks, runControlPostgresSupport, setupRunControlDatabase } from "./__tests__/run-control-fixtures.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 vi.mock("../adapter-execution-control.js", async (importOriginal) => {
@@ -40,50 +39,6 @@ vi.mock("../local-service-supervisor.js", async (importOriginal) => ({
 }));
 
 type Run = typeof heartbeatRuns.$inferSelect;
-function callbacks(db: Db) {
-  const state = createHeartbeatRunState(db);
-  const lifecycleDependencies = {
-    ...state,
-    ...createHeartbeatRunPreparation(db),
-    issuesSvc: {
-      addComment: vi.fn<HeartbeatLifecycleDependencies["issuesSvc"]["addComment"]>(),
-      listReviewAttention: vi.fn<HeartbeatLifecycleDependencies["issuesSvc"]["listReviewAttention"]>(),
-    },
-    recovery: { escalateStrandedAssignedIssue: vi.fn<HeartbeatLifecycleDependencies["recovery"]["escalateStrandedAssignedIssue"]>() },
-    companySkills: { completeTestRunForIssue: vi.fn<HeartbeatLifecycleDependencies["companySkills"]["completeTestRunForIssue"]>() },
-    budgets: { getInvocationBlock: vi.fn(async () => null) },
-    treeControlSvc: { getActivePauseHoldGate: vi.fn(async () => null) },
-    enqueueWakeup: vi.fn<HeartbeatLifecycleDependencies["enqueueWakeup"]>(),
-    getCurrentUserRedactionOptions: vi.fn(async () => ({})),
-    getAgentInvokability: vi.fn<HeartbeatLifecycleDependencies["getAgentInvokability"]>(async () => ({ invokable: true })),
-    emitTerminalAgentTaskRun: vi.fn<HeartbeatLifecycleDependencies["emitTerminalAgentTaskRun"]>(),
-    budgetHooks: {},
-  } satisfies HeartbeatLifecycleDependencies;
-  const lifecycle = createHeartbeatLifecycle(db, lifecycleDependencies);
-  return {
-    ...state,
-    ...lifecycle,
-    getRun: vi.fn(state.getRun),
-    getAgent: vi.fn(state.getAgent),
-    setRunStatusFromLive: vi.fn(lifecycle.setRunStatusFromLive),
-    setRunStatus: vi.fn(lifecycle.setRunStatus),
-    setWakeupStatus: vi.fn(lifecycle.setWakeupStatus),
-    appendRunEvent: vi.fn(lifecycle.appendRunEvent),
-    finalizeAgentStatus: vi.fn<HeartbeatRunControlDependencies["finalizeAgentStatus"]>(),
-    options: { closeWarmNativeSessionsForRun: vi.fn(async () => ({ closed: 1, busy: 0, failed: 0 })) },
-    envOrchestrator: { releaseForRun: vi.fn<HeartbeatRunControlDependencies["envOrchestrator"]["releaseForRun"]>(async () => ({ released: [], errors: [] })) },
-    enqueueWakeup: lifecycleDependencies.enqueueWakeup,
-    startNextQueuedRunForAgent: vi.fn<HeartbeatRunControlDependencies["startNextQueuedRunForAgent"]>(),
-    sweepPendingCleanupLeases: vi.fn<HeartbeatRunControlDependencies["sweepPendingCleanupLeases"]>(),
-    timerClaimWasFirstHeartbeat: vi.fn<HeartbeatRunControlDependencies["timerClaimWasFirstHeartbeat"]>(() => undefined),
-    wakeQueue: { releaseIssueExecution: vi.fn<HeartbeatRunControlDependencies["wakeQueue"]["releaseIssueExecution"]>(async () => ({ outcome: { kind: "released" }, postCommitEffects: [] })) },
-    applyWakeQueuePostCommitEffects: vi.fn(async () => undefined),
-    getSchedulingSuppression: vi.fn(async () => ({ suppressed: false })),
-    activeRunExecutions: new Set<string>(),
-    processRunCancellationSettlements: new Map<string, { settled: Promise<void>; failed: boolean; error?: unknown }>(),
-    failedProcessRunCancellations: new Map<string, { settled: Promise<void>; failed: boolean; error?: unknown }>(),
-  } satisfies HeartbeatRunControlDependencies;
-}
 function guardedDatabase() {
   const access = vi.fn(() => { throw new Error("Unexpected run-control database access"); });
   return { db: new Proxy({}, { get: access }) as Db, access };
@@ -171,35 +126,9 @@ describe("heartbeat run-control module boundary", () => {
   });
 });
 
-const support = await getEmbeddedPostgresTestSupport();
-if (!support.supported) console.warn(`Skipping run-control database tests: ${support.reason}`);
-describe.skipIf(!support.supported)("heartbeat run-control database wiring", () => {
-  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control database wiring", () => {
   let db: Db;
-  beforeAll(async () => {
-    database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-run-control-module");
-    db = createDb(database.connectionString);
-  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
-  afterAll(async () => {
-    await db?.$client.end();
-    await database?.cleanup();
-  });
-  beforeEach(async () => {
-    vi.mocked(terminateLocalService).mockReset().mockResolvedValue(undefined);
-    await db.execute(sql`truncate table companies restart identity cascade`);
-  });
-  afterEach(() => runningProcesses.clear());
-
-  async function fixture() {
-    const [company] = await db.insert(companies).values({ name: "Run control", issuePrefix: "RC" }).returning();
-    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Controlled agent", adapterType: "codex_local" }).returning();
-    return { company, agent };
-  }
-  async function liveRun(companyId: string, agentId: string) {
-    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() }).returning();
-    runningProcesses.set(run.id, { child: { pid: 424242 } as never, graceSec: 4, processGroupId: 424242 });
-    return run;
-  }
+  const { fixture, liveRun } = setupRunControlDatabase("paperclip-heartbeat-run-control-module", value => { db = value; });
 
   it.each(["queued", "running", "cancelled", "succeeded"] as const)("does not supersede a retry that becomes %s between lookup and the cancellation fence", async status => {
     const { company, agent } = await fixture();
@@ -500,6 +429,43 @@ describe.skipIf(!support.supported)("heartbeat run-control database wiring", () 
       .toMatchObject({ status: "done", phase: "done", completedAt: expect.any(Date) });
   });
 
+  it("keeps pre-Stop input pending until a later user message authorizes one continuation", async () => {
+    const { company, agent } = await fixture();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Retain my direction after Stop",
+      status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const runId = randomUUID(), stoppedAt = new Date();
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
+      nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: stoppedAt, processPid: 2_000_000_000,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId: company.id, issueId: issue.id,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } },
+    }).returning();
+    await db.insert(nativeRunFinalizations).values({ runId, companyId: company.id, issueId: issue.id,
+      phase: "terminal_failure", failureCode: "native_retry_cancelled" });
+    const [earlier] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
+      authorType: "user", authorUserId: "operator", body: "Keep my changed label", createdAt: new Date(stoppedAt.getTime() - 1000) }).returning();
+    const payload = (ids: string[]) => withQueuedCommentIdsInWakePayload({ issueId: issue.id, commentId: ids.at(-1),
+      _paperclipWakeContext: { issueId: issue.id, wakeReason: "issue_commented", wakeCommentId: ids.at(-1), wakeCommentIds: ids } }, ids);
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "on_demand", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "operator", payload: payload([earlier.id]) }).returning();
+    const deps = callbacks(db), control = createHeartbeatRunControl(db, deps);
+    await control.resumeRemoteStopComments(run);
+    expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const [later] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
+      authorType: "user", authorUserId: "operator", body: "Resume the same task", createdAt: new Date(stoppedAt.getTime() + 1000) }).returning();
+    await db.update(agentWakeupRequests).set({ payload: payload([earlier.id, later.id]) }).where(eq(agentWakeupRequests.id, wake.id));
+    await control.resumeRemoteStopComments(run);
+    expect(deps.enqueueWakeup).toHaveBeenCalledExactlyOnceWith(agent.id, expect.objectContaining({ requestedByActorType: "user",
+      requestedByActorId: "operator", queuedCommentRequestId: wake.id,
+      payload: expect.objectContaining({ _paperclipWakeContext: expect.objectContaining({ wakeCommentIds: [earlier.id, later.id] }) }),
+    }), wake.id);
+  });
+
   it.each(["ephemeral", "reuse_by_environment"] as const)("keeps %s cancellation eligible for retention when teardown loses the task lock", async leasePolicy => {
     const { company, agent } = await fixture();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Retain cancelled work",
@@ -704,37 +670,4 @@ describe.skipIf(!support.supported)("heartbeat run-control database wiring", () 
     expect(wakes.map(wake => persisted.find(row => row.id === wake.id)?.status)).toEqual(["cancelled", "cancelled", "claimed", "queued", "queued"]);
   });
 
-  it("rechecks stale budget enforcement before cancelling runs or queued wakes", async () => {
-    const { company, agent } = await fixture();
-    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", runtimeMode: "legacy" }).returning();
-    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "assignment", status: "queued" }).returning();
-    const deps = callbacks(db);
-    await createHeartbeatRunControl(db, deps).cancelBudgetScopeWork({ companyId: company.id, scopeType: "agent", scopeId: agent.id, enforcement: { policyId: randomUUID(), version: 1 } });
-    expect((await deps.getRun(run.id))?.status).toBe("queued");
-    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("queued");
-    expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
-    expect(deps.finalizeAgentStatus).not.toHaveBeenCalled();
-    expect(terminateLocalService).not.toHaveBeenCalled();
-  });
-
-  it("limits project budget cancellation by company, effective project, and admission cutoff", async () => {
-    const { company, agent } = await fixture();
-    const [otherCompany] = await db.insert(companies).values({ name: "Other company", issuePrefix: "OC" }).returning();
-    const [otherAgent] = await db.insert(agents).values({ companyId: otherCompany.id, name: "Other company agent" }).returning();
-    const projectRows = await db.insert(projects).values([
-      { companyId: company.id, name: "Target" }, { companyId: company.id, name: "Override" },
-    ]).returning();
-    const [issue] = await db.insert(issues).values({ companyId: company.id, projectId: projectRows[0].id, title: "Bound task", issueNumber: 1, identifier: "RC-1" }).returning();
-    const old = new Date("2026-01-01T00:00:00Z");
-    const cutoff = new Date("2026-01-02T00:00:00Z");
-    const wakes = await db.insert(agentWakeupRequests).values([
-      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued", createdAt: old, payload: { issueId: issue.id } },
-      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued", createdAt: old, payload: { issueId: issue.id, projectId: projectRows[1].id } },
-      { companyId: company.id, agentId: agent.id, source: "assignment", status: "queued", createdAt: cutoff, payload: { projectId: projectRows[0].id } },
-      { companyId: otherCompany.id, agentId: otherAgent.id, source: "assignment", status: "queued", createdAt: old, payload: { projectId: projectRows[0].id } },
-    ]).returning();
-    await createHeartbeatRunControl(db, callbacks(db)).cancelBudgetScopeWork({ companyId: company.id, scopeType: "project", scopeId: projectRows[0].id, createdBefore: cutoff });
-    const persisted = await db.select().from(agentWakeupRequests);
-    expect(wakes.map(wake => persisted.find(row => row.id === wake.id)?.status)).toEqual(["cancelled", "queued", "queued", "queued"]);
-  });
 });

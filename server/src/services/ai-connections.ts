@@ -1,3 +1,4 @@
+import { notifyLoginSessionChanged } from "./login-cleanup-notifications.js";
 import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
@@ -569,7 +570,7 @@ export function aiConnectionService(db: Db) {
     userId: string,
     input: CreateAiConnection | AiConnectionLoginIntent,
     verifiedCredential: string,
-    sessionId?: string,
+    loginSession?: { id: string; complete?: (tx: Db) => Promise<void> },
     attemptStartedAt = new Date(),
   ) {
     const routing = "routing" in input ? input.routing : undefined;
@@ -610,15 +611,13 @@ export function aiConnectionService(db: Db) {
     const grantId = reconnect?.grant.id ?? randomUUID();
     const persist = () => withAccountHomeSecretMutationLock(undefined, companyId, () => db.transaction(async (tx) => {
       const secrets = secretService(tx);
-      if (sessionId) {
+      if (loginSession) {
         const [session] = await tx
           .select()
           .from(adapterAuthSessions)
           .where(
             and(
-              input.provider === "anthropic"
-                ? eq(adapterAuthSessions.publicSessionId, sessionId)
-                : eq(adapterAuthSessions.id, sessionId),
+              eq(adapterAuthSessions.id, loginSession.id),
               eq(adapterAuthSessions.companyId, companyId),
               eq(adapterAuthSessions.startedByUserId, userId),
             ),
@@ -888,22 +887,19 @@ export function aiConnectionService(db: Db) {
               })),
             );
       }
-      if (sessionId)
+      if (loginSession) await notifyLoginSessionChanged(tx);
+      if (loginSession)
         await tx
           .update(adapterAuthSessions)
           .set({
             connectionId: id,
             connectionGrantId: grantId,
             connectionMethod: input.method,
-            ...(input.provider === "anthropic"
-              ? { status: "stored" as const }
-              : {}),
           })
           .where(
-            input.provider === "anthropic"
-              ? eq(adapterAuthSessions.publicSessionId, sessionId)
-              : eq(adapterAuthSessions.id, sessionId),
+            eq(adapterAuthSessions.id, loginSession.id),
           );
+      await loginSession?.complete?.(tx as unknown as Db);
       await logActivity(tx as unknown as Db, {
         companyId,
         actorType: "user",

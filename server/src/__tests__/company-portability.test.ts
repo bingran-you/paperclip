@@ -6106,7 +6106,7 @@ describe("company portability", () => {
     expect(() => resolvePaperclipRunnerProviderProfile(createdConfig)).toThrow(expect.objectContaining({ code: "paperclip_runner_dot_config_invalid" }));
   });
 
-  it("rejects runner imports while disabled and accepts the same selection when enabled", async () => {
+  it("accepts native OpenCode imports without the experimental flag", async () => {
     const portability = companyPortabilityService({} as any);
     const exported = await portability.exportBundle("company-1", {
       include: { company: false, agents: true, projects: false, issues: false },
@@ -6134,11 +6134,11 @@ describe("company portability", () => {
       },
     };
 
-    await expect(portability.importBundle(request, "user-1")).rejects.toMatchObject({
-      status: 422,
-      details: { code: "paperclip_runner_rollout_disabled" },
-    });
-    expect(agentSvc.create).not.toHaveBeenCalled();
+    await portability.importBundle(request, "user-1");
+    expect(agentSvc.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      adapterType: "paperclip_runner",
+      adapterConfig: expect.objectContaining({ provider: "opencode" }),
+    }), { createdByUserId: "user-1" });
 
     instanceSettingsSvc.getExperimental.mockResolvedValue({ enableNativeRunner: true });
     await portability.importBundle({

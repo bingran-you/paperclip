@@ -97,7 +97,12 @@ makes an earlier ordinary question historical, without answering, cancelling,
 or accepting it. Agent-authored, run-attributed, derived-agent, and untrusted
 comments do not establish that direction. The server uses the same question
 classification in task context, completion feedback, governed waits, and native
-status finalization. Browser dismissal remains a local presentation preference.
+status finalization. Human dismissal is persisted on saved interactions.
+Dismissed ordinary confirmations, completion reviews, choices, suggested tasks,
+and item verdicts also cease to gate completion. They remain pending until
+explicitly decided or expired by task completion. Dismissal never authorizes a
+tool, secret, connection, document approval, company-enforced restriction, or
+configured review stage; agents retain those gates without repeating reminders.
 
 A historical question stays in the feed and remains answerable after completion.
 A later authorized human answer updates history without reopening or resuming
@@ -152,6 +157,13 @@ Monitor replies inherit a conversation only through an admitted monitor wake
 and the matching server-issued scheduling receipt on the source run. Company,
 task, agent, requester, schedule identity, and current delivery authorization
 remain enforced. Provider-supplied source IDs do not establish that lineage.
+
+An accepted same-agent continuation retains the same presentation contract.
+Its successor inherits conversation provenance only through the applied status
+decision, delivered continuation effect, and admitted wake that name the same
+company, task, agent, and requester. Dispatch still checks current endpoint,
+principal, and resource authorization. These receipts do not grant execution
+or override Stop.
 
 A successful Slack turn with a published final reply and no remaining execution
 or decision path settles to `chat_conversations.state = waiting` and issue
@@ -509,9 +521,13 @@ of the invalid call. Unauthorized tools still receive a generic rejection, and
 corrected calls retain the same permission and approval checks.
 
 A native provider may omit `continuation` (or send `null`) when it reports
-`yielded` after saving a monitor. The controller reads current authorized task
-context and fills the canonical `monitor` continuation only if that same task,
-run, assignee, work mode, and monitor remain eligible. Completion admission
+`yielded` after saving a monitor or requesting repository preparation. The controller reads current authorized task
+context and fills the canonical continuation only if that same task,
+run, assignee, and work mode remain eligible. An eligible monitor takes precedence.
+A pending repository requested by that task in its current workspace offers
+`same_agent`; the existing status arbiter and wake queue own the next admission.
+Prepared repositories and requests belonging to another task cannot offer it.
+An explicit `done` result does not acquire a continuation. Completion admission
 checks that persisted monitor again. This default does not create or renew a
 schedule. A consumed, cleared, exhausted, or ineligible monitor cannot authorize
 a passive wait. An explicit `response_wake` still identifies a real response
@@ -573,7 +589,7 @@ A board comment can be an interrupt, an ownership change, both, or neither. Pape
 
 An interrupt stops the current live execution path for the issue. It does not, by itself, select the next owner. If an active run is interrupted by the board, the run may still terminate with the underlying `cancelled` status, but the issue activity and wake context should make the operator intent visible as an interruption rather than an unexplained runtime failure.
 
-For legacy runners, **Interrupt** on a queued message stops the active run and explicitly continues the pending queue after execution cleanup. It validates the queue revision and target run, then dispatches the requested queue’s current message bodies in their saved order. Other actors’ queues cannot consume that interrupt. The persisted interrupt intent is retried by the scheduler after a promotion error or server restart until that queue is dispatched or discarded. Edits and discards remain authoritative until dispatch; deleting the final message must not create an empty continuation. Pending messages remain visible after a run stops. Cancelling only the run preserves the queue for a later explicit wake; pausing the task retains its separate queue-cancellation behavior. Native same-turn steering keeps its separate acknowledgement protocol. Legacy Codex uses Ctrl-C to stop its tool sessions and cannot retry a missing-session fallback after the provider has confirmed that the session started.
+For legacy runners, **Interrupt** on a queued message stops the active run and explicitly continues the pending queue after execution cleanup. It validates the queue revision and target run, then dispatches the requested queue’s current message bodies in their saved order. Other actors’ queues cannot consume that interrupt. The persisted interrupt intent is retried by the scheduler after a promotion error or server restart until that queue is dispatched or discarded. Edits and discards remain authoritative until dispatch; deleting the final message must not create an empty continuation. Pending messages remain visible after a run stops. Cancelling only the run preserves the queue for a later explicit wake; pausing the task retains its separate queue-cancellation behavior. Native same-turn steering keeps its separate acknowledgement protocol. After an acknowledged native Stop, a follow-up saved before the stopped run finished remains pending. It cannot authorize an automatic new turn. A later user message can authorize one continuation that retains the earlier undelivered input. Closing the stopped execution coordinator also wakes the existing accounting worker in the same transaction. Complete usage can settle once; missing or partial receipts retain their accounting hold. Legacy Codex uses Ctrl-C to stop its tool sessions and cannot retry a missing-session fallback after the provider has confirmed that the session started.
 
 An ownership change selects who owns the issue after the comment is committed:
 

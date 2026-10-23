@@ -179,6 +179,28 @@ describe("TaskSidePanel", () => {
     );
   }
 
+  it("keeps the upload slot mounted and inert when switching away from Artifacts", async () => {
+    await render(panel({ streamlinedTabs: true, artifactsOpenRequestId: 1 }));
+    const slot = container.querySelector<HTMLElement>("[data-artifact-upload-slot]");
+    expect(slot).not.toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-artifacts")?.click());
+    expect(slot?.getAttribute("aria-hidden")).toBe("false");
+    expect(slot?.hasAttribute("inert")).toBe(false);
+    expect(slot?.className).not.toContain("invisible");
+
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-properties")?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBe(slot);
+    expect(slot?.getAttribute("aria-hidden")).toBe("true");
+    expect(slot?.hasAttribute("inert")).toBe(true);
+    expect(slot?.className).toContain("invisible");
+
+    await act(async () => container.querySelector<HTMLButtonElement>("#side-panel-tab-artifacts")?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBe(slot);
+    expect(slot?.hasAttribute("inert")).toBe(false);
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close Artifacts"]')?.click());
+    expect(container.querySelector("[data-artifact-upload-slot]")).toBeNull();
+  });
+
   it("opens, deduplicates, switches and closes text attachment tabs", async () => {
     const onAttachmentOpened = vi.fn();
     await render(panel({ openAttachment: { id: "file-1", title: "AGENTS.md", requestId: 1 }, onAttachmentOpened }));

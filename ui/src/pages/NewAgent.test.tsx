@@ -1022,6 +1022,78 @@ describe("New agent setup", () => {
       expect(secrets.create).toHaveBeenCalledTimes(1);
     },
   );
+  it("resumes an empty native Pi draft with account selection and exact thinking controls", async () => {
+    const id = "00000000-0000-4000-8000-000000000093";
+    settings.getExperimental.mockResolvedValue({ enableNativeRunner: false });
+    state.params = new URLSearchParams({ name: "Pi", adapterType: "pi_local", setupAgentId: id });
+    state.adapters = state.adapters.map((adapter: any) => adapter.type === "pi_local"
+      ? { ...adapter, supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" } : adapter);
+    api.get.mockResolvedValue({ id, companyId: "company-1", name: "Pi", adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "", piThinkingLevel: "max" }, runtimeConfig: {}, pauseReason: "setup", status: "paused" });
+    await renderCurrentParams();
+    await settle();
+    expect(container.querySelector('[role="combobox"][aria-label="Connection"]')).not.toBeNull();
+    expect((container.querySelector('[aria-label="Model"]') as HTMLInputElement).value).toBe("");
+    const thinking = container.querySelector('[aria-label="Thinking effort"]') as HTMLSelectElement;
+    expect(thinking.value).toBe("max");
+    expect([...thinking.options].map(option => option.value)).toEqual(["", "off", "low", "high", "max"]);
+    expect(container.querySelector('[aria-label="OPENROUTER_API_KEY"]')).toBeNull();
+  });
+
+  it.each(["auto", "legacy"] as const)("keeps OpenCode %s selection consistent between testing and hiring", async runner => {
+    settings.getExperimental.mockResolvedValue({ enableNativeRunner: false });
+    state.adapters = state.adapters.map((adapter: any) => adapter.type === "opencode_local"
+      ? { ...adapter, supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" } : adapter);
+    await render("opencode_local");
+    const model = "openrouter/anthropic/claude-sonnet-4.6";
+    await fill("Model", model);
+    const select = container.querySelector<HTMLButtonElement>('[aria-label="Runner"]')!;
+    expect(select.textContent).toContain("Paperclip Runner");
+    if (runner === "legacy") {
+      await act(async () => select.click());
+      await act(async () => document.querySelector<HTMLButtonElement>('[role="option"][data-value="legacy"]')!.click());
+    }
+    await click("Run test");
+    await click("Finish setup");
+    expect(api.testEnvironment).toHaveBeenCalledWith("company-1", "opencode_local", expect.objectContaining({ adapterConfig: expect.objectContaining({ model }), ...(runner === "legacy" ? { runner } : {}) }));
+    expect(api.hire).toHaveBeenCalledWith("company-1", expect.objectContaining({ adapterType: "opencode_local", adapterConfig: expect.objectContaining({ model }), ...(runner === "legacy" ? { runner } : {}) }));
+    if (runner === "auto") expect(api.hire.mock.calls[0][1]).not.toHaveProperty("runner");
+  });
+
+  it("retains automatic OpenCode selection while the first draft request is in flight", async () => {
+    let release!: () => void;
+    const originalCreate = api.create.getMockImplementation()!;
+    api.create.mockImplementation(async (...args) => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return originalCreate(...args);
+    });
+    await render("opencode_local");
+    const url = state.navigate.mock.calls[0][0] as string;
+    state.params = new URLSearchParams(url.split("?")[1]);
+    expect(state.params.get("runner")).toBe("auto");
+    await renderCurrentParams();
+    expect(api.create).toHaveBeenCalledOnce();
+    await act(async () => release());
+    await settle();
+    expect(api.create.mock.calls[0][1].runner).toBe("auto");
+    expect(api.create).toHaveBeenCalledOnce();
+  });
+
+  it.each(["opencode_local", "paperclip_runner"])("resumes OpenCode's saved %s setup after a default change", async adapterType => {
+    const id = "00000000-0000-4000-8000-000000000092";
+    state.params = new URLSearchParams({ name: "OpenCode", adapterType: "opencode_local", setupAgentId: id });
+    state.adapters = state.adapters.map((adapter: any) => adapter.type === "opencode_local"
+      ? { ...adapter, supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" } : adapter);
+    const savedPolicy = adapterType === "paperclip_runner"
+      ? { provider: "opencode", opencodePermissionMode: "ask", lifecycleMode: "persistent", idleTimeoutMs: 30000 }
+      : { command: "custom-opencode", dangerouslySkipPermissions: false };
+    api.get.mockResolvedValue({ id, companyId: "company-1", name: "OpenCode", adapterType, adapterConfig: { ...savedPolicy, model: "openrouter/anthropic/claude-sonnet-4.6" }, runtimeConfig: {}, pauseReason: "setup", status: "paused" });
+    await renderCurrentParams();
+    await settle();
+    await click("Finish setup");
+    expect(api.hire.mock.calls[0][1].runner).toBe(adapterType === "paperclip_runner" ? "paperclip" : "legacy");
+    expect(api.hire.mock.calls[0][1]).toMatchObject({ adapterType, adapterConfig: savedPolicy });
+  });
+
   it("connects OpenRouter before testing and hiring OpenCode without copying credentials into the agent", async () => {
     await render("opencode_local");
     const model = "openrouter/anthropic/claude-sonnet-4.6";

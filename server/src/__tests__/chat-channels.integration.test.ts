@@ -2564,6 +2564,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run.id };
       return { ...f, conversation, run, session };
     }
+    it("keeps GitHub response ownership checks independent of large run payloads", async () => {
+      const f = await toolReplyFixture();
+      const responses = githubResponseCommentService(db, f.providerFetch);
+      const input = { ...f.session, issueId: f.conversation.issueId!, endpointId: f.endpoint.id };
+      expect(await responses.hasWorkingResponseForRun(input)).toBe(true);
+      const unused = "unused-run-payload".repeat(32_768);
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: { ...f.run.contextSnapshot, prompt: unused, nativeExecutionInput: { prompt: unused } },
+        runnerProfileJson: { unused }, resultJson: { unused }, stdoutExcerpt: unused,
+      }).where(eq(heartbeatRuns.id, f.run.id));
+      expect(await responses.hasWorkingResponseForRun(input)).toBe(true);
+      await expect(responses.hasWorkingResponseForRun({ ...input, companyId: randomUUID() }))
+        .rejects.toMatchObject({ status: 403 });
+      await expect(responses.hasWorkingResponseForRun({ ...input, issueId: randomUUID() }))
+        .rejects.toMatchObject({ status: 403 });
+    });
+
     async function publicationRetryFixture() {
       const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
       const head = "b".repeat(40);
@@ -72351,7 +72368,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           status: "running",
           contextSnapshot: {},
         });
-        const runsBefore = await readHeartbeatRunsByCompanyId(lane.fixture.companyId);
+        const runsBefore = (await readHeartbeatRunsByCompanyId(lane.fixture.companyId))
+          .toSorted((a, b) => a.id.localeCompare(b.id));
         let stoppedId = 0;
         lane.setHook(async (method, body) => {
           if (method.endsWith("Draft") && !stoppedId) {
@@ -72380,7 +72398,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(issueComments.id, publication!.commentId!));
         expect(comment!.body).toContain("END-first-stopped");
         expect(
-          await readHeartbeatRunsByCompanyId(lane.fixture.companyId),
+          (await readHeartbeatRunsByCompanyId(lane.fixture.companyId))
+            .toSorted((a, b) => a.id.localeCompare(b.id)),
         ).toEqual(runsBefore);
         expect(lane.context.cancelRun).not.toHaveBeenCalled();
         expect(

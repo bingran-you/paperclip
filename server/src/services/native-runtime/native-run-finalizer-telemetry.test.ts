@@ -62,6 +62,7 @@ import { waitForPendingRunFailureReports } from "../run-failure-report.js";
 import { deliverExecutionStatuses } from "../execution-status-delivery.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION, type NativeStatusDecision } from "./status-arbiter.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -945,6 +946,26 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     );
     expect(alreadyEmittedByCommittedDecision).toBe(true);
     expect(agentTaskRunCalls(callsBefore)).toHaveLength(1);
+  });
+
+  it("signals durable accounting when native commitment or permanent failure makes a receipt actionable", async () => {
+    const settled = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.accounting, settled);
+    try {
+      const committed = await seedNativeRun();
+      await driveToCompleteResult(committed);
+      const beforeCommit = settled.mock.calls.length;
+      await finalizeNativeRun({ db, runId: committed.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, committed.runId)))[0].phase).toBe("committed");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, committed.runId)))[0].status).toBe("succeeded");
+      expect(settled.mock.calls.length).toBeGreaterThan(beforeCommit);
+      const failed = await seedNativeRun();
+      await driveToCompleteResult(failed);
+      const beforeFailure = settled.mock.calls.length;
+      await recordNativeFinalizationFailure({ db, runId: failed.runId, error: new Error("native_fixture_permanent_failure"), permanent: true });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, failed.runId)))[0].phase).toBe("terminal_failure");
+      expect(settled.mock.calls.length).toBeGreaterThan(beforeFailure);
+    } finally { unsubscribe(); }
   });
 });
 

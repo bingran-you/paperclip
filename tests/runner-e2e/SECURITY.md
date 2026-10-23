@@ -415,3 +415,17 @@ limits, case/task state and correlated receipt checks enter workflow evidence.
 Two passive seed cases support browser list assertions; screenshots remain on
 the exact primary case/task routes and document dialogs preserve that case URL.
 The public screenshot allowlist is unchanged.
+
+
+## Configured repository and conversion proof
+
+The repository proof flow seeds only the exact `workspace` child of its resolved
+fixture-owned temporary directory. It initializes that disposable Git checkout
+with a fresh random reference. It never modifies a contributor checkout. Provider
+credentials remain encrypted fixture secret references. Retention evidence keeps
+a digest of allowlisted configuration fields rather than raw environment values.
+The public API performs legacy conversion; no database mutation or private
+Runner hook performs it. Only synthetic source bytes and proof JSON enter the
+existing private attempt evidence and registered-artifact verification pipeline.
+A failed attempt remains retained. These development checks are not staging or
+Slack qualification, and they do not publish trusted archives or credentials.

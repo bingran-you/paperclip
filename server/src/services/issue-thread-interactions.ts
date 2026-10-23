@@ -1,6 +1,6 @@
 import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
-import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
+import { historicalQuestionCondition } from "./issue-question-context.js";
 import {
   currentContinuationOrigins,
   deliveredContinuationCommentIds,
@@ -4803,7 +4803,7 @@ export function issueThreadInteractionService(
             eq(issueThreadInteractions.status, "pending"),
             // Completed work retains ordinary historical questions for later
             // human answers. Cancellation and governed requests still expire.
-            issue.status === "done" ? activeIssueInteractionCondition() : undefined,
+            issue.status === "done" ? sql`not ${historicalQuestionCondition()}` : undefined,
           ),
         );
       if (rows.length === 0) return [];
@@ -5098,6 +5098,49 @@ export function issueThreadInteractionService(
       const answered = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, answered);
       return answered;
+    },
+
+    dismissInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      actor: InteractionActor,
+    ) => {
+      if (!actor.userId || actor.agentId || actor.runId || actor.systemId) {
+        throw forbidden("Only a human can dismiss a request");
+      }
+      return db.transaction(async (tx) => {
+        // Use the same lock order as resolution and completion. Dismissal only
+        // changes attention state; it never resolves or executes the request.
+        const [task] = await tx.select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          executionRunId: issues.executionRunId,
+          workMode: issues.workMode,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          reviewPolicy: issues.reviewPolicy,
+          createdByAgentId: issues.createdByAgentId,
+          createdByUserId: issues.createdByUserId,
+        }).from(issues)
+          .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
+        if (!task) throw interactionNotFoundError();
+        const [current] = await tx.select().from(issueThreadInteractions).where(and(
+          eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+        )).for("update");
+        if (!current) throw interactionNotFoundError();
+        assertInteractionResolutionAllowed(current, actor);
+        if (current.status !== "pending" || current.dismissedAt) return hydrateInteraction(current);
+        if (task.status === "in_review" && isRequestConfirmationLikeKind(current.kind)) {
+          await assertRequestConfirmationResolutionAllowedUnderLock(tx as unknown as Db, task, current, actor);
+        }
+        const now = new Date();
+        const [updated] = await tx.update(issueThreadInteractions)
+          .set({ dismissedAt: now, dismissedByUserId: actor.userId, updatedAt: now })
+          .where(eq(issueThreadInteractions.id, interactionId)).returning();
+        return hydrateInteraction(updated!);
+      });
     },
 
     skipInteraction: async (

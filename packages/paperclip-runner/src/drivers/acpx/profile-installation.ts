@@ -65,3 +65,8 @@ export async function probeAcpxCursorInstallation(model: string): Promise<void> 
   const installation = await verifyAcpxProfileInstallation(resolveQualifiedAcpxProfile("cursor", model));
   await (await installation.openCommand()).close();
 }
+
+export async function probeAcpxPiInstallation(model: string): Promise<void> {
+  const installation = await verifyAcpxProfileInstallation(resolveQualifiedAcpxProfile("pi", model));
+  await (await installation.openCommand()).close();
+}

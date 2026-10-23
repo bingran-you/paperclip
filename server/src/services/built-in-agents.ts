@@ -1762,7 +1762,7 @@ export function builtInAgentService(db: Db) {
         const adapterConfig = resolvedInput.adapterConfig ?? existing.adapterConfig;
         assertAdapterAllowed(definition, adapterType, adapterConfig);
         const selectedHarness = agentHarnessType(adapterType, adapterConfig);
-        const sameQualifiedHarness = ["codex_local", "claude_local"].includes(selectedHarness)
+        const sameQualifiedHarness = ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(selectedHarness)
           && agentHarnessType(existing.adapterType, existing.adapterConfig) === selectedHarness;
         const runner = resolvedInput.runner ?? (sameQualifiedHarness && existing.metadata?.paperclipBuiltInSetupRequired !== true
           ? agentRunner(existing.adapterType) : undefined);

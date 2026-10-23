@@ -7,7 +7,7 @@ import { withAccountingReadSnapshot, withAccountingTransaction } from "./account
 import { receiptFingerprint } from "./receipt-fingerprint.js";
 import { logActivity } from "./activity-log.js";
 import { updateMonthlySpendProjections } from "./costs.js";
-import { budgetServiceInTransaction, deliverBudgetEnforcement, type BudgetServiceHooks } from "./budgets.js";
+import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.js";
 
 async function invoiceCostCandidates(tx: Db, companyId: string, biller: string, line: {
   costEventId?: string | null; runId?: string | null; providerRequestId?: string | null; model?: string | null;
@@ -180,7 +180,6 @@ export function billingReconciliationService(db: Db, hooks: BudgetServiceHooks =
           details: { adjustmentId: adjustment.id, previousCents: input.expectedCents, correctedCents: input.correctedCents, reason: input.reason, pricing: input.pricing } }, publications);
         return adjustment;
       });
-      await deliverBudgetEnforcement(db, hooks, companyId);
       return result;
     },
   };

@@ -1121,3 +1121,12 @@ identity references. Budget reservations have a distinct classifier invocation
 source, and cost events accept `prompt_injection`. Unknown charges retain their
 holds through agent deletion attempts and settle through billing correction.
 See [service behavior](prompt-injection-prevention.md).
+
+### Deferred conversation requests
+
+`issue_thread_interactions.dismissed_at` and `dismissed_by_user_id` record a
+human's decision to leave a pending request in history. They are independent of
+`status`, `result`, and `resolved_at`: dismissal is neither an answer nor approval.
+The board-only dismissal path locks the task then interaction, checks audience,
+and never enqueues a continuation. Ordinary deferred requests are excluded from
+completion arbitration; protected authorization gates remain active.

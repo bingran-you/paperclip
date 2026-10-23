@@ -85,6 +85,15 @@ describe("workspace provider SDK", () => {
       }),
     ).toThrow();
   });
+  it("expresses fresh outcomes without imposing Git storage layout", () => {
+    const fresh = { attemptId: id(6), sourceRunId: id(7), previousWorkspaceId: id(8),
+      recoverySnapshots: [{ operationId: id(9), sourceRunId: id(7),
+        archive: { path: "/controller/recovery/archive.tar", sha256: "a".repeat(64), byteSize: 1024 },
+        manifest: { path: "/controller/recovery/manifest.jsonl", sha256: "b".repeat(64), byteSize: 128 } }] };
+    expect(workspaceProviderOperationSchema.parse({ ...params.operation, fresh })).toMatchObject({ fresh });
+    expect(() => workspaceProviderOperationSchema.parse({ ...params.operation, fresh: { ...fresh, independentGitStorage: true } })).toThrow();
+    expect(() => workspaceProviderOperationSchema.parse({ ...params.operation, fresh: { ...fresh, recoverySnapshots: [{ ...fresh.recoverySnapshots[0], archive: { ...fresh.recoverySnapshots[0].archive, sha256: "invalid" } }] } })).toThrow();
+  });
   it("requires project lifecycle and storage management as one contract", () => {
     const manifest = {
       id: "test.storage",
@@ -103,6 +112,13 @@ describe("workspace provider SDK", () => {
       resourceLifecycle: ["project"],
     };
     expect(pluginManifestV1Schema.safeParse(manifest).success).toBe(true);
+    const withDefault = { ...manifest, workspaceProvider: { ...manifest.workspaceProvider,
+      defaultForProjects: { mode: "isolated_workspace", strategy: "git_worktree" } } };
+    expect(pluginManifestV1Schema.parse(withDefault).workspaceProvider?.defaultForProjects).toEqual({
+      mode: "isolated_workspace", strategy: "git_worktree",
+    });
+    expect(pluginManifestV1Schema.safeParse({ ...withDefault, workspaceProvider: { ...withDefault.workspaceProvider,
+      defaultForProjects: { mode: "shared_workspace", strategy: "git_worktree" } } }).success).toBe(false);
     expect(
       pluginManifestV1Schema.safeParse({
         ...manifest,

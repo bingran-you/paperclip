@@ -110,9 +110,9 @@ most one primary ordinary task per case and one primary case per task. Handoffs
 reuse that task, update its assignee through normal task policy, and store a free
 text phase separately from case/task status. They do not satisfy review gates.
 
-Native `create_case` requires `kickoff` and `workflow_document_text`, delegating
-to ordinary case handoff acceptance. New-case API handoffs also require workflow
-text. It is saved verbatim as ordinary task document key `workflow`, title
+Native `create_case` requires `kickoff` and exactly one of `workflowId` or
+`workflow_document_text`, delegating to ordinary case handoff acceptance.
+New-case API handoffs accept the same choice. The selected prompt is saved verbatim as ordinary task document key `workflow`, title
 `Workflow`, format `markdown`. Missing or blank text is rejected before mutation.
 Top-level `initialDocuments` belongs to first-task kickoff: normalized, unique
 task document keys, at most 20 additional documents and 200,000 total body
@@ -126,8 +126,8 @@ tools are retired; case detail and execution context roll up authorized task
 document references, omitting bodies and system keys. Historical case document
 storage and REST reads remain compatible.
 
-Starting the first new task of an existing passive case also requires workflow
-text. New-case binding may create `workflow` on the bound task with ordinary task
+Starting the first new task of an existing passive case also requires a workflow
+ID or inline workflow text. New-case binding may create `workflow` on the bound task with ordinary task
 mutation authority and create-only revision semantics; an existing key conflicts
 atomically. Later handoffs of an existing primary task omit workflow text and
 revise it through ordinary task document tools. Existing stored cases are not
@@ -138,6 +138,37 @@ defining each transition's trigger, evidence, destination agent, human wait/resu
 rules, and correction/escalation limits. State IDs match phases and named edge
 outcomes are defined in prose. No graph parser, guard interpreter or new workflow
 execution service is added.
+
+Reusable `workflows` are company-scoped definitions with a name, Markdown prompt,
+and ordinary attribution/timestamps. Cases hold an optional `workflowId`; their
+case type, facts, status and free-text phase remain independent. There are no
+workflow versions, workflow runs, state graphs, or role bindings. The task's
+`workflow` document is the effective procedure and owns its revision history.
+Editing a shared definition affects future adoptions only.
+
+Agent handoffs omit `workflowId` to preserve the relationship and document,
+supply an ID to adopt the latest prompt (including the current ID to refresh),
+or supply null to detach while retaining instructions. Acceptance snapshots the
+selected prompt, previous/next workflow IDs, names and phases, and the document's
+base revision. Transfer applies the relationship, phase and effective document
+revision in one transaction after outgoing execution settles. Intervening
+changes to the workflow document hold adoption with the existing revision
+conflict; cancel and submit new intent after reading current state. Cancelled,
+unapplied intent changes neither instructions nor workflow routing. Applied
+retries never create another document revision. Generic case updates cannot
+change workflow routing. Historical handoffs remain readable without inferred
+workflow assignments, and repeated visits are distinct handoffs. Captured names
+survive renames. Terminal completion semantics are unchanged.
+
+Company list/create and individual read/update workflow endpoints, plus native
+`list_workflows`, `read_workflow`, `create_workflow` and `update_workflow`, share
+`experimental.enableCases`. Lists and mutation receipts return metadata; prompt
+reads are on demand, using bounded native API JSON text pages. The existing
+company authorization, source-trust and run mutation fences apply. Definitions
+are company-shared; no case document is automatically published into them.
+Existing case pages and Audit show current and captured workflow names/phases,
+distinguishing pending intent from applied transitions. Authoring is API/agent
+first; there is no workflow editor or deletion lifecycle.
 
 `case_handoffs` is a durable, principal-idempotent intent/delivery ledger.
 Acceptance atomically stores the comment, links, observed revisions, audit, and
@@ -1308,6 +1339,16 @@ Invites tab does not hide this Cloud action.
 
 ## 10.3 Agents
 
+The Harness / Runtime configuration page offers **Upgrade runner** for existing
+legacy Claude and Codex agents when the target environment selects Paperclip
+Runner by default. The action uses the normal authorized agent PATCH with
+`runner: "paperclip"`, includes pending configuration edits, and retains the
+model and compatible settings. A rejected conversion leaves saved configuration
+unchanged and identifies unsupported fields. Successful conversion records a
+configuration revision, clears incompatible session state, and preserves agent
+identity, instruction files, credentials, run policy, and run history. Existing
+agents never upgrade merely by visiting or saving unrelated configuration.
+
 The Core setup wizard creates its agent record when the user submits the agent
 name, before adapter selection, authentication, and runtime configuration.
 Until the adapter is chosen, the held record uses a provisional adapter
@@ -1649,6 +1690,22 @@ Scheduler must skip invocation when:
 - an existing run is active
 - hard budget limit has been hit
 
+Budget admission and accounting serialize under the company accounting lock.
+The dispatch boundary rechecks current company, agent, and project policies and
+reserves capacity before paid work starts. Accounting commits budget blocks and
+durable stop intent without waiting for provider shutdown or reconciling unrelated
+agents. An asynchronous worker cancels only work in the affected scope; committed
+stop intent survives policy changes and restart until existing stop proof succeeds.
+
+Accepted cumulative per-run usage checkpoints contribute observed running spend
+before the final ledger charge. Admission counts each unfinished operation's
+maximum of its reservation and observed spend; hard stops count actual ledger
+and observed running spend, rather than reservation estimates. Final settlement
+atomically replaces the observation with the ledger charge. Incomplete or unknown
+accounting remains conservative. Mid-run enforcement depends on provider usage
+reports or existing supported pricing; providers reporting only at completion
+cannot offer exact mid-call spend detection.
+
 Legacy execution records a renewable controller lease when claiming a queued run,
 before provisioning. A live lease protects the run during overlapping service
 deployments. An expired controller loses dispatch authority; a recovery worker
@@ -1829,24 +1886,27 @@ Required UX behaviors:
 - conflict toasts on atomic checkout failure
 - no silent background failures; every failed run visible in UI
 
-Regular task chats and Agent Chat keep unanswered questions as compact,
-reopenable entries at their original position in the feed. Dismissing a question
-or sending a newer message clears its form from the composer without resolving
-the saved question. Questions do not contribute to composer pending counts.
-Dismissal persists locally for the person and task across reloads; reopening
-restores the original form and draft. Approval and permission gates are unchanged.
+Regular task chats and Agent Chat keep requests as compact, reopenable entries
+at their original position in the feed. Dismissing any composer request clears
+its form and pending reminder, including completion reviews, confirmations,
+checkbox choices, suggested tasks, item verdicts, and runtime requests. Saved
+interactions persist `dismissedAt` and `dismissedByUserId` through a board-only,
+company-scoped endpoint with task-access, resolver-audience, and current review-policy
+checks and an activity record. Review policy is checked under the task-row lock.
+Dismissal never creates an answer, decision, execution, or continuation wake.
+Raw runtime requests retain browser-local dismissal; reopening restores the
+original request and draft. A failed save leaves the request open with an error.
 
-A saved ordinary question becomes historical when a newer human task message
-moves it out of the current composer. Agent context, completion feedback, and
-native finalization apply the same rule. The historical question remains pending
-and answerable, including after completion; a later human answer records history
-without reopening the task or waking its agent. Its presence alone does not
-request another answer or prevent completion. Cancellation still expires pending
-questions. Agents continue work that does not need the missing input and withdraw
-obsolete questions when later evidence satisfies them. A real current input
-blocker must identify what is still needed. Approval, permission, connection,
-and configured review gates remain active. No server-side UI dismissal record
-is required.
+A saved ordinary question becomes historical after a newer human task message
+or explicit human dismissal. It remains answerable after completion without
+reopening work or waking the agent. Dismissed ordinary requests, including native
+completion reviews, no longer gate task completion; completion expires their
+non-question cards through the existing lifecycle. Cancellation still expires
+all pending requests. Agents must not repeat reminders for dismissed requests.
+Tool actions, secret proposals, connection authorization, company-enforced
+resolver restrictions, document/plan approvals, and separately configured review
+stages retain their authority gates. Dismissal does not authorize their actions;
+agents continue independent work without repeating the deferred request.
 
 ## 15. Operational Requirements
 

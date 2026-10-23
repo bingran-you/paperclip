@@ -453,6 +453,45 @@
       "evidenceLimit": "Live proof covers anonymous MCP initialize/discovery and one narrow public React documentation lookup through Paperclip's actual Apps connection and Test dialog, including a successful repeat after reload. It does not prove elevated API-key rate limits, private-repository access, or any non-public provider content."
     },
     {
+      "app": "ditto",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "openid",
+        "profile",
+        "email",
+        "offline_access"
+      ],
+      "capability": "write",
+      "supportedActions": "Read style guide rules and check text against them; search, create, update, translate and permanently delete text items; create, update, translate and publish library components and link or unlink text items to them (linking replaces a text item's developer ID); link synced Figma text nodes; manage component folders, projects, project blocks, variables, variants, style guides and style guide rules; read statuses and workspace tags. The connection acts as the Ditto user who signs in.",
+      "evidence": [
+        "https://developer.dittowords.com/guides/connect-the-mcp",
+        "https://developer.dittowords.com/mcp-reference/tools",
+        "https://api.dittowords.com/.well-known/oauth-protected-resource",
+        "https://login.dittowords.com/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-10",
+      "liveProof": "not-run"
+    },
+    {
+      "app": "ditto",
+      "method": "mcp-api-key",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "provider-controlled",
+      "supportedActions": "Read style guide rules and check text against them; search, create, update, translate and permanently delete text items; create, update, translate and publish library components and link or unlink text items to them (linking replaces a text item's developer ID); link synced Figma text nodes; manage component folders, projects, project blocks, variables, variants, style guides and style guide rules; read statuses and workspace tags.",
+      "evidence": [
+        "https://developer.dittowords.com/guides/connect-the-mcp",
+        "https://developer.dittowords.com/mcp-reference/tools",
+        "https://developer.dittowords.com/api-reference/authentication"
+      ],
+      "reviewedAt": "2026-10-10",
+      "liveProof": "not-run",
+      "keyPermissions": "Ditto API keys are not scoped: a key reaches all data in its workspace, including permanent deletes, and actions are attributed to the user who created the key. Create a separate key for Paperclip so it can be removed independently, and set delete and link actions to Ask first before agents run unattended. Paperclip cannot narrow an existing key."
+    },
+    {
       "app": "egnyte",
       "method": "mcp-oauth",
       "auth": "oauth",
@@ -2746,6 +2785,118 @@
       "reviewedAt": "2026-10-15",
       "liveProof": "not-run",
       "keyPermissions": "Create an organization key with the read, write, and delete permissions for the resources you intend to manage. Daytona toolbox access is available to every valid organization key, even without selected scopes. Some user or administration endpoints require provider user authentication and will reject an API key."
+    },
+    {
+      "app": "paperclip-notebook",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "notebook:read",
+        "notebook:write",
+        "notebook:share",
+        "notebook:delete"
+      ],
+      "capability": "write",
+      "supportedActions": "Read available pages; create and update owned pages; change sharing including public discovery; manage versions; delete and restore owned pages.",
+      "evidence": [
+        "doc/connections/PAPERCLIP-NOTEBOOK.md"
+      ],
+      "reviewedAt": "2026-10-20",
+      "liveProof": "not-run",
+      "evidenceLimit": "First-party implementation contract; canonical service availability and live OAuth qualification are deployment prerequisites. Uses the existing personal OAuth flow with default connection labels; automatic remote revocation and custom keyed refresh recovery are deferred."
+    },
+    {
+      "app": "braintrust",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "mcp"
+      ],
+      "capability": "write",
+      "supportedActions": "Read logs, schemas, experiment summaries, datasets, projects, monitoring views, and documentation; create or update prompts, evaluators, datasets, patterns, charts, and automations; run evaluations and Topics jobs that may consume credits. Dataset row edits can permanently delete rows. Automation status can enable retention or delivery. Access remains bounded by the authenticated Braintrust account.",
+      "evidence": [
+        "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+        "https://api.braintrust.dev/.well-known/oauth-protected-resource/mcp",
+        "https://api.braintrust.dev/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-21",
+      "liveProof": "2026-10-21 US OAuth: temporary personal connection authorized in an isolated instance; 49 tools discovered (17 reads, 32 non-reads). Real process-agent runs completed bounded retrieval and synthetic dataset insert/readback through run-scoped gateway sessions. Catalog refresh and OAuth reconnect retained the connection, region and quarantine; subsequent read passed. Synthetic row and dataset removed. Local removal revoked 2 secrets and 1 grant and denied further calls. Structural API/log redaction checked. Token expiry/refresh, provider-side revocation and native CLI capability delivery remain unqualified. See BRAINTRUST.md and braintrust-qualification-2026-10-21.json.",
+      "evidenceLimit": "Live proof covers a temporary personal US OAuth grant, bounded retrieval, one synthetic dataset insert/readback, real process-agent gateway calls, catalog refresh, OAuth reconnect, local removal and structural redaction. Live token expiry/refresh, remote OAuth revocation, native CLI automatic capability delivery and exact decrypted-token scanning remain unqualified. The other three methods need separate live accounts/keys."
+    },
+    {
+      "app": "braintrust",
+      "method": "mcp-api-key",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "write",
+      "supportedActions": "Read logs, schemas, experiment summaries, datasets, projects, monitoring views, and documentation; create or update prompts, evaluators, datasets, patterns, charts, and automations; run evaluations and Topics jobs that may consume credits. Dataset row edits can permanently delete rows. Automation status can enable retention or delivery. Access remains bounded by the authenticated Braintrust account.",
+      "evidence": [
+        "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+        "https://api.braintrust.dev/.well-known/oauth-protected-resource/mcp",
+        "https://api.braintrust.dev/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-21",
+      "liveProof": "not-run",
+      "evidenceLimit": "Public provider documentation and OAuth metadata only. Account-bound connect, discovery, read/write execution, run-scoped gateway, refresh/reconnect, removal, and secret handling remain to be qualified for this method.",
+      "keyPermissions": "Create a Braintrust API key in Settings → API keys for the account and organization whose data agents should access. The key must authorize the reads and writes you intend to allow; Paperclip cannot increase or narrow its provider permissions. Evaluations and Topics processing can incur costs. Dataset edits can permanently delete rows; automation activation can enable retention or delivery."
+    },
+    {
+      "app": "braintrust",
+      "method": "mcp-eu-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "mcp"
+      ],
+      "capability": "write",
+      "supportedActions": "Read logs, schemas, experiment summaries, datasets, projects, monitoring views, and documentation; create or update prompts, evaluators, datasets, patterns, charts, and automations; run evaluations and Topics jobs that may consume credits. Dataset row edits can permanently delete rows. Automation status can enable retention or delivery. Access remains bounded by the authenticated Braintrust account.",
+      "evidence": [
+        "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+        "https://api-eu.braintrust.dev/.well-known/oauth-protected-resource/mcp",
+        "https://api-eu.braintrust.dev/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-21",
+      "liveProof": "not-run",
+      "evidenceLimit": "Public provider documentation and OAuth metadata only. Account-bound connect, discovery, read/write execution, run-scoped gateway, refresh/reconnect, removal, and secret handling remain to be qualified for this method."
+    },
+    {
+      "app": "braintrust",
+      "method": "mcp-eu-api-key",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "write",
+      "supportedActions": "Read logs, schemas, experiment summaries, datasets, projects, monitoring views, and documentation; create or update prompts, evaluators, datasets, patterns, charts, and automations; run evaluations and Topics jobs that may consume credits. Dataset row edits can permanently delete rows. Automation status can enable retention or delivery. Access remains bounded by the authenticated Braintrust account.",
+      "evidence": [
+        "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+        "https://api-eu.braintrust.dev/.well-known/oauth-protected-resource/mcp",
+        "https://api-eu.braintrust.dev/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-10-21",
+      "liveProof": "not-run",
+      "evidenceLimit": "Public provider documentation and OAuth metadata only. Account-bound connect, discovery, read/write execution, run-scoped gateway, refresh/reconnect, removal, and secret handling remain to be qualified for this method.",
+      "keyPermissions": "Create a Braintrust API key in Settings → API keys for the account and organization whose data agents should access. The key must authorize the reads and writes you intend to allow; Paperclip cannot increase or narrow its provider permissions. Evaluations and Topics processing can incur costs. Dataset edits can permanently delete rows; automation activation can enable retention or delivery."
+    },
+    {
+      "app": "unikraft",
+      "method": "api-token",
+      "auth": "api_key",
+      "policy": "provider-key",
+      "requestedScopes": [],
+      "capability": "write",
+      "supportedActions": "All published Unikraft Cloud platform API operations (instances, checkpoints, templates, service groups, autoscale, volumes, images, certificates, and quotas) and sandbox plugin operations (commands and files) in every published metro. The audit event stream is not exposed.",
+      "evidence": [
+        "https://unikraft.com/docs/sdks/overview#authentication",
+        "https://unikraft.com/docs/platform/metros",
+        "https://raw.githubusercontent.com/unikraft-cloud/openapi/5dd107ea1cd8716b83cb86a83ed2a6ee46f99b5b/platform.json",
+        "https://raw.githubusercontent.com/unikraft-cloud/openapi/5dd107ea1cd8716b83cb86a83ed2a6ee46f99b5b/plugins/sandbox.json"
+      ],
+      "reviewedAt": "2026-10-15",
+      "liveProof": "not-run",
+      "keyPermissions": "Create an API token in the Unikraft Cloud console. A token acts for its whole organization in every metro, including running sandbox commands and deleting resources. Unikraft does not offer narrower token permissions, so choose trusted agents and use action permissions to limit what they can do."
     }
   ]
 }

@@ -1,3 +1,4 @@
+import { canonicalNativeRuntimeContextDigest } from "../contracts/runtime-context.js";
 import { acpxProfileActivity } from "../drivers/acpx/profile-activity.js";
 import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import { appendSemanticToolReceipt, readNativeSemanticReceipt, semanticInputSha256 } from "../drivers/semantic-tool-receipt.js";
@@ -317,10 +318,10 @@ describe("qualified ACPX runtime sidecar", () => {
     }
   });
 
-  it.each([true, false])("resolves an omitted continuation before the production sidecar validator only with a saved monitor: %s", async eligible => {
+  it.each([["monitor", true], ["monitor", false], ["same_agent", true], ["same_agent", false]] as const)("resolves an omitted continuation before the production sidecar validator with saved %s authority=%s", async (kind, eligible) => {
     const raw = { reportedWorkDisposition: "yielded", summary: "The review fix is published.", evidence: [], verification: [],
       completionClaim: { contractRevision: "1", objectiveSatisfied: false, criteria: [], remainingWork: [{ description: "Wait for checks.", blocksCompletion: true }] } };
-    const continuation = { kind: "monitor", summary: "Wait for the saved task monitor.", idempotencyKey: "task-monitor:task:deadline" };
+    const continuation = { kind, summary: "Continue from saved task state.", idempotencyKey: "saved:task:receipt" };
     const tools = new Map<string, any>(), emitted: any[] = [];
     const handler = loadWaitForTool({ tools, emitted, validate: validatePrpStructuredRunResult });
     const commands = loadActualToolCommands(tools);
@@ -1128,6 +1129,23 @@ describe("qualified ACPX runtime sidecar", () => {
       });
     },
   );
+
+  it("routes assigned MCP through PRP in the actual restricted Claude open dispatcher", async () => {
+    const sidecar = startSidecar(), model = "claude-sonnet-5", digest = "a".repeat(64);
+    const snapshot = { prompt: { revision: "fixture", text: "Instructions", digest: createHash("sha256").update("Instructions").digest("hex") },
+      instructions: { entryPath: "AGENTS.md", bundle: { schema: "paperclip.runtime-asset.v1" as const,
+        rootPath: "/unused", digest, manifestDigest: digest, fileCount: 0, totalBytes: 0 } },
+      skills: [], mcp: { assignmentSetId: "assigned", digest, bindingId: "assigned-run" } };
+    sidecar.write(initializeRequest(1, "claude", model));
+    expect(await sidecar.next(frame => frame.id === 1)).toMatchObject({ ok: true });
+    sidecar.write({ protocolVersion: ACPX_SIDECAR_PROTOCOL_VERSION, id: 2, command: "session.open",
+      params: { runtimeDirectory: "/unused", workingDirectory: "/", normalizedSessionId: "assigned-open",
+        agent: "claude", model, permissionMode: "deny-all", providerPolicy: { readOnly: true }, systemInstructions: "Instructions",
+        runtimeContext: { ...snapshot, aggregateDigest: canonicalNativeRuntimeContextDigest(snapshot) },
+        tools: [{ name: "assigned_lookup", inputSchema: { type: "object" } }] } });
+    expect(await sidecar.next(frame => frame.id === 2)).toMatchObject({ ok: false,
+      error: { message: "ACPX working directory must be a non-root directory" } });
+  });
 
   it.each(["off", "low", "high", "max"])(
     "accepts Pi thinking level %s through the actual session.open dispatcher",

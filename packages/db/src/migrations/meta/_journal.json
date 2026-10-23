@@ -2584,6 +2584,34 @@
       "when": 1792544911793,
       "tag": "0370_flimsy_lord_tyger",
       "breakpoints": true
+    },
+    {
+      "idx": 371,
+      "version": "7",
+      "when": 1792597792969,
+      "tag": "0371_furry_red_shift",
+      "breakpoints": true
+    },
+    {
+      "idx": 372,
+      "version": "7",
+      "when": 1792707356696,
+      "tag": "0372_mature_the_initiative",
+      "breakpoints": true
+    },
+    {
+      "idx": 373,
+      "version": "7",
+      "when": 1792710084082,
+      "tag": "0373_wandering_mongu",
+      "breakpoints": true
+    },
+    {
+      "idx": 374,
+      "version": "7",
+      "when": 1792713110842,
+      "tag": "0374_rare_wolfpack",
+      "breakpoints": true
     }
   ]
 }

@@ -41,6 +41,21 @@ existing preparation and verification lifecycle.
 
 Open `/agents/:agentId` and the configuration/instruction surfaces it exposes.
 
+In `/agents/all`, select roster checkboxes and choose **Edit connection & model**.
+A mixed selection offers one action per harness. Each field is opt-in. The editor
+previews each changed value and excludes agents already at the target value.
+Models must be compatible with every selected connection. Failed writes show
+per-agent errors; Retry touches only the remaining agents. Connection pools and
+externally managed agents are not editable through this shortcut.
+
+Verify connection-only, model-only, both fields, mixed-harness selection, hidden
+selections, no-op counts, incompatible models, partial failure and retry. Reload
+the roster and compare stored settings, including unrelated heartbeat and adapter
+fields. A concurrent configuration edit must return a conflict. Shared runtime
+validation, access checks, revisions and audit logging still apply. Live runs
+retain their existing settings; model changes can reset saved sessions. Connection
+adoption can require an explicit reset of existing sessions.
+
 ### `organization`
 
 Use the roster’s organization view; `/org` redirects to the roster in the streamlined shell.
@@ -120,6 +135,25 @@ session invalidation. Incompatible settings must produce a field-specific error;
 selecting another runner must not silently discard them or change an active run's
 recorded execution. Keep runner choice in Advanced and verify the next eligible
 run separately from historical transcripts.
+
+Existing legacy Claude and Codex agents on qualified default environments also
+show **Upgrade runner** above their configuration. Exercise that action with
+pending edits and an environment-variable draft; reopen the page and compare the
+saved harness, model, account bindings, instructions, and run policy. Check a
+rejected incompatible setting, repair it, and retry. Verify a real task before
+and after migration, including its output, preserved history, and fresh session.
+The notice must stay absent for native agents, other harnesses, and unsupported
+targets. Discovery failure must not imply that an upgrade is available.
+Navigate to another agent while an upgrade is pending. Its result must stay with
+the original agent, without showing success on the new page or redirecting back.
+Focused coverage: [save receipt](../../ui/src/pages/AgentRunnerUpgrade.test.tsx)
+and [configuration form](../../ui/src/components/AgentConfigForm.render.test.tsx).
+
+Storybook: [Runner upgrade](../../ui/storybook/stories/agents/codex-runner/upgrade.stories.tsx)
+mounts the production page and shell with mutable HTTP fixtures for both harnesses,
+pending, failure/retry, incompatible settings, repair, native/unsupported states,
+and mobile/light presentation. Fixture success does not establish real migration
+or provider execution.
 
 ### `organization`
 

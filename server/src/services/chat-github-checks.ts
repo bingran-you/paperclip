@@ -171,14 +171,14 @@ export function githubReviewCheckService(db: Db, fetchImpl = fetch) {
           let run = review?.runId
             ? (
                 await db
-                  .select()
+                  .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
                   .from(heartbeatRuns)
                   .where(eq(heartbeatRuns.id, review.runId))
               )[0]
             : undefined;
           if (review && !run) {
             const [sourceRun] = await db
-              .select({ run: heartbeatRuns })
+              .select({ run: { id: heartbeatRuns.id, status: heartbeatRuns.status } })
               .from(chatDeliveries)
               .innerJoin(
                 chatMessageLinks,

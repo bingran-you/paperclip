@@ -1,3 +1,4 @@
+import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { reconcileMuseNativeTerminalRun } from "./muse-terminal-reconciliation.js";
 import { assertNativeCaseHandoffResult } from "./native-case-handoff.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
@@ -64,11 +65,12 @@ import {
   restoreNativeChatReviewPresentationInTransaction,
 } from "./native-chat-review-presentation.js";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
-  readAcceptedMonitorContinuationSummary,
+  readAcceptedTaskContinuationSummary,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
@@ -418,6 +420,8 @@ async function recordRetryableFailure(input: {
             ? "native_workspace_sync_out_retry_exhausted"
             : "native_finalization_retry_exhausted"
           : input.failureCode;
+    if (phase === "terminal_failure") await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.run.companyId);
+    await notifyExecutionRunWork(tx);
     await tx
       .update(nativeRunFinalizations)
       .set({
@@ -597,6 +601,9 @@ export async function recordNativeFinalizationFailure(input: {
     message,
     nextAction:
       input.failureScope === "workspace"
+        && (message === "native_plugin_workspace_branch_mismatch" || message === "native_plugin_workspace_owner_mismatch")
+        ? "Repair the plugin workspace branch or owner, then resume finalization without another provider turn."
+        : input.failureScope === "workspace"
         ? input.permanent
           ? "Restore the exact sandbox containing the unexported workspace changes, or resolve the task manually from durable evidence."
           : "Retry workspace export and merge from the retained sandbox; do not submit another provider turn."
@@ -660,69 +667,75 @@ async function projectCommittedRun(input: {
   const projectedStatus = projectNativeTerminalRunStatus(
     terminalState as "succeeded" | "failed" | "cancelled",
   );
-  const now = new Date();
-  const [updatedRun] = await input.db
-    .update(heartbeatRuns)
-    .set({
-      executionStatusDeliveryId: randomUUID(),
-      status: projectedStatus,
-      finishedAt: input.run.finishedAt ?? now,
-      nativePhase: "committed",
-      nativePhaseUpdatedAt: now,
-      ...(terminalState === "succeeded"
-        ? {
-            error: null,
-            errorCode: null,
-            // Capture the row being updated, not the earlier admission read:
-            // cleanup may have recorded a new diagnostic in the meantime.
-            // Other result metadata and all physical-owner evidence stay put.
-            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
-              || ${recoveredExecutionFailureMetadata()}
-              || jsonb_build_object('finalizationPhase', 'committed', 'failureCode', null, 'originalFailureCode', null, 'nextAttemptAt', null)`,
-          }
-        : { resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('finalizationPhase', 'committed', 'failureCode', null, 'originalFailureCode', null, 'nextAttemptAt', null)` }),
-      updatedAt: now,
-    })
-    .where(
+  const needsRepair = and(
+    eq(heartbeatRuns.id, input.run.id),
+    eq(heartbeatRuns.runtimeMode, "native"),
+    or(
+      inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
       and(
-        eq(heartbeatRuns.id, input.run.id),
-        eq(heartbeatRuns.runtimeMode, "native"),
+        eq(heartbeatRuns.status, "succeeded"),
         or(
-          inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
-          and(
-            eq(heartbeatRuns.status, "succeeded"),
-            or(
-              isNotNull(heartbeatRuns.error),
-              isNotNull(heartbeatRuns.errorCode),
-              isNull(heartbeatRuns.finishedAt),
-              sql`${heartbeatRuns.nativePhase} is distinct from 'committed'`,
-              sql`${heartbeatRuns.resultJson}->>'finalizationPhase' is distinct from 'committed'`,
-              sql`${heartbeatRuns.resultJson}->>'nextAttemptAt' is not null`,
-              sql`${heartbeatRuns.resultJson}->>'failureCode' is not null`,
-              sql`${heartbeatRuns.resultJson}->>'originalFailureCode' is not null`,
-            ),
-          ),
-        ),
-        // Reconciliation revisits committed results periodically. Only repair
-        // a changed projection; rewriting an unchanged failed run would mint a
-        // fresh status delivery (and failure toast) on every sweep. Check the
-        // current row so concurrent replays cannot both queue the same repair.
-        or(
-          sql`${heartbeatRuns.status} is distinct from ${projectedStatus}`,
+          isNotNull(heartbeatRuns.error),
+          isNotNull(heartbeatRuns.errorCode),
           isNull(heartbeatRuns.finishedAt),
           sql`${heartbeatRuns.nativePhase} is distinct from 'committed'`,
           sql`${heartbeatRuns.resultJson}->>'finalizationPhase' is distinct from 'committed'`,
           sql`${heartbeatRuns.resultJson}->>'nextAttemptAt' is not null`,
           sql`${heartbeatRuns.resultJson}->>'failureCode' is not null`,
           sql`${heartbeatRuns.resultJson}->>'originalFailureCode' is not null`,
-          ...(terminalState === "succeeded"
-            ? [isNotNull(heartbeatRuns.error), isNotNull(heartbeatRuns.errorCode)]
-            : []),
         ),
-        nativeRunnerOwnershipNotHeldCondition(),
       ),
-    )
-    .returning();
+    ),
+    // Reconciliation revisits committed results periodically. Only repair
+    // a changed projection; rewriting an unchanged failed run would mint a
+    // fresh status delivery (and failure toast) on every sweep. Check the
+    // current row so concurrent replays cannot both queue the same repair.
+    or(
+      sql`${heartbeatRuns.status} is distinct from ${projectedStatus}`,
+      isNull(heartbeatRuns.finishedAt),
+      sql`${heartbeatRuns.nativePhase} is distinct from 'committed'`,
+      sql`${heartbeatRuns.resultJson}->>'finalizationPhase' is distinct from 'committed'`,
+      sql`${heartbeatRuns.resultJson}->>'nextAttemptAt' is not null`,
+      sql`${heartbeatRuns.resultJson}->>'failureCode' is not null`,
+      sql`${heartbeatRuns.resultJson}->>'originalFailureCode' is not null`,
+      ...(terminalState === "succeeded"
+        ? [isNotNull(heartbeatRuns.error), isNotNull(heartbeatRuns.errorCode)]
+        : []),
+    ),
+    nativeRunnerOwnershipNotHeldCondition(),
+  );
+  const [candidate] = await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(needsRepair).limit(1);
+  if (!candidate) return;
+  const now = new Date();
+  const [updatedRun] = await input.db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.run.companyId);
+    await notifyExecutionRunWork(tx);
+    return tx
+      .update(heartbeatRuns)
+      .set({
+        executionStatusDeliveryId: randomUUID(),
+        status: projectedStatus,
+        finishedAt: input.run.finishedAt ?? now,
+        nativePhase: "committed",
+        nativePhaseUpdatedAt: now,
+        ...(terminalState === "succeeded"
+          ? {
+              error: null,
+              errorCode: null,
+              // Capture the row being updated, not the earlier admission read:
+              // cleanup may have recorded a new diagnostic in the meantime.
+              // Other result metadata and all physical-owner evidence stay put.
+              resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
+                || ${recoveredExecutionFailureMetadata()}
+                || jsonb_build_object('finalizationPhase', 'committed', 'failureCode', null, 'originalFailureCode', null, 'nextAttemptAt', null)`,
+            }
+          : { resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('finalizationPhase', 'committed', 'failureCode', null, 'originalFailureCode', null, 'nextAttemptAt', null)` }),
+        updatedAt: now,
+      })
+      .where(needsRepair)
+      .returning();
+  });
   // Metadata repairs can preserve the terminal status. Only a genuine status
   // transition should emit another terminal event. A failed run that leaves a
   // pending retry still needs its first failure report.
@@ -964,7 +977,7 @@ export async function repairCommittedNativeChatResponse(
       if (record(decision.decisionJson).externalChatReviewPresentation)
         return false;
       const monitorResult = { nativeResult: result, finalizationPhase: "committed", finalizationReasonCode: decision.reasonCode };
-      if (readAcceptedMonitorContinuationSummary(monitorResult) && run.status === "succeeded" &&
+      if (readAcceptedTaskContinuationSummary(monitorResult) && run.status === "succeeded" &&
           terminal.runTerminalState === "succeeded" && terminal.turnTerminalState === "completed" &&
           terminal.reportedWorkDisposition === "yielded" && record(run.contextSnapshot).skipIssueComment !== true &&
           !await hasChatRunOwnedProviderInteraction(tx, input)) {
@@ -1579,7 +1592,7 @@ export async function finalizeNativeRun(input: {
         statusVersionAfter: Number(committed.issue.statusVersion),
         workspaceFinalizeStatus: input.workspaceFinalizeStatus,
       };
-      const [updatedRun] = await input.db
+      const projectRun = (tx: Db) => tx
         .update(heartbeatRuns)
         .set({
           executionStatusDeliveryId: randomUUID(),
@@ -1610,6 +1623,12 @@ export async function finalizeNativeRun(input: {
         })
         .where(eq(heartbeatRuns.id, run.id))
         .returning();
+      const [updatedRun] = await input.db.transaction(async transaction => {
+        const tx = transaction as unknown as Db;
+        if (input.projectRunStatus) await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, run.companyId);
+        await notifyExecutionRunWork(tx);
+        return projectRun(tx);
+      });
       if (
         input.projectRunStatus &&
         !alreadyEmittedByCommittedDecision &&

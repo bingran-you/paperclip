@@ -39,6 +39,7 @@ export interface RunnerToolBridgeOptions {
   tools?: readonly Readonly<Record<string, unknown>>[];
   /** Claude-only: avoid tool search for task naming and terminal disposition. */
   preloadClaudeTaskTools?: boolean;
+  preserveToolNames?: boolean;
   /** Runner-owned operations that are callable but never model-visible. */
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler(call: RunnerToolCall): Promise<unknown>;
@@ -110,8 +111,8 @@ export async function startRunnerToolBridge(
   const secret = options.secret ?? randomBytes(32).toString("base64url");
   if (secret.length === 0)
     throw new Error("Runner tool bridge secret is empty");
-  const tools = normalizeTools(options.tools ?? [], "public");
-  const privateTools = normalizeTools(options.privateTools ?? [], "private");
+  const tools = normalizeTools(options.tools ?? [], "public", options.preserveToolNames);
+  const privateTools = normalizeTools(options.privateTools ?? [], "private", options.preserveToolNames);
   const publicNames = new Set(tools.map((tool) => tool.name));
   for (const tool of privateTools) {
     if (publicNames.has(tool.name)) {
@@ -134,6 +135,7 @@ export async function startRunnerToolBridge(
   const controllers = new Map<string, AbortController>();
   const context = {
     secret,
+    preserveToolNames: options.preserveToolNames === true,
     visibleTools,
     admittedTools: new Map(admittedTools.map((tool) => [tool.name, tool])),
     validators,
@@ -204,6 +206,7 @@ async function handleRequest(
   response: ServerResponse,
   context: {
     secret: string;
+    preserveToolNames: boolean;
     visibleTools: RunnerToolDefinition[];
     admittedTools: Map<string, RunnerToolDefinition>;
     validators: Map<string, ValidateFunction>;
@@ -289,7 +292,7 @@ async function handleRequest(
 
   const params = isRecord(message.params) ? message.params : {};
   const rawName = typeof params.name === "string" ? params.name : "";
-  const tool = canonicalRunnerToolName(rawName);
+  const tool = context.preserveToolNames ? rawName : canonicalRunnerToolName(rawName);
   if (!context.admittedTools.has(tool)) {
     writeToolError(response, id, "Unsupported tool.");
     return;
@@ -413,13 +416,14 @@ async function handleRequest(
 function normalizeTools(
   input: readonly Readonly<Record<string, unknown>>[],
   visibility: "public" | "private",
+  preserveNames = false,
 ): RunnerToolDefinition[] {
   const tools: RunnerToolDefinition[] = [];
   const seen = new Set<string>();
   const reservedNames = new Set(RESERVED_TOOLS.map((tool) => tool.name));
   for (const raw of input) {
     const name =
-      typeof raw.name === "string" ? canonicalRunnerToolName(raw.name) : "";
+      typeof raw.name === "string" ? (preserveNames ? raw.name : canonicalRunnerToolName(raw.name)) : "";
     if (!/^[A-Za-z0-9_.:-]{1,256}$/.test(name)) {
       throw new Error(`Runner ${visibility} tool has an invalid name`);
     }

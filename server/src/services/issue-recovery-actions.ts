@@ -1,3 +1,5 @@
+import { writeExecutionControl } from "./execution-control-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
@@ -318,6 +320,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   ): Promise<IssueRecoveryAction> {
     try {
       const created = await db.transaction(async (tx) => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
         const [superseded] = await tx
           .update(issueRecoveryActions)
           .set({
@@ -381,10 +385,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         if (existing.cause === "native_workspace_finalization_owner_unverified"
           && input.cause === existing.cause && input.fingerprint === existing.fingerprint
           && !existing.evidence?.workspaceOwnerStop && existing.nextAction !== input.nextAction) {
-          const [updated] = await db.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
+          const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
             .where(and(eq(issueRecoveryActions.id, existing.id),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-              sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning();
+              sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning());
           if (updated) return toReadModel(updated);
         }
         return existing;
@@ -404,7 +408,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           existing.attemptCount,
           Math.min(nextAttemptCount, effectiveMaxAttempts),
         );
-        const [exhausted] = await db
+        const [exhausted] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
           .update(issueRecoveryActions)
           .set({
             status: "escalated",
@@ -452,13 +456,13 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
               ]),
             ),
           )
-          .returning();
+          .returning());
         if (!exhausted) {
           return retryUpsertSourceScoped(input, retryCount);
         }
         return toReadModel(exhausted);
       }
-      const [updated] = await db
+      const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.preserveExistingOwner
@@ -517,7 +521,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
             inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
           ),
         )
-        .returning();
+        .returning());
       if (!updated) {
         return retryUpsertSourceScoped(input, retryCount);
       }
@@ -525,10 +529,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     }
 
     try {
-      const [created] = await db
+      const [created] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
         .insert(issueRecoveryActions)
         .values(buildInsertValues(input, ownerType, now))
-        .returning();
+        .returning());
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
@@ -565,7 +569,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
-    const [updated] = await dbOrTx
+    const [updated] = await writeExecutionControl(dbOrTx, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
       .update(issueRecoveryActions)
       .set({
         status: input.status,
@@ -575,7 +579,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         updatedAt: now,
       })
       .where(and(...predicates))
-      .returning();
+      .returning());
 
     return updated ? toReadModel(updated) : null;
   }

@@ -17,6 +17,7 @@ import { remoteTerminationReceipt } from "../services/remote-execution-terminati
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { readIdleSleepSafety, type IdleSleepDrainStatus } from "../services/idle-sleep-safety.js";
+import { reserveRunBudget } from "../services/budget-reservations.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -290,8 +291,9 @@ describePostgres("already available connection requests", () => {
         expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_waiting_for_response" });
     } else {
       const invoke = vi.fn(async () => null);
+      const reservation = await reserveRunBudget(db, f.companyId, run.id, null);
       expect(await dispatch.dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: run.id,
-        expectedStatus: "running", now: new Date(), dispatch: invoke })).toMatchObject({ dispatched: false,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch: invoke })).toMatchObject({ dispatched: false,
           cancellation: { outcome: "cancelled", errorCode: "issue_waiting_for_response" } });
       expect(invoke).not.toHaveBeenCalled();
     }

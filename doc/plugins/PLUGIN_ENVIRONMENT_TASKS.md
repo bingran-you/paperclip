@@ -1,10 +1,11 @@
 # Environment task API
 
 An environment driver can provide a Runner task through a worker hook.
-The task API has no shell command or file transfer operation.
+The task API has no shell command. Its optional file-read operation is scoped
+to the active task workspace.
 
-This API is a server and worker contract. The agent environment test can verify
-a task-capable provider. Native heartbeat dispatch is a separate integration.
+This API is a server and worker contract. The [native execution integration](PLUGIN_RUNNER_EXECUTION.md)
+connects a task-capable environment to a Runner run.
 
 ## Declare the hook
 
@@ -38,6 +39,7 @@ See [the schemas](../../packages/plugins/sdk/src/environment-tasks.ts) for all f
 | `connection` | `connection` | Return an authenticated WSS endpoint and its generation. |
 | `status` | `status` | Report the phase and observed process termination. |
 | `check_project_auth` | `project_auth` | Validate the prepared project configuration before managed credential transfer. |
+| `read_file` | `file` | Read one bounded, task-scoped file from the active task. |
 | `read_state` | `state` | Read the exact retained Runner checkpoint. |
 | `archive_state` | `state` | Archive suspended authority with an idempotent archive key. Keep provider session files. |
 | `credentials` | `credentials` | Return the selected account after process termination. |
@@ -186,3 +188,54 @@ For a native hello probe, select a saved AI account or use the installed account
 Core rejects local environment overrides when no saved account is selected.
 This includes draft credentials. The probe uses the installed VM environment. Core does not test a different installed account in their place.
 Only Core can supply the selected account identity and local credential home.
+
+## Fresh attempts
+
+A workspace provider opts in with `workspaceProvider.freshWorkspaceVersion: 1`.
+A task environment also declares `environmentDrivers[].freshWorkspaceVersion: 1`
+and returns `freshWorkspaceVersion: 1` from `describe`.
+
+Core supplies a server-authorized `fresh` intent on workspace preparation and on
+launch-related task calls. `attemptId` is stable across interrupted preparation.
+`previousWorkspaceId` identifies retained storage; it is not permission to change
+or remove it. The provider prepares a new working directory from the authorized
+source and base. It may share repository objects or other immutable storage.
+Core does not require a particular Git or filesystem layout.
+
+`recoverySnapshots` contains verified, Core-staged archive and manifest files.
+Each file descriptor contains a trusted host path, SHA-256, and byte size. These
+paths are host-authored transfer sources, never user-supplied paths or URLs.
+Providers verify the bytes and safely materialize each snapshot separately at
+`.paperclip-recovered/<operationId>` beneath the new working directory. Preserve
+file links safely and include provenance. Never overlay recovered files onto the
+clean working tree or overwrite an earlier attachment. Core includes those
+relative attachment paths in the new attempt's continuation context.
+
+A provider reconciles the same attempt and workspace identity after an ambiguous
+reply. It must not replace the failed workspace or allocate another workspace
+when preparation is repeated. Providers without this version remain unavailable
+for fresh attempts; ordinary preparation and reuse retain their existing contract.
+
+Core keeps transfer files while preparation is uncertain. Confirmed task completion
+and provider workspace removal release these disposable copies. The descriptors
+remain stable: a later preparation downloads the same verified files again.
+
+
+## Task workspace files
+
+Core uses `read_file` for `call_api` file uploads and `register_deliverable`
+when a plugin owns execution and advertises `workspaceFileReadVersion: 1` in
+`describe`. The request includes the submitted Runner identity,
+validated project IDs, a canonical relative or absolute path, and a byte limit (at most 10 MiB).
+The provider resolves paths within locations granted to the active task. Relative
+paths resolve from its prepared workspace. Absolute paths can select another
+granted location such as agent home, but never a supervisor path or another
+agent's files. Core does not prescribe provider filesystem layout.
+
+The provider must reject inactive tasks, path escapes, symlinks, hard links,
+non-regular files, protected credentials, oversized files, and files that change
+while being read. Return canonical base64, byte size, and a SHA-256 digest in a
+`file` result for the same task. Core validates the result and rechecks authority
+before publishing it. Deliverables additionally verify the caller's expected
+size and digest. Providers without this operation fail closed; Core never falls
+back to reading remote paths on the server. Existing artifact uploads are unchanged.

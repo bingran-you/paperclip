@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentInstructionWorkingCopies, agents, agentApiKeys, agentWakeupRequests, companies, companySecretProposals, createDb,
+  agentInstructionWorkingCopies, agents, agentApiKeys, agentWakeupRequests, budgetPolicies, companies, companySecretProposals, createDb,
   adapterAuthSessions, environments, environmentLeases, executionWorkspaces,
   feedbackExports, feedbackVotes,
   heartbeatRuns, issues, issueWatchdogs, issueThreadInteractions, issueQuestionResponseDeliveries,
@@ -186,6 +186,36 @@ if (!support.supported) console.warn(`Skipping idle sleep Postgres tests: ${supp
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "succeeded" });
     return { companyId, agentId, runId };
   }
+
+  it("retains committed budget stop intent until its exact generation is delivered", async () => {
+    const f = await seed();
+    const [policy] = await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId,
+      windowKind: "calendar_month_utc", enforcementVersion: 2, enforcementDeliveredVersion: 1 }).returning();
+    expect(await read()).toEqual(present);
+    await db.update(budgetPolicies).set({ enforcementDeliveredVersion: 2 }).where(eq(budgetPolicies.id, policy.id));
+    expect(await read()).toEqual(none);
+  });
+
+  it("retains company hold projection and lifecycle operations through admission drain", async () => {
+    const f = await seed();
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId));
+    expect(await read()).toEqual(present);
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing", lifecycleHolds: ["company_paused"] }).where(eq(agents.id, f.agentId));
+    expect(await read()).toEqual(present);
+    await db.update(agents).set({ lifecycleState: "paused" }).where(eq(agents.id, f.agentId));
+    expect(await read()).toEqual(none);
+  });
+
+  it("retains a committed budget Stop after terminal status until delivery is acknowledged", async () => {
+    const f = await seed();
+    const intent = { companyId: f.companyId, scopeType: "agent", scopeId: f.agentId, policyId: randomUUID(), version: 1 };
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { startupCancellation: { budgetEnforcement: intent } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect(await read()).toEqual(present);
+    await db.update(heartbeatRuns).set({ resultJson: { startupCancellation: { budgetEnforcement: { ...intent, deliveredAt: new Date(now).toISOString() } } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect(await read()).toEqual(none);
+  });
 
   async function feedbackHistory(status: string, change: Partial<typeof feedbackExports.$inferInsert> = {}) {
     const f = await seed();

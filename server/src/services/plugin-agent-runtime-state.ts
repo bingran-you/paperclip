@@ -50,9 +50,12 @@ export async function pluginAgentRuntimeState(db: Db, pluginId: string, companyI
         versionSelections: skillVersionSelectionMap(preference.desiredSkillEntries, { versionPinsEnabled: settings.enableBetaSkills }),
       }));
     const connectionAssignments = await pluginAgentConnectionAssignments(db, companyId, agentId, { publicMcp: settings.enablePublicMcp, chatConnectors: settings.enableChatConnectors });
+    const fallback = !state.instructionsRootPath ? await agentInstructionsService().exportFiles(state.agent, { rejectSymlinks: true }) : null;
+    const entryFile = fallback?.entryFile ?? state.instructionsEntryFile;
+    const entryContent = fallback?.files[entryFile];
     const current = await readState(db, pluginId, companyId, agentId);
     if (!current) return null;
-    if (current.revision === state.revision) return { ...current, skills, connectionAssignments };
+    if (current.revision === state.revision) return { ...current, instructionsEntryFile: entryFile, ...(entryContent === undefined ? {} : { instructionsEntryContent: entryContent }), skills, connectionAssignments };
   }
   throw conflict("Agent runtime changed while resolving synchronization inputs; retry");
 }

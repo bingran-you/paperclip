@@ -1,3 +1,4 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -649,11 +650,10 @@ export function activityService(db: Db) {
       return [fromContext, ...fromActivity];
     },
 
-    create: (data: typeof activityLog.$inferInsert) =>
-      db
-        .insert(activityLog)
-        .values(data)
-        .returning()
-        .then((rows) => rows[0]),
+    create: (data: typeof activityLog.$inferInsert) => db.transaction(async tx => {
+      if (data.entityType === "issue") await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${data.entityId}`);
+      const [row] = await tx.insert(activityLog).values(data).returning();
+      return row;
+    }),
   };
 }

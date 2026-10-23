@@ -57,6 +57,7 @@ import {
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
 export class NativeStatusRaceError extends Error {
   readonly code = "native_status_race" as const;
@@ -1056,6 +1057,7 @@ async function materializeDecisionEffect(input: {
           ),
         );
     }
+    await notifyDeliveryWork(input.tx, DELIVERY_QUEUES.accounting, input.companyId);
     const [run] = await input.tx
       .update(heartbeatRuns)
       .set({
@@ -1845,6 +1847,7 @@ export async function commitNativeStatusDecision(input: {
       const finalizationError = input.decision.effects.find(
         effect => effect.kind === "record_finalization_error",
       );
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.companyId);
       await tx
         .update(nativeRunFinalizations)
         .set({

@@ -212,6 +212,20 @@ Gaps: An acknowledged retry can remain pending or fail; report actual useful res
 
 Capability ID: `recovery/workspace`.
 
+The internal preservation resume path grants no board or agent execution API.
+It requires the exact source action, company, run, lease and environment, a
+held physical workspace owner, and its current stop-only cleanup claim. The
+ordinary resume and destruction fences still apply to protected sources. The
+assembled-runtime regression checks this separation before any provider call.
+
+Managed missing-source reconciliation uses the server-only Cloud
+`POST /v1/tenant/sandbox-absence` protocol. A host-bound capability authenticates
+the stack; board and agent credentials cannot call it. Core requires a fresh
+Cloud signature for the exact company, issue, run, lease, allocation and physical
+owner. This can establish execution absence, never recovered files or successful
+task completion. Normal Retry admission and external-effect fences still apply.
+Signature and PostgreSQL regressions are local evidence, not deployed acceptance.
+
 Review: `operation-reviewed`.
 
 Each workspace repair/export/reconstruction/physical-owner operation has its own proof and authority.

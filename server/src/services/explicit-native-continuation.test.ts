@@ -132,9 +132,9 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(comment.authorUserId).toBe("second-user");
     } else expect(receipt.status).toBe("deferred_issue_execution");
   });
-  it.each(["ready", "unacknowledged", "pause", "recovery", "controller", "process_running", "identity_missing", "remote_pending", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors"])("delivers a saved native message after run-only Stop exactly once (%s)", async gate => {
+  it.each(["ready", "unacknowledged", "pause", "resolved_recovery", "controller", "process_running", "identity_missing", "remote_pending", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors"])("retains pre-Stop input and delivers once only after a later authorized message (%s)", async gate => {
     const f = await seed();
-    if (gate !== "recovery") await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    if (gate !== "resolved_recovery") await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureDetail: null, leaseOwner: gate === "controller" ? "still-cleaning" : null })
       .where(eq(nativeRunFinalizations.runId, f.sourceRunId));
@@ -189,12 +189,27 @@ const support = await getEmbeddedPostgresTestSupport();
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeRemoteStopComments(source);
     await heartbeat.resumeRemoteStopComments(source);
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const resumeId = randomUUID();
+    await db.insert(issueComments).values({ id: resumeId, companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "Resume with my earlier direction.", createdAt: new Date("2026-09-11T11:00:00Z") });
+    queuedIds = [...queuedIds, resumeId];
+    expectedIds = [...expectedIds, resumeId];
+    await db.update(agentWakeupRequests).set({ payload: {
+      issueId: f.issueId, commentId: resumeId, _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented",
+        wakeCommentId: resumeId, wakeCommentIds: queuedIds },
+    } }).where(eq(agentWakeupRequests.id, queueId));
+    await heartbeat.resumeRemoteStopComments(source);
+    await heartbeat.resumeRemoteStopComments(source);
     const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
-    expect(successors).toHaveLength(["ready", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors"].includes(gate) ? 1 : 0);
+    expect(successors).toHaveLength(["ready", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors", "resolved_recovery"].includes(gate) ? 1 : 0);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
-    if (["ready", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors"].includes(gate)) {
+    if (["ready", "remote_stopped", "first_delivered", "last_delivered", "mixed_authors", "resolved_recovery"].includes(gate)) {
       expect(wake).toMatchObject({ status: "coalesced", runId: successors[0].id, requestedByActorId: "board" });
       expect(successors[0].contextSnapshot).toMatchObject({ wakeCommentIds: expectedIds });
+      if (gate === "resolved_recovery") expect(successors[0].contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.sourceRunId });
       expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     } else expect(wake.status).toBe("deferred_issue_execution");
   });

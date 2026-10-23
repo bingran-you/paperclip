@@ -41,6 +41,8 @@ function words(text: string): string[] {
 }
 
 function dedicatedTools(method: string, path: string): string[] {
+  if (/\/companies\/\{[^}]+\}\/workflows$/.test(path)) return method === "GET" ? ["list_workflows"] : method === "POST" ? ["create_workflow"] : [];
+  if (/\/workflows\/\{[^}]+\}$/.test(path)) return method === "GET" ? ["read_workflow"] : method === "PATCH" ? ["update_workflow"] : [];
   if (/\/issues\/\{[^}]+\}\/title$/.test(path) && method === "PUT") return ["set_task_title"];
   if (/\/agents\/\{[^}]+\}\/instructions-bundle\/file$/.test(path)) return method === "GET" ? ["read_agent_instructions"] : method === "PUT" ? ["update_agent_instructions"] : [];
   if (/\/agents\/\{[^}]+\}\/instructions-bundle\/history$/.test(path) && method === "GET") return ["get_agent_instruction_history"];

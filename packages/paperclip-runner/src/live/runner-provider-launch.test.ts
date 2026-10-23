@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createRunnerProviderLaunch, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
+import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
+  type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 
 const requirements: RunnerProviderLaunchRequirements = {
   schema: "paperclip.runner.launch-requirements.v1",
@@ -60,5 +61,21 @@ describe("built-in provider launch preparation", () => {
       .toThrow("requires a qualified managed profile");
     expect(() => createRunnerProviderLaunch({ ...requirements, provider: "aws_agentcore" }, environment))
       .toThrow("requires a qualified AgentCore profile");
+  });
+
+  it.each(["codex", "opencode", "acpx"] as const)("accepts only a normalized absolute %s prepared cwd", provider => {
+    const selected = provider === "acpx"
+      ? { ...requirements, provider, model: "claude-selected", settings: { acpxAgent: "claude" as const } }
+      : { ...requirements, provider };
+    const prepared = (cwd: unknown) => ({ configurationId: "prepared", requirementsDigest: runnerLaunchRequirementsDigest(selected),
+      provider: { ...createRunnerProviderLaunch(selected, environment), cwd } });
+    for (const cwd of ["/home/agent", "/projects/repository/worktrees/workspace"]) {
+      expect(() => validatePreparedRunnerLaunch(selected, prepared(cwd))).not.toThrow();
+      expect(preparedRunnerLaunchWorkingDirectory(prepared(cwd))).toBe(cwd);
+    }
+    for (const cwd of [undefined, "", "home/agent", "/", "/home/agent/../root", "/home/\0agent"]) {
+      expect(() => validatePreparedRunnerLaunch(selected, prepared(cwd)))
+        .toThrow("runner_prepared_launch_working_directory_invalid");
+    }
   });
 });

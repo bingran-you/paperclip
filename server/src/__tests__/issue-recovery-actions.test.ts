@@ -106,6 +106,7 @@ describe("issueRecoveryActionService", () => {
     });
 
     const fakeDb = {
+      async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> { return fn(fakeDb); },
       select: vi.fn(() => makeSelectQuery(selectResults.shift() ?? [])),
       update: vi.fn(() => ({
         set: vi.fn(() => ({

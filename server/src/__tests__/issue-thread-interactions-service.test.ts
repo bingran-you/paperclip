@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  applyPendingMigrations,
   activityLog,
   agents,
   authUsers,
@@ -31,13 +32,15 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { issueService } from "../services/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { agentService } from "../services/agents.js";
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const externalUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_INTERACTIONS_TEST_DATABASE_URL");
+const embeddedPostgresSupport = externalUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 describeEmbeddedPostgres("issueThreadInteractionService", () => {
@@ -47,8 +50,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-thread-interactions-");
-    db = createDb(tempDb.connectionString);
+    if (externalUrl) await applyPendingMigrations(externalUrl);
+    else tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-thread-interactions-");
+    db = createDb(externalUrl ?? tempDb!.connectionString);
     issuesSvc = issueService(db);
     interactionsSvc = issueThreadInteractionService(db);
   }, 20_000);
@@ -78,6 +82,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
   });
 
   afterAll(async () => {
+    await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
   });
 
@@ -717,8 +722,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const release = new Promise<void>((resolve) => { releaseInsert = resolve; });
 
     await db.transaction(async (tx) => {
-      const lockedTx = new Proxy(tx as any, {
+      const observeInserts = (runner: typeof tx): typeof tx => new Proxy(runner as any, {
         get(target, property, receiver) {
+          if (property === "transaction") return (callback: (nested: typeof tx) => Promise<unknown>) =>
+            target.transaction((nested: typeof tx) => callback(observeInserts(nested)));
           if (property !== "insert") return Reflect.get(target, property, receiver);
           return (table: unknown) => {
             const builder = target.insert(table);
@@ -752,10 +759,10 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         "Comment inserted under a caller-owned transaction.",
         { userId: "board-user" },
         { authorType: "user" },
-        lockedTx,
+        observeInserts(tx),
       );
-      await reached;
       try {
+        await Promise.race([reached, commentPromise.then(() => { throw new Error("Comment insert was not intercepted"); })]);
         await expect(db.transaction(async (observer) => {
           await observer.execute(sql`
             select id from issues

@@ -1,3 +1,4 @@
+import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { canSelectFreshWorkspace, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
@@ -356,16 +357,19 @@ export async function admitExplicitNativeContinuation(input: {
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
     ...(queuedRequest ? { queuedCommentRequestId: input.queuedCommentRequestId } : {}), runId: input.successorRunId,
     previousRunId: previous.id, recordedAt: new Date().toISOString() };
-  for (const runId of cancelledStartupIds) {
-    await db.update(nativeRunFinalizations).set({
-      phase: "terminal_failure", failureCode: "native_startup_cancelled", nextAttemptAt: null,
-      controlDeadlineAt: null, updatedAt: new Date(),
-    }).where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId)));
-    await db.update(heartbeatRuns).set({
-      ...(nativeSources.some(run => run.id === runId) ? { nativePhase: "terminal_failure", nativePhaseUpdatedAt: new Date() } : {}),
-      executionControlDeadlineAt: null,
-    }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-  }
+  if (cancelledStartupIds.size) await db.transaction(async tx => {
+    await notifyExecutionRunWork(tx);
+    for (const runId of cancelledStartupIds) {
+      await tx.update(nativeRunFinalizations).set({
+        phase: "terminal_failure", failureCode: "native_startup_cancelled", nextAttemptAt: null,
+        controlDeadlineAt: null, updatedAt: new Date(),
+      }).where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId)));
+      await tx.update(heartbeatRuns).set({
+        ...(nativeSources.some(run => run.id === runId) ? { nativePhase: "terminal_failure", nativePhaseUpdatedAt: new Date() } : {}),
+        executionControlDeadlineAt: null,
+      }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    }
+  });
   if (nativeSources.length) await db.update(nativeRunFinalizations).set({
     failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),

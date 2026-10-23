@@ -35,6 +35,7 @@ const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
     read_case: "delegation",
     update_case: "delegation",
     create_case: "delegation",
+  list_workflows: "delegation", read_workflow: "delegation", create_workflow: "delegation", update_workflow: "delegation",
     get_agent: "discovery",
     search_tasks: "discovery",
     list_approvals: "governance",

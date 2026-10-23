@@ -1,7 +1,9 @@
+import type { WorkspaceWorkers } from "../plugin-workspaces.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, not, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -489,6 +491,7 @@ export async function claimNativeSessionResumptions(input: {
         || (!!checkpoint && !checkpointHasProviderIdentity)
       ) {
         const failureCode = originalFailureCode;
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, row.run.companyId);
         await tx.update(nativeRunFinalizations).set({
           phase: "terminal_failure",
           leaseOwner: null,
@@ -624,6 +627,7 @@ export async function claimNativeSessionResumptions(input: {
 }
 
 type NativeReconciliationOptions = {
+  pluginWorkerManager?: WorkspaceWorkers;
   environmentRuntime?: EnvironmentRuntimeService;
   onWorkspaceSettled?: (input: {
     runId: string;
@@ -1040,6 +1044,7 @@ async function reconcileNativeFinalizationsPass(
         db,
         runId: row.runId,
         environmentRuntime: options.environmentRuntime,
+        pluginWorkerManager: options.pluginWorkerManager,
       });
       // Busy is ownership, not another failed export or retry-budget debit.
       if (!operation) continue;
@@ -1049,11 +1054,13 @@ async function reconcileNativeFinalizationsPass(
         const unrecoverable = operation.stderrExcerpt?.includes(
           "workspace_sync_out_unrecoverable",
         );
+        const pluginFailure = operation.stderrExcerpt?.trim();
+        const pluginRepair = pluginFailure === "plugin_workspace_branch_mismatch" || pluginFailure === "plugin_workspace_owner_mismatch";
         const failure = await recordNativeFinalizationFailure({
           db,
           runId: row.runId,
           error: new Error(
-            unrecoverable
+            pluginRepair ? `native_${pluginFailure}` : unrecoverable
               ? "native_workspace_sync_out_unrecoverable"
               : "native_workspace_sync_out_failed",
           ),

@@ -222,7 +222,7 @@ export function agentDisplayAdapterType(agent: { adapterType: string; adapterCon
     return agent.adapterConfig.provider;
   }
   const harness = agentHarnessType(agent.adapterType, agent.adapterConfig);
-  return ["codex_local", "claude_local"].includes(harness) ? harness : agent.adapterType;
+  return ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(harness) ? harness : agent.adapterType;
 }
 
 export function isKnownAdapterType(type: string): boolean {

@@ -925,9 +925,9 @@ The Copilot `extended-harnesses` file case supplies a portable read-only validat
 
 ## Same-task case handoffs
 
-The suite contains three local cells: `receipt-smoke` under both `runner-codex`
-(API key) and `runner-codex-subscription`, plus the original subscription-only
-`same-task-roundtrip`. The API profile uses the same model and workflow
+The suite contains four local cells: `receipt-smoke` and `same-task-roundtrip`
+under both `runner-codex` (API key) and `runner-codex-subscription`.
+The API profile uses the same model and workflow
 definition with ordinary encrypted `OPENAI_API_KEY` secret references, including
 the provider's `CODEX_API_KEY` alias. It does not stage a subscription login.
 Receipt smoke has exactly four successful native task work runs, with triage,
@@ -967,7 +967,7 @@ They remain unchanged and start no work. Public screenshots use the primary
 case detail route, document dialogs on that route and the primary task route.
 List navigation itself produces no screenshot.
 
-Both case fixtures supply required `workflow_document_text` through the handoff
+The receipt fixture supplies `workflow_document_text` through the handoff
 API; it becomes the ordinary task's `workflow` document before dispatch. Receipt
 role prompts tell each phase to read that document. Older recorded campaigns
 precede this new required field and remain evidence of their original version.
@@ -991,3 +991,18 @@ home, refuses nonisolated or redirected roots and occupied auth files, and
 registers cleanup before agent setup. It copies no operator config, sessions,
 plugins or unrelated files. The shared fixture registry owns that dependency;
 there is no private runtime injection.
+
+The `same-task-roundtrip` arithmetic cell now creates two reusable name-and-prompt
+workflows through production APIs and kicks off using `workflowId`. Its existing
+four-phase journey adopts A → B → A, then preserves A. Every phase reads the
+effective task document and persists its distinct procedure marker; the oracle
+requires the captured workflow identities and effective revision references.
+Case Work and expanded history show the names and arbitrary phases. This changes
+the definition/grader digest; historical passes do not qualify this extension.
+The receipt cells continue exercising inline kickoff compatibility. Provider-turn,
+timeout, credentials and cleanup bounds are unchanged.
+
+The arithmetic journey records four delivered agent handoffs and one completed
+terminal intent. The final case is `done` at handoff version 5, while the same
+four provider work runs and unchanged workflow document revision finish the task.
+The oracle rejects a missing or pending terminal intent.

@@ -544,7 +544,16 @@ This is the implementation sequence an autonomous coding agent should follow.
    task. Do not reset, rewrite, or format unrelated files.
 4. Decide whether the request is research-only, definition-only, or a new
    runtime capability. A store card is not evidence of runtime support.
-5. Write acceptance criteria before editing. At minimum: actionable store card,
+5. Apply [Module boundaries](../../rules/module-boundaries.mdc) before extending
+   shared code. Identify what the existing connection system already supports
+   and which requested features need a new platform capability. Keep new
+   connector-specific protocol behavior in
+   `server/src/services/connectors/<provider>/`; catalog definitions, branding,
+   and registration belong in their established locations. Shared gateway,
+   OAuth, and runtime code should use domain contracts, without interpreting
+   provider tool names or response formats. Separate ordinary MCP calls from
+   optional helpers such as local-file publishing when assessing the footprint.
+6. Write acceptance criteria before editing. At minimum: actionable store card,
    setup completes, credentials are vaulted, tools list, one safe read runs,
    refresh/reconnect works, revoke blocks use, and no secret appears in API or
    logs.
@@ -711,6 +720,12 @@ definitions, resource-assignment resolver, and execution handler. Use names such
 as `agentmail_send` rather than extending core tools with provider-specific
 branches. Existing MCP connectors continue to use their normal MCP tool catalog;
 they do not need a duplicate native wrapper just to supply a skill.
+
+For a gated catalog connector, declare `experimentalFeatureKey` in its
+`AppDefinition`. Shared availability checks resolve the saved application key
+and evaluate that feature before setup, discovery, and execution. Keep the
+feature's settings visibility separate from this enforcement. Do not add
+provider-name checks to the gateway or setup screens.
 
 **Resolve eligibility from current assignments and access.** An AgentMail account
 credential alone does not give an agent email capabilities. An active inbox
@@ -1293,8 +1308,12 @@ unrelated worktree change, or temporary evidence file is staged.
 
 ### Phase 12: Prepare and submit the pull request
 
-1. Keep commits scoped. A typical split is definition/branding, generic runtime
-   capability, and tests/docs. Do not split generated output from its source.
+1. Recheck [Module boundaries](../../rules/module-boundaries.mdc). Explain each
+   substantive shared change in the PR: the missing capability, why the existing
+   contract is insufficient, affected consumers, and behavior with the connector
+   absent or disabled. Separate substantial platform capabilities into reviewable
+   slices with explicit dependencies when appropriate. Keep tests and docs with
+   their behavior and generated output with its source.
 2. Do not commit `pnpm-lock.yaml`; GitHub Actions owns it in this repository.
 3. Read `.github/PULL_REQUEST_TEMPLATE.md` immediately before writing the PR
    body.

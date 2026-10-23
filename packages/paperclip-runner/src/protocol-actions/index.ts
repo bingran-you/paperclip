@@ -24,6 +24,7 @@ import { controlWorkspaceServiceAction } from "./control-workspace-service.js";
 import { createTaskAction } from "./create-task.js";
 import { handoffCaseAction } from "./handoff-case.js";
 import { createCaseAction, readCaseAction, updateCaseAction } from "./case-data.js";
+import { listWorkflowsAction, readWorkflowAction, createWorkflowAction, updateWorkflowAction } from "./workflows.js";
 import { decideApprovalAction } from "./decide-approval.js";
 import { exportCompanyAction } from "./export-company.js";
 import { finishTaskAction } from "./finish-task.js";
@@ -93,6 +94,7 @@ export const PAPERCLIP_PROTOCOL_ACTIONS = deepFreezeProtocolAction([
   readCaseAction,
   updateCaseAction,
   createCaseAction,
+  listWorkflowsAction, readWorkflowAction, createWorkflowAction, updateWorkflowAction,
   decideApprovalAction,
   exportCompanyAction,
   finishTaskAction,

@@ -2389,6 +2389,43 @@ describe("TaskChatThread runtime transcript selection", () => {
       requestKind: "permission_approval", resolution: { action: "decline" } });
   });
 
+  it("dismisses a runtime permission without resolving it and retains the feed action after reload", async () => {
+    const runId = "dismissed-native-permission";
+    nativeTranscriptState.transcriptByRun.set(runId, [
+      { kind: "runtime_request", ts: "2026-08-25T18:00:01.000Z", requestId: "permission-1",
+        requestKind: "permission_approval", turnId: "provider-turn-1", requestType: "permission", status: "pending",
+        prompt: "Pi write", choices: [{ key: "decline", label: "Deny" }], fields: [] },
+    ]);
+    const resolve = vi.spyOn(heartbeatsApi, "resolveRuntimeRequest").mockResolvedValue({} as never);
+    const show = () => renderThread({
+      issueId: "issue-1", currentUserId: "user-board", comments: [], onAdd: async () => {}, issueStatus: "in_progress",
+      activeRun: { id: runId, runtimeMode: "native", status: "running", invocationSource: "issue", triggerDetail: null,
+        startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null, createdAt: "2026-08-25T18:00:00.000Z",
+        agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner" },
+    });
+    show();
+    const takeover = () => container.querySelector('[data-testid="task-chat-composer-takeover"]');
+    await act(async () => takeover()!.querySelector<HTMLButtonElement>('[aria-label^="Dismiss "]')!.click());
+    expect(resolve).not.toHaveBeenCalled();
+    expect(takeover()).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-pending-input-indicator"]')).toBeNull();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show();
+    expect(takeover()).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-pending-input-indicator"]')).toBeNull();
+    await act(async () => {
+      const details = container.querySelector<HTMLDetailsElement>('[data-testid="task-chat-pending-runtime-request"]')!;
+      details.open = true;
+      details.dispatchEvent(new Event("toggle", { bubbles: true }));
+    });
+    const deny = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "Deny");
+    expect(deny).toBeDefined();
+    await act(async () => deny!.click());
+    expect(resolve).toHaveBeenCalledWith({ runId, requestId: "permission-1", turnId: "provider-turn-1",
+      requestKind: "permission_approval", resolution: { action: "decline" } });
+  });
+
   it("labels the live tail as a continuation after the steering bubble", () => {
     nativeTranscriptState.transcriptByRun.set("native-live-steered", [
       assistantEntry("2026-08-25T18:00:01.000Z", "Work before steering.", "progress"),
@@ -3325,6 +3362,74 @@ describe.each([true, false])("Unanswered question history (conversationMode=%s)"
     expect(pendingIndicator()?.textContent).toContain("2 pending inputs");
     await act(async () => pendingIndicator()!.click());
     expect(takeover()?.textContent).toContain("Approve the note?");
+  });
+
+  it.each(["request_confirmation", "request_checkbox_confirmation", "request_item_verdicts", "suggest_tasks"] as const)("keeps dismissed %s in the feed through reload", async kind => {
+    const fixtures = await import("@/fixtures/issueThreadInteractionFixtures");
+    const source = {
+      request_confirmation: fixtures.genericPendingRequestConfirmationInteraction,
+      request_checkbox_confirmation: fixtures.pendingRequestCheckboxConfirmationInteraction,
+      request_item_verdicts: fixtures.pendingRequestItemVerdictsInteraction,
+      suggest_tasks: fixtures.pendingSuggestedTasksInteraction,
+    }[kind];
+    const request = { ...source, id: "deferred-request", title: "Review requested" };
+    const onDismissInteraction = vi.fn().mockResolvedValue(undefined);
+    const show = () => render(<TaskChatThread {...props} comments={[]} interactions={[request]} onDismissInteraction={onDismissInteraction} />);
+    show();
+    expect(takeover()).not.toBeNull();
+    await dismiss();
+    expect(onDismissInteraction).toHaveBeenCalledWith(request);
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    flushSync(() => root!.unmount());
+    root = createRoot(container);
+    show();
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Open request: Review requested"]')!.click());
+    expect(takeover()).not.toBeNull();
+  });
+
+  it("honors a saved dismissal on another browser and surfaces save failures", async () => {
+    const review = { ...planReviewInteraction(), title: "Review requested", payload: { version: 1, prompt: "Review the work?" } } as IssueThreadInteraction;
+    render(<TaskChatThread {...props} comments={[]} interactions={[{ ...review, dismissedAt: new Date() }]} />);
+    expect(takeover()).toBeNull();
+    expect(pendingIndicator()).toBeNull();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Open request: Review requested"]')!.click());
+    const onDismissInteraction = vi.fn().mockRejectedValue(new Error("Dismissal could not be saved"));
+    render(<TaskChatThread {...props} comments={[]} interactions={[review]} onDismissInteraction={onDismissInteraction} />);
+    await dismiss();
+    expect(takeover()).not.toBeNull();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Dismissal could not be saved");
+  });
+
+  it("keeps the newly opened request visible when an earlier dismissal finishes saving", async () => {
+    const { genericPendingRequestConfirmationInteraction } = await import("@/fixtures/issueThreadInteractionFixtures");
+    const first = { ...genericPendingRequestConfirmationInteraction, id: "first-review", title: "First review" };
+    const second = { ...first, id: "second-review", title: "Second review" };
+    let finishDismiss!: () => void;
+    const onDismissInteraction = vi.fn(() => new Promise<void>(resolve => { finishDismiss = resolve; }));
+    render(<TaskChatThread {...props} comments={[]} interactions={[first, second]} onDismissInteraction={onDismissInteraction} />);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Open request: First review"]')!.click());
+    await dismiss();
+    expect(onDismissInteraction).toHaveBeenCalledWith(first);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Open request: Second review"]')!.click());
+    expect(takeover()?.textContent).toContain("Second review");
+    await act(async () => finishDismiss());
+    expect(takeover()?.textContent).toContain("Second review");
+    expect(takeover()?.textContent).not.toContain("First review");
+  });
+
+  it("keeps a reopened dismissed review visible when a delayed human comment refresh arrives", async () => {
+    const { genericPendingRequestConfirmationInteraction } = await import("@/fixtures/issueThreadInteractionFixtures");
+    const review = { ...genericPendingRequestConfirmationInteraction, title: "Reopened review" };
+    const show = (comments = movedOn.slice(0, 0)) => render(<TaskChatThread {...props} comments={comments} interactions={[review]} />);
+    show();
+    await dismiss();
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Open request: Reopened review"]')!.click());
+    expect(takeover()?.textContent).toContain("Reopened review");
+    await act(async () => show(movedOn));
+    expect(takeover()?.textContent).toContain("Reopened review");
   });
 
   it("opens the new question but can reopen the exact historical native question", async () => {

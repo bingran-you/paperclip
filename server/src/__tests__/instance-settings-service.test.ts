@@ -7,6 +7,18 @@ import {
 } from "../services/instance-settings.js";
 
 describe("instance settings service", () => {
+  it("keeps Notebook off for legacy or invalid settings and round-trips explicit operator choices", () => {
+    for (const stored of [undefined, null, {}, { enableApps: true },
+      { enablePaperclipNotebook: "true" }, { enablePaperclipNotebook: 1 },
+      { enablePaperclipNotebook: true, enableCases: "invalid" }]) {
+      expect(normalizeExperimentalSettings(stored).enablePaperclipNotebook).toBe(false);
+    }
+    const enabled = applyExperimentalSettingsPatch({}, { enablePaperclipNotebook: true });
+    const restored = normalizeExperimentalSettings(JSON.parse(JSON.stringify(enabled)));
+    expect(restored).toMatchObject({ enablePaperclipNotebook: true, enableMemoryConnectors: false });
+    const disabled = applyExperimentalSettingsPatch(restored, { enablePaperclipNotebook: false });
+    expect(normalizeExperimentalSettings(JSON.parse(JSON.stringify(disabled))).enablePaperclipNotebook).toBe(false);
+  });
   it("keeps OpenAI Dot opt-in and persists its setting independently of its prerequisites", () => {
     expect(normalizeExperimentalSettings({}).enableOpenAiDot).toBe(false);
     const enabled = applyExperimentalSettingsPatch({}, { enableOpenAiDot: true });
@@ -64,9 +76,11 @@ describe("instance settings service", () => {
       enableMuse: false,
       enableGrokBot: false,
       enableCombinedInboxTasks: false,
+      enableArtifactsV1: false,
       enableChatConnectors: false,
       enableGitHubReviewBots: false,
       enableMemoryConnectors: false,
+      enablePaperclipNotebook: false,
       enableConferenceRoomChat: false,
       enableClassicTaskInterface: false,
       enableExternalObjects: false,

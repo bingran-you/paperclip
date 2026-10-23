@@ -748,6 +748,19 @@ export async function enqueueChatRunMilestones(
         and monitor_wake.payload->>'issueId' = ${issueIdFromContext}
     )
   )`;
+  // This is only a candidate prefilter. The origin resolver below requires the
+  // committed decision/effect ledger before selecting any conversation.
+  const hasTaskContinuation = sql<boolean>`(
+    ${heartbeatRuns.contextSnapshot}->>'source' = 'native_status_decision' and exists (
+      select 1 from agent_wakeup_requests continuation_wake
+      where continuation_wake.company_id = ${heartbeatRuns.companyId}
+        and continuation_wake.run_id = ${heartbeatRuns.id}
+        and continuation_wake.agent_id = ${heartbeatRuns.agentId}
+        and continuation_wake.reason = 'issue_status_changed'
+        and continuation_wake.status in ('queued', 'claimed', 'completed', 'coalesced')
+        and continuation_wake.payload->>'issueId' = ${issueIdFromContext}
+    )
+  )`;
   let inserted = 0;
   let cursor: {
     updatedAt: Date;
@@ -835,6 +848,7 @@ export async function enqueueChatRunMilestones(
             ),
             hasQuestionContinuationTarget,
             hasMonitorContinuation,
+            hasTaskContinuation,
           ),
           // Heartbeat marks a run succeeded before the presentation resolver
           // finishes. Waiting for its durable decision prevents a generic
@@ -884,6 +898,7 @@ export async function enqueueChatRunMilestones(
           ),
           or(
             hasMonitorContinuation,
+            hasTaskContinuation,
             sql`exists (
               select 1
               from ${chatMessageLinks}

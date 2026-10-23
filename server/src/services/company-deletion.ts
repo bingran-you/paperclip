@@ -3,7 +3,8 @@ import { agentObservabilityService } from "./agent-observability.js";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
 import type { Db } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
-import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.js";
+import { createAgentLifecycle, processAgentLifecycle } from "./agent-lifecycle.js";
+import { requestRestorePointDeletion } from "./git-restore-point-ledger.js";
 import { agentLifecycleCompanyDeletion } from "../modules/agent-lifecycle/company-deletion.js";
 import {
   companies,
@@ -50,7 +51,7 @@ export async function deleteCompany(db: Db, id: string) {
   const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, id));
   for (const agent of companyAgents) {
     await lifecycle.terminateAgent(agent.id);
-    await scheduleAgentLifecycle(db, agent.id);
+    await processAgentLifecycle(db, agent.id);
   }
   return withAccountHomeSecretMutationLock(undefined, id, () => db.transaction(async (tx) => {
         // Exclude accounting writers before taking child locks. KEY SHARE must
@@ -109,6 +110,7 @@ export async function deleteCompany(db: Db, id: string) {
         await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
         await tx.delete(assets).where(eq(assets.companyId, id));
         await tx.delete(goals).where(eq(goals.companyId, id));
+        await requestRestorePointDeletion(tx, { companyId: id });
         await tx.delete(executionWorkspaces).where(eq(executionWorkspaces.companyId, id));
         await tx.delete(projects).where(eq(projects.companyId, id));
         await agentLifecycleCompanyDeletion.deleteCompanyData(tx, id);

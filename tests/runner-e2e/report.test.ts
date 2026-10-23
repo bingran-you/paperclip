@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { STARTUP_REUSE_LAYERS, STARTUP_REUSE_SCHEMA, summarizeStartupReuse } from "../../packages/adapter-utils/src/startup-reuse.js";
 import type { RunnerE2EResult } from "./types.js";
+import { classifyLatency, observationTiming } from "./latency-timing.js";
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
@@ -19,6 +20,41 @@ afterEach(async () => {
 });
 
 describe("runner E2E report aggregation", () => {
+  it("corrects overconfident timing verdicts without changing retained bounds or original files", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-latency-report-"));
+    cleanupDirectories.push(root);
+    const executionId = "core-compatibility.runner-codex.local.message-marker";
+    const directory = path.join(root, "attempt-1");
+    await mkdir(directory);
+    const acknowledgement = classifyLatency(observationTiming({ event: "acknowledgement", lastAbsentMs: 1_901, firstPresentMs: 2_427, resolutionMs: 0 }), { operator: "<=", ms: 2_000 });
+    const response = classifyLatency(observationTiming({ event: "first_visible_response", lastAbsentMs: 52_965, firstPresentMs: 53_334, resolutionMs: 0 }), { operator: "<=", ms: 30_000 });
+    const result: RunnerE2EResult = {
+      schema: "paperclip.runner-e2e.result/v2", executionId, suiteId: "core-compatibility", attempt: 1, status: "passed",
+      profileId: "runner-codex", environmentId: "local", caseId: "message-marker", provider: "codex", model: "fixture-model", runtimeMode: "native",
+      startedAt: "2026-10-18T00:00:00Z", finishedAt: "2026-10-18T00:01:00Z", durationMs: 60_000, cleanup: "passed",
+      // An old report called the crossing interval a failure (or a pass).
+      latencyProbes: [{ ...acknowledgement, verdict: "fail", reason: "outside_target", observationTimeouts: 1 }, { ...acknowledgement, verdict: "pass", reason: "within_target" }, response],
+    };
+    const raw = JSON.stringify(result);
+    await writeFile(path.join(directory, "result.json"), raw);
+    await writeFile(path.join(directory, "final-state.png"), "fixture-png");
+    await writeFile(path.join(directory, "evidence-manifest.json"), JSON.stringify({ files: ["final-state.png"], leaks: [], missing: [] }));
+    const output = path.join(root, "merged");
+    await execFileAsync(process.execPath, [path.join(repositoryRoot, "cli/node_modules/tsx/dist/cli.mjs"), path.join(repositoryRoot, "tests/runner-e2e/report.ts")], {
+      cwd: repositoryRoot, env: { ...process.env, PAPERCLIP_RUNNER_E2E_REPORT_ROOT: root, PAPERCLIP_RUNNER_E2E_REPORT_OUT: output, PAPERCLIP_RUNNER_E2E_EXPECTED_IDS: JSON.stringify([executionId]) },
+    });
+    const normalized = JSON.parse(await readFile(path.join(output, "normalized-results.json"), "utf8"));
+    expect(normalized.results[0].latencyProbes).toEqual([
+      { ...acknowledgement, recordedVerdict: "fail", observationTimeouts: 1 }, { ...acknowledgement, recordedVerdict: "pass" }, response,
+    ]);
+    expect(normalized.passed).toBe(1);
+    expect(await readFile(path.join(directory, "result.json"), "utf8")).toBe(raw);
+    const dashboard = await readFile(path.join(output, "index.html"), "utf8");
+    expect(dashboard).toContain("inconclusive");
+    expect(dashboard).toContain("(1901, 2427] ms");
+    expect(dashboard).toContain("(52965, 53334] ms");
+    expect(dashboard).toContain("first_visible_response");
+  });
   it("retains full reuse and a workspace-only invalidation in the generated report", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "runner-reuse-report-"));
     cleanupDirectories.push(root);

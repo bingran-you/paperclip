@@ -13,14 +13,18 @@ import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { recordedIsolatedRemoteSource, verifiedRecordedIsolatedRemoteSource, materializeIsolatedRemoteWorkspaceSource } from "./isolated-remote-workspace-source.js";
 import { findRegenerableWorkspaceDirs } from "./workspace-compaction.js";
+import { ensureGitRestorePointCommit, validateGitRestorePointRef, type GitRestorePointRef } from "./git-restore-point-storage.js";
+import { getStorageService } from "../storage/index.js";
+import type { StorageService } from "../storage/types.js";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
 
 const execFile = promisify(execFileCallback);
 const shaPattern = /^[a-f0-9]{40}$/;
 export const GIT_CACHE_RESTORATION_KEY = "gitCacheRestoration";
 export const GIT_CACHE_EXPIRATION_REASON = "reproducible_git_cache_expired";
+export const GIT_CACHE_RESTORATION_SCHEMA_V2 = "paperclip.git-cache-restoration.v2";
 export type GitCacheRestoration = {
-  schema: "paperclip.git-cache-restoration.v1";
+  schema: "paperclip.git-cache-restoration.v1" | typeof GIT_CACHE_RESTORATION_SCHEMA_V2;
   companyId: string;
   workspaceId: string;
   sourceIssueId: string;
@@ -36,6 +40,7 @@ export type GitCacheRestoration = {
   restoredAt?: string;
   contentsRestoredAt?: string | null;
   contents?: GitWorkspaceContents;
+  restorePoint?: GitRestorePointRef;
 };
 export type GitCacheExpiration = {
   schema: "paperclip.git-cache-expiration.v1"; generation: number; workspaceRemoved: boolean;
@@ -80,7 +85,7 @@ export function readGitCacheRestoration(workspace: Workspace): GitCacheRestorati
   const value = workspace.metadata?.[GIT_CACHE_RESTORATION_KEY];
   if (value === undefined) return null;
   const recipe = value as GitCacheRestoration | null;
-  if (!recipe || recipe.schema !== "paperclip.git-cache-restoration.v1"
+  if (!recipe || !restorationSchemaMatches(recipe)
     || !isRuntimeOwnedGitBranch(workspace.metadata)
     || recipe.gitBranchOwnershipVersion !== 1
     || recipe.companyId !== workspace.companyId || recipe.workspaceId !== workspace.id
@@ -96,7 +101,27 @@ export function readGitCacheRestoration(workspace: Workspace): GitCacheRestorati
     throw new GitCacheRestorationFailure();
   }
   validateGitWorkspaceContents(recipe.contents);
+  validateRestorePoints(recipe, workspace);
   return recipe;
+}
+
+function hasRestorePoints(recipe: GitCacheRestoration) {
+  return recipe.restorePoint !== undefined || (recipe.contents?.checkouts ?? []).some(checkout => checkout?.restorePoint !== undefined);
+}
+
+function restorationSchemaMatches(recipe: GitCacheRestoration) {
+  return recipe.schema === "paperclip.git-cache-restoration.v1"
+    ? !hasRestorePoints(recipe)
+    : recipe.schema === GIT_CACHE_RESTORATION_SCHEMA_V2 && hasRestorePoints(recipe);
+}
+
+function validateRestorePoints(recipe: GitCacheRestoration, workspace: { companyId: string; id: string }) {
+  try {
+    if (recipe.restorePoint) validateGitRestorePointRef(recipe.restorePoint, workspace);
+    for (const checkout of recipe.contents?.checkouts ?? []) {
+      if (checkout.restorePoint) validateGitRestorePointRef(checkout.restorePoint, workspace, checkout.name);
+    }
+  } catch { throw new GitCacheRestorationFailure(); }
 }
 
 export async function gitCacheCommand(cwd: string, args: string[], signal?: AbortSignal) {
@@ -140,9 +165,10 @@ async function stockGitFiles() {
   return templateFiles;
 }
 
-export async function assertReproducibleBaseGitStorage(cwd: string, signal?: AbortSignal) {
+export async function assertReproducibleBaseGitStorage(cwd: string, signal?: AbortSignal, options: { savedCommitMessage?: boolean } = {}) {
   const root = path.join(cwd, ".git");
-  const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "config", "description", "hooks", "info", "refs", "objects", "logs", "packed-refs", "worktrees", "branches"]);
+  const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "config", "description", "hooks", "info", "refs", "objects", "logs", "packed-refs", "worktrees", "branches",
+    ...(options.savedCommitMessage ? ["COMMIT_EDITMSG"] : [])]);
   if ((await fs.readdir(root)).some(name => !allowed.has(name))) throw new Error("unknown_base_git_files");
   const branches = path.join(root, "branches");
   const branchesStat = await fs.lstat(branches).catch((error: NodeJS.ErrnoException) => {
@@ -187,9 +213,43 @@ const PAPERCLIP_CLAUDE_SETTINGS_FILE = ".claude/settings.local.json";
 
 export type ManagedCheckoutProver = (checkoutPath: string, name: string, signal?: AbortSignal) => Promise<void>;
 
+const COMMIT_MESSAGE_LIMIT = 64 * 1024;
+
+async function readCommitMessage(gitDir: string): Promise<string | null> {
+  const target = path.join(gitDir, "COMMIT_EDITMSG");
+  const entry = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!entry) return null;
+  if (!entry.isFile() || entry.size > COMMIT_MESSAGE_LIMIT) throw new Error("unsupported_commit_message");
+  const handle = await fs.open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > COMMIT_MESSAGE_LIMIT) throw new Error("unsupported_commit_message");
+    const buffer = Buffer.alloc(COMMIT_MESSAGE_LIMIT + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > COMMIT_MESSAGE_LIMIT) throw new Error("unsupported_commit_message");
+    return buffer.subarray(0, length).toString("utf8");
+  } finally { await handle.close(); }
+}
+
+async function assertCommitMessageSaved(cwd: string, gitDir: string, signal?: AbortSignal) {
+  const message = await readCommitMessage(gitDir);
+  if (message === null) return;
+  const saved = [(await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim(),
+    ...(await gitCacheCommand(cwd, ["log", "-g", "--format=%B%x00", "HEAD"], signal).catch(() => "")).split("\0").map(entry => entry.trim())];
+  if (!saved.includes(message.trim())) throw new Error("uncommitted_git_message");
+}
+
 export async function assertReproducibleManagedCheckout(checkout: string, input: {
-  repoUrl: string; resolveGitAuth: GitRemoteAuthProvider; signal?: AbortSignal;
-}) {
+  repoUrl: string; resolveGitAuth: GitRemoteAuthProvider; signal?: AbortSignal; restorePoint?: boolean;
+}): Promise<{ headOnRemote: boolean }> {
   const { signal } = input;
   const gitDir = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
   if (!gitDir?.isDirectory()) throw new Error("unproven_managed_checkout");
@@ -199,10 +259,37 @@ export async function assertReproducibleManagedCheckout(checkout: string, input:
   const worktrees = (await gitCacheCommand(checkout, ["worktree", "list", "--porcelain"], signal))
     .split("\n").filter(line => line.startsWith("worktree "));
   if (worktrees.length !== 1) throw new Error("managed_checkout_has_worktrees");
-  await assertReproducibleGitFiles(checkout, signal, { preserveSettings: true });
-  await assertReproducibleBaseGitStorage(checkout, signal);
+  await assertReproducibleGitFiles(checkout, signal, { preserveSettings: true, restorePoint: input.restorePoint });
+  await assertReproducibleBaseGitStorage(checkout, signal, { savedCommitMessage: true });
+  await assertCommitMessageSaved(checkout, path.join(checkout, ".git"), signal);
   const refs = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(refname)"], signal)).trim().split("\n").filter(Boolean);
   if (refs.some(ref => !/^refs\/(heads|tags|remotes\/origin)\//.test(ref))) throw new Error("unsupported_managed_checkout_refs");
+  if (input.restorePoint) {
+    const head = (await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
+    const shas = (output: string) => output.split("\n").map(line => line.trim()).filter(sha => shaPattern.test(sha));
+    const covered = new Set([head,
+      ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(() => "")),
+      ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(() => ""))]);
+    const recorded = new Set([
+      ...shas(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags"], signal)),
+      ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H"], signal).catch(() => "")),
+    ]);
+    const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
+    const otherTips = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], signal))
+      .split("\n").map(line => line.trim().split(" ")).filter(([sha, ref]) => shaPattern.test(sha ?? "") && ref !== current).map(([sha]) => sha!);
+    if (otherTips.length && await hasCommitsMissingUpstream(checkout, otherTips, input.repoUrl, input.resolveGitAuth, signal, [head])) {
+      throw new Error("unpushed_managed_checkout_branches");
+    }
+    const uncovered = [...recorded].filter(sha => !covered.has(sha));
+    if (uncovered.length + covered.size > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
+    if (uncovered.length && await hasCommitsMissingUpstream(checkout, uncovered, input.repoUrl, input.resolveGitAuth, signal, [...covered])) {
+      throw new Error("unpushed_managed_checkout_branches");
+    }
+    const headOnRemote = !await hasCommitsMissingUpstream(checkout, [head], input.repoUrl, input.resolveGitAuth, signal);
+    const unreachable = await gitCacheCommand(checkout, ["fsck", "--connectivity-only", "--unreachable", "--no-progress"], signal);
+    if (unreachable.trim()) throw new Error("unreachable_managed_checkout_objects");
+    return { headOnRemote };
+  }
   const localTips = new Set([
     ...(await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).split("\n"),
     ...(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)"], signal)).split("\n"),
@@ -214,12 +301,13 @@ export async function assertReproducibleManagedCheckout(checkout: string, input:
   }
   const unreachable = await gitCacheCommand(checkout, ["fsck", "--connectivity-only", "--unreachable", "--no-progress"], signal);
   if (unreachable.trim()) throw new Error("unreachable_managed_checkout_objects");
+  return { headOnRemote: true };
 }
 
 const MANAGED_CHECKOUT_LOCAL_TIP_LIMIT = 5_000;
 
 async function hasCommitsMissingUpstream(checkout: string, localTips: string[], repoUrl: string,
-  resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal) {
+  resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal, covered: string[] = []) {
   const store = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-checkout-proof-"));
   try {
     const options = { timeout: 120_000, signal, maxBuffer: 16 * 1024 * 1024, cwd: os.tmpdir(),
@@ -235,7 +323,7 @@ async function hasCommitsMissingUpstream(checkout: string, localTips: string[], 
       if (signal?.aborted) throw error;
       throw new Error("managed_checkout_upstream_unavailable");
     }
-    const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
+    const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*", ...covered], options);
     return missing.stdout.trim() !== "";
   } finally {
     await fs.rm(store, { recursive: true, force: true });
@@ -293,14 +381,16 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
   proveManagedCheckout?: ManagedCheckoutProver;
   preserveSettings?: boolean;
   verifyFetchedCommit?: (commit: string, signal?: AbortSignal) => Promise<void>;
+  restorePoint?: boolean;
 } = {}) {
-  if ((await gitCacheCommand(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"], signal)).length) throw new Error("dirty_or_untracked_files");
+  if (!options.restorePoint && (await gitCacheCommand(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "-z"], signal)).length) throw new Error("dirty_or_untracked_files");
   if ((await gitCacheCommand(cwd, ["ls-files", "-v"], signal)).split("\n").some(line => /^[a-zS] /.test(line))) throw new Error("unsupported_index_flags");
   const localConfig = await gitCacheCommand(cwd, ["config", "--local", "--name-only", "--list"], signal);
   if (localConfig.split("\n").filter(Boolean).some(key => !/^(core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode)|remote\.origin\.(url|fetch)|branch\.[^.]+\.(remote|merge))$/.test(key))) throw new Error("unsupported_local_git_config");
   const regenerable = await findRegenerableWorkspaceDirs(cwd, { signal });
   const ignored = (await gitCacheCommand(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], signal)).split("\0").filter(Boolean);
-  const unexplained = ignored.filter(file => !(options.preserveSettings && file === PAPERCLIP_CLAUDE_SETTINGS_FILE) && !regenerable.some(dir => file.startsWith(`${dir}/`)));
+  const unexplained = ignored.filter(file => !(options.preserveSettings && file === PAPERCLIP_CLAUDE_SETTINGS_FILE) && !regenerable.some(dir => file.startsWith(`${dir}/`))
+    && !(options.restorePoint && /^\.env(\..*)?$/.test(path.posix.basename(file))));
   const checkouts = new Set<string>();
   for (const file of unexplained) {
     const [namespace, name, rest] = file.split("/", 3);
@@ -323,7 +413,7 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
       if (await fs.lstat(path.join(root, name)).then(() => true, (e: NodeJS.ErrnoException) => { if(e.code === "ENOENT") return false; throw e; })) throw new Error("unsupported_local_git_state");
     }
   }
-  const original = await gitCacheCommand(cwd, ["rev-parse", "--verify", "ORIG_HEAD"], signal).catch(() => null);
+  const original = options.restorePoint ? null : await gitCacheCommand(cwd, ["rev-parse", "--verify", "ORIG_HEAD"], signal).catch(() => null);
   if (original) await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", original.trim(), "HEAD"], signal)
     .catch(() => { throw new Error("unique_original_head"); });
   if (gitDir !== common) {
@@ -340,10 +430,13 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
       }
     }
     await assertEmptyRefs(path.join(gitDir, "refs"));
-    const message = await fs.readFile(path.join(gitDir, "COMMIT_EDITMSG"), "utf8").catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return null; throw error;
-    });
-    if (message !== null && message.trim() !== (await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim()) throw new Error("uncommitted_git_message");
+    const message = await readCommitMessage(gitDir);
+    if (message !== null && message.trim() !== (await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim()) {
+      const saved = options.restorePoint
+        ? (await gitCacheCommand(cwd, ["log", "-g", "--format=%B%x00", "HEAD"], signal).catch(() => "")).split("\0").map(entry => entry.trim())
+        : [];
+      if (!saved.includes(message.trim())) throw new Error("uncommitted_git_message");
+    }
     const logs = await fs.readdir(path.join(gitDir, "logs")).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return []; throw error;
     });
@@ -352,7 +445,7 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
   // Packed stashes/replacement refs are just as important as loose refs.
   if ((await gitCacheCommand(cwd, ["for-each-ref", "--format=%(refname)", "refs/stash", "refs/replace"], signal)).trim()) throw new Error("unique_git_refs");
   // Rewrites can leave commits reachable only from this worktree's reflog.
-  for (const commit of new Set((await gitCacheCommand(cwd, ["reflog", "show", "--format=%H", "HEAD"], signal)).split("\n").filter(Boolean))) {
+  for (const commit of options.restorePoint ? [] : new Set((await gitCacheCommand(cwd, ["reflog", "show", "--format=%H", "HEAD"], signal)).split("\n").filter(Boolean))) {
     await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", commit, "HEAD"], signal).catch(() => { throw new Error("unique_reflog_commits"); });
   }
   return regenerable;
@@ -360,6 +453,16 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
 
 export async function inspectGitCacheRecipe(workspace: Workspace, resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal,
   options: { proveManagedCheckout?: ManagedCheckoutProver } = {}): Promise<GitCacheRestoration> {
+  return (await inspectRecipe(workspace, resolveGitAuth, signal, options, false)).recipe;
+}
+
+export async function inspectGitCacheRecipeForRestorePoint(workspace: Workspace, resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal,
+  options: { proveManagedCheckout?: ManagedCheckoutProver } = {}) {
+  return inspectRecipe(workspace, resolveGitAuth, signal, options, true);
+}
+
+async function inspectRecipe(workspace: Workspace, resolveGitAuth: GitRemoteAuthProvider, signal: AbortSignal | undefined,
+  options: { proveManagedCheckout?: ManagedCheckoutProver }, restorePoint: boolean): Promise<{ recipe: GitCacheRestoration; headOnRemote: boolean }> {
   if (workspace.mode !== "isolated_workspace" || workspace.strategyType !== "git_worktree"
     || !isRuntimeOwnedGitBranch(workspace.metadata) || !workspace.sourceIssueId || !workspace.repoUrl
     || !workspace.cwd || !workspace.branchName || (workspace.providerRef && workspace.providerRef !== workspace.cwd)) throw new Error("unproven_workspace_ownership");
@@ -378,14 +481,19 @@ export async function inspectGitCacheRecipe(workspace: Workspace, resolveGitAuth
   if (!(await fs.lstat(path.join(workspace.cwd, ".git"))).isFile()) throw new Error("not_linked_worktree");
   if ((await gitCacheCommand(workspace.cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], signal)).trim() !== path.join(await fs.realpath(source), ".git")) throw new Error("source_identity_changed");
   if ((await gitCacheCommand(workspace.cwd, ["symbolic-ref", "--short", "HEAD"], signal)).trim() !== workspace.branchName) throw new Error("branch_identity_changed");
-  await assertReproducibleGitFiles(workspace.cwd, signal, { ...options, preserveSettings: true,
+  await assertReproducibleGitFiles(workspace.cwd, signal, { ...options, preserveSettings: true, restorePoint,
     verifyFetchedCommit: (commit, verificationSignal) => verifyRemoteGitCommit(workspace.repoUrl!, commit, resolveGitAuth, verificationSignal) });
   const commit = (await gitCacheCommand(workspace.cwd, ["rev-parse", "HEAD"], signal)).trim();
-  await verifyRemoteGitCommit(workspace.repoUrl, commit, resolveGitAuth, signal);
-  return { schema: "paperclip.git-cache-restoration.v1", companyId: workspace.companyId, workspaceId: workspace.id,
+  let headOnRemote = true;
+  try { await verifyRemoteGitCommit(workspace.repoUrl, commit, resolveGitAuth, signal); }
+  catch (error) {
+    if (!restorePoint || signal?.aborted) throw error;
+    headOnRemote = false;
+  }
+  return { headOnRemote, recipe: { schema: "paperclip.git-cache-restoration.v1", companyId: workspace.companyId, workspaceId: workspace.id,
     sourceIssueId: workspace.sourceIssueId, repoUrl: workspace.repoUrl, commit, branchName: workspace.branchName,
     sourceKind: recordedIsolatedRemoteSource(workspace) ? "isolated_remote" : "managed_project", projectId: workspace.projectId,
-    sourcePath: source, worktreePath: workspace.cwd, gitBranchOwnershipVersion: 1, verifiedAt: new Date().toISOString() };
+    sourcePath: source, worktreePath: workspace.cwd, gitBranchOwnershipVersion: 1, verifiedAt: new Date().toISOString() } };
 }
 
 export function readGitCacheExpiration(workspace: Workspace): GitCacheExpiration | null {
@@ -466,7 +574,12 @@ export async function finishGitCacheTrash(workspace: Workspace) {
 }
 
 /** Called only after authorization and while holding the source/lifecycle fences. */
-export async function restoreGitCacheBase(workspace: Workspace, recipe: GitCacheRestoration, resolveGitAuth: GitRemoteAuthProvider) {
+export function gitRestorePointExpired(recipe: GitCacheRestoration) {
+  return Boolean(recipe.restorePoint?.expiredAt) || (recipe.contents?.checkouts ?? []).some(checkout => Boolean(checkout.restorePoint?.expiredAt));
+}
+
+export async function restoreGitCacheBase(workspace: Workspace, recipe: GitCacheRestoration, resolveGitAuth: GitRemoteAuthProvider,
+  storage?: StorageService, options: { freshStart?: boolean } = {}) {
   if (readGitCacheRestoration(workspace)?.commit !== recipe.commit) throw new GitCacheRestorationFailure();
   try {
     await finishGitCacheTrash(workspace);
@@ -491,6 +604,11 @@ export async function restoreGitCacheBase(workspace: Workspace, recipe: GitCache
         : (await materializeManagedProjectWorkspace(recipe.sourcePath, { repoUrl: recipe.repoUrl, resolveGitAuth })).cwd;
     await verifiedGitCacheSource(workspace, recipe.sourcePath);
     if (!cwd) throw new GitCacheRestorationFailure();
+    if (options.freshStart) return cwd;
+    if (recipe.restorePoint) {
+      await ensureGitRestorePointCommit({ storage: storage ?? getStorageService(), workspace: { companyId: workspace.companyId, id: workspace.id },
+        ref: recipe.restorePoint, repositoryCwd: cwd });
+    }
     await ensureSavedGitCommit(cwd, recipe.repoUrl, recipe.commit, resolveGitAuth);
     return cwd;
   } catch { throw new GitCacheRestorationFailure(); }
@@ -514,7 +632,7 @@ export function savedGitWorkspaceRestoration(input: { metadata?: Record<string, 
   const raw = input.metadata?.[GIT_CACHE_RESTORATION_KEY];
   if (raw === undefined) return null;
   const value = raw as GitCacheRestoration | null;
-  if (!value || value.schema !== "paperclip.git-cache-restoration.v1" || !shaPattern.test(value.commit)
+  if (!value || !restorationSchemaMatches(value) || !shaPattern.test(value.commit)
     || value.companyId !== input.companyId || value.workspaceId !== input.workspaceId
     || value.worktreePath !== input.cwd || value.sourcePath !== input.baseCwd
     || value.repoUrl !== input.repoUrl || value.branchName !== input.branchName
@@ -522,6 +640,8 @@ export function savedGitWorkspaceRestoration(input: { metadata?: Record<string, 
     || (value.restoredAt !== undefined && !Number.isFinite(Date.parse(value.restoredAt)))
     || (value.contentsRestoredAt != null && !Number.isFinite(Date.parse(value.contentsRestoredAt)))) throw new GitCacheRestorationFailure();
   validateGitWorkspaceContents(value.contents);
-  return { commit: value.commit, restored: value.restoredAt !== undefined, contents: value.contents,
+  validateRestorePoints(value, { companyId: input.companyId, id: input.workspaceId ?? "" });
+  const restorePoint: GitRestorePointRef | null = value.restorePoint ?? null;
+  return { commit: value.commit, restored: value.restoredAt !== undefined, contents: value.contents, restorePoint,
     contentsRestored: value.contentsRestoredAt === undefined ? value.restoredAt !== undefined : value.contentsRestoredAt !== null };
 }

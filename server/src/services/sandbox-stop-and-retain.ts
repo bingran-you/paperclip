@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasNativeWorkspaceExportResume, readNativeWorkspaceExportResume, settleNativeWorkspaceExportResume } from "./native-runtime/native-workspace-export-resume.js";
+import type { SandboxAbsenceProof } from "./sandbox-absence-proof.js";
 
 type Lease = Pick<typeof environmentLeases.$inferSelect,
   "id" | "companyId" | "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata">;
@@ -147,4 +148,29 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
     sql`${environmentLeases.metadata}->>'pluginId' is not distinct from ${intent.pluginId}`,
   )).returning();
   return updated ?? null;
+}
+
+export async function settleAbsentSandbox(db: Db, lease: typeof environmentLeases.$inferSelect,
+  evidence: { proof: SandboxAbsenceProof; receipt: string }) {
+  const { proof } = evidence;
+  if (proof.companyId !== lease.companyId || proof.runId !== lease.heartbeatRunId || proof.issueId !== lease.issueId
+    || proof.leaseId !== lease.id || proof.provider !== lease.provider || proof.providerLeaseId !== lease.providerLeaseId) return false;
+  const termination = remoteTerminationReceipt(lease, { providerLeaseId: proof.providerLeaseId, state: "destroyed" });
+  if (!termination) return false;
+  const now = new Date();
+  const changed = await db.update(environmentLeases).set({
+    status: "released", cleanupStatus: "success", failureReason: "workspace_source_unavailable", releasedAt: now, updatedAt: now,
+    metadata: sql`(${environmentLeases.metadata} - 'sandboxStopAndRetain' - 'nativeWorkspaceExportResume' - 'sandboxStopAndRetainReceipt') || ${JSON.stringify({
+      remoteExecutionTermination: termination, sandboxAbsence: evidence,
+      pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
+    })}::jsonb`,
+  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+    eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!), eq(environmentLeases.providerLeaseId, proof.providerLeaseId),
+    eq(environmentLeases.status, lease.status),
+    sql`exists (select 1 from ${heartbeatRuns} where ${heartbeatRuns.id} = ${lease.heartbeatRunId}
+      and ${heartbeatRuns.companyId} = ${lease.companyId}
+      and ${heartbeatRuns.runnerProfileJson}#>>'{nativeWorkspaceFinalizationOwner,token}' = ${proof.ownerToken})`,
+    sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`,
+  )).returning({ id: environmentLeases.id });
+  return changed.length === 1;
 }

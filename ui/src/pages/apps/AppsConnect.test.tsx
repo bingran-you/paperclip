@@ -66,6 +66,8 @@ const POSTHOG = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "posthog"
 const NEON = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "neon")!;
 const SUPERAGENT = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "superagent")!;
 const GAUGE = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "gauge")!;
+const DITTO = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "ditto")!;
+const BRAINTRUST = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "braintrust")!;
 const POSTMAN = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "postman")!;
 const SHOPIFY = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "shopify")!;
 const GOOGLE_SHEETS = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "google-sheets")!;
@@ -663,6 +665,64 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(connectAppMock).not.toHaveBeenCalled();
     expect(putConnectionInstallsMock).not.toHaveBeenCalled();
     expect(finishAppMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "source=paperclip-notebook", "source=%20paperclip-notebook%20", "appKey=paperclip-notebook", "source=paperclip-notebook&resume=existing-notebook",
+    "source=paperclip-notebook&reconnect=existing-notebook", "reconnect=existing-notebook",
+  ])("blocks Notebook setup and existing authorization shortcuts while disabled: %s", async query => {
+    mockSearch.value = query;
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", status: "active", config: { sourceTemplateKey: "paperclip-notebook" } });
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("paperclip-notebook")] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+    expect(finishAppMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["path", "inline"])("blocks the Notebook %s setup route while disabled", async route => {
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", status: "active", config: { sourceTemplateKey: "paperclip-notebook" } });
+    mockParams.appKey = route === "path" ? "paperclip-notebook" : undefined;
+    await render(undefined, false, route === "inline" ? <ConnectionSetupFlow host="dialog" serviceSlug="paperclip-notebook" configuredConnection={{ id: "existing-notebook", applicationId: "notebook-app", name: "Notebook", enabled: true, status: "active" }} /> : undefined);
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the saved application identity when its mutable provider marker has changed", async () => {
+    mockSearch.value = "source=notion&reconnect=existing-notebook";
+    getConnectionMock.mockResolvedValue({ id: "existing-notebook", applicationId: "notebook-app", status: "active", config: { sourceTemplateKey: "notion" } });
+    listConnectionsMock.mockResolvedValue({ connections: [{ id: "existing-notebook", applicationId: "notebook-app", status: "active", config: { sourceTemplateKey: "notion" } }] });
+    listApplicationsMock.mockResolvedValue({ applications: [{ id: "notebook-app", applicationKey: "app-gallery:paperclip-notebook:11111111-1111-4111-8111-111111111111", metadata: { sourceTemplateKey: "notion" } }] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook is not available on this instance");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("waits for Notebook settings and fails closed when they cannot be loaded", async () => {
+    mockSearch.value = "source=paperclip-notebook";
+    let reject!: (error: Error) => void;
+    experimentalMock.mockImplementation(() => new Promise((_resolve, fail) => { reject = fail; }));
+    await render();
+    expect(container.textContent).toContain("Loading connection settings");
+    await act(async () => { reject(new Error("Settings unavailable")); });
+    await flushReact();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not load connector availability");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).not.toHaveBeenCalled();
+  });
+
+  it("opens Notebook setup only with its explicit rollout opt-in", async () => {
+    mockSearch.value = "source=paperclip-notebook";
+    experimentalMock.mockResolvedValue({ enablePaperclipNotebook: true });
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("paperclip-notebook")] });
+    await render();
+    expect(container.textContent).toContain("Paperclip Notebook");
+    expect(container.textContent).not.toContain("not available on this instance");
+    expect(listGalleryMock).toHaveBeenCalledWith("company-1");
+    expect([...container.querySelectorAll("button")].some(button => /Continue to|Continue to sign in|Connect/.test(button.textContent ?? ""))).toBe(true);
   });
 
   it.each(["mem0", "zep", "supermemory", "cognee", "honcho"])("blocks direct %s setup while memory connectors are off", async (provider) => {
@@ -2093,6 +2153,65 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Pick the app you want your agents to use.");
   });
 
+  it.each([
+    "mcp-oauth", "mcp-api-key", "mcp-eu-oauth", "mcp-eu-api-key",
+  ])("submits the selected Braintrust region and authentication (%s)", async (methodKey) => {
+    mockSearch.value = "source=braintrust";
+    listGalleryMock.mockResolvedValueOnce({ apps: [BRAINTRUST] });
+    const method = BRAINTRUST.methods.find((candidate) => candidate.key === methodKey)!;
+    await render();
+
+    expect(buttonByText("Continue to sign in")?.disabled).toBe(false);
+    expect(container.textContent).toContain("permissions");
+    expect(container.textContent).toContain("cost");
+    expect(container.textContent).toContain("permanently delete");
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    await openAccessAdvanced();
+    expect(radioContaining(BRAINTRUST.methods[0]!.label!)?.getAttribute("aria-checked")).toBe("true");
+    await act(async () => { radioContaining(method.label!)!.click(); });
+    await flushReact();
+
+    expect(container.textContent).toContain("permissions");
+    expect(container.textContent).toContain("cost");
+    expect(container.textContent).toContain("permanently delete");
+    if (method.auth === "api_key") {
+      const input = container.querySelector<HTMLInputElement>('input[type="password"]')!;
+      expect(input).toBeTruthy();
+      expect(buttonByText("Connect")?.disabled).toBe(true);
+      await act(async () => setInputValue(input, "braintrust-ui-canary"));
+      await flushReact();
+    }
+    await act(async () => { buttonByText(method.auth === "oauth" ? "Continue to sign in" : "Connect")!.click(); });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      galleryKey: "braintrust",
+      connectionMethodKey: methodKey,
+      ...(method.auth === "api_key" ? { credentialValues: { "credentials.authorization": "braintrust-ui-canary" } } : {}),
+    }));
+    expect(JSON.stringify({ ...window.sessionStorage, ...window.localStorage })).not.toContain("braintrust-ui-canary");
+  });
+
+  it("resumes the selected Braintrust EU OAuth draft after cancellation", async () => {
+    const connectionId = "22222222-2222-4222-8222-222222222222";
+    mockSearch.value = `source=braintrust&resume=${connectionId}&oauth=denied`;
+    listGalleryMock.mockResolvedValueOnce({ apps: [BRAINTRUST] });
+    listApplicationsMock.mockResolvedValueOnce({ applications: [{
+      id: "braintrust-app", status: "draft", metadata: { sourceTemplateKey: "braintrust" },
+    }] });
+    listConnectionsMock.mockResolvedValueOnce({ connections: [{
+      id: connectionId, applicationId: "braintrust-app", authKind: "oauth", credentialPolicy: "per_user", status: "draft",
+      config: { sourceTemplateKey: "braintrust", connectionMethodKey: "mcp-eu-oauth", url: "https://api-eu.braintrust.dev/mcp" }, transportConfig: {},
+    }] });
+    startOAuthMock.mockResolvedValueOnce(oauthStartResponse(connectionId, "braintrust", "https://api-eu.braintrust.dev/oauth/authorize"));
+    await render();
+    await act(async () => { buttonByText("Try again")!.click(); });
+    await flushReact();
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).toHaveBeenCalledWith(connectionId, { asCurrentUser: true });
+    expect(navigateTopLevelMock).toHaveBeenCalledWith("https://api-eu.braintrust.dev/oauth/authorize");
+  });
+
   it("connects Superagent with only an organization API key", async () => {
     mockParams.appKey = "superagent";
     listGalleryMock.mockResolvedValueOnce({ apps: [SUPERAGENT] });
@@ -2121,6 +2240,44 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       galleryKey: "superagent",
       connectionMethodKey: "mcp-api-key",
       credentialValues: { "credentials.authorization": "sk_live_test-key" },
+    }));
+  });
+
+  it("defaults Ditto to browser sign-in and connects a workspace API key once entered", async () => {
+    mockParams.appKey = "ditto";
+    listGalleryMock.mockResolvedValueOnce({ apps: [DITTO] });
+    await render();
+    // The delete warning must be visible on the default sign-in path.
+    expect(container.textContent).toContain("delete tools cannot be undone");
+    expect(buttonByText("Continue to sign in")?.disabled).toBe(false);
+    await openAccessAdvanced();
+
+    expect(radioContaining("Sign in with Ditto")?.getAttribute("aria-checked")).toBe("true");
+    await act(async () => {
+      radioContaining("Use an API key")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("set delete and link actions to Ask first");
+    const keyInput = container.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(keyInput).toBeTruthy();
+    expect(buttonByText("Connect")?.disabled).toBe(true);
+
+    await act(async () => {
+      setInputValue(keyInput!, "ditto-test-key");
+    });
+    await flushReact();
+    const submit = buttonByText("Connect");
+    expect(submit?.disabled).toBe(false);
+    await act(async () => {
+      submit?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      galleryKey: "ditto",
+      connectionMethodKey: "mcp-api-key",
+      credentialValues: { "credentials.authorization": "ditto-test-key" },
     }));
   });
 

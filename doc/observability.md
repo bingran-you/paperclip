@@ -35,6 +35,25 @@ maintains as a dependency; once you install the packages below, they become
 normal dependencies of **your own** project, and your own Dependabot updates
 them.
 
+## Budget admission, accounting, and enforcement
+
+The operator-gated `paperclip.budgets` tracer records
+`budget.admission.evaluate`, `budget.admission.reserve`,
+`budget.accounting.transaction`, `budget.accounting.settlement`, `budget.accounting.lock_wait`,
+`budget.exposure.evaluate`, `budget.enforcement.deliver`,
+`budget.enforcement.scope`, `budget.cancellation.deliver`, and `budget.accounting.recover`.
+Transaction spans include commit time. Lock-wait spans cover acquisition of the
+company accounting lock. Settlement spans cover the ledger and reservation
+transaction. Enforcement spans measure asynchronous delivery; cancellation
+delivery spans start after acquiring a concurrency slot and cover the external
+Stop attempt. Both remain separate from provider inference.
+
+The closed attribute list is `budget.policy_count` (number of applicable
+policies) and `budget.enforcement.queue_delay_ms` (time since the pending policy's
+last intent or retry timestamp). These spans contain no tool content, usage
+receipt bodies, credentials, or provider error bodies. They do not change
+Paperclip's separate first-party Telemetry contract.
+
 ## Slack receipt reactions
 
 Slack stages its eyes reaction in the same transaction as the authorized task,

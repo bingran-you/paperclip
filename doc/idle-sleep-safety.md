@@ -46,6 +46,41 @@ without installed handler tracking keeps the same conservative hold. Missing fil
 continue through the normal fallback and error handlers; they do not exempt
 other GET requests or callback-only application work.
 
+## Budget and agent lifecycle work
+
+Budget accounting commits its charge, admission block, and enforcement generation
+before returning to its caller. Cancellation delivery runs separately through the
+delivery coordinator, using the existing policy version pair and committed run
+Stop records. It can finish already-admitted stops during drain, but cannot start
+another paid turn. A provider still stopping, an unacknowledged Stop, a pending
+policy generation, and unresolved accounting remain sleep blockers.
+
+Agent lifecycle uses the same transaction-aware coordinator. Hire approval,
+configuration invalidation, manual commands, and computed agent budget holds
+register work before their transaction writes. Company status transitions register
+inherited-hold projection; changing a company name, description, or logo does not.
+Projection selects only agents whose company pause/archive hold differs from the
+committed company state, in pages of 100 under one company accounting transaction
+per page. Pause/archive transactions also persist pausing operations for agents
+with cancellable runs, reading only those involved agents in batches. Immediate
+reactivation can remove an inherited hold but cannot erase an owed Stop; new
+provider work waits for lifecycle readiness. Archive activity counts describe
+requested pauses and cancellations, not completed provider termination. Agent
+and project budget changes never enumerate company peers.
+
+Startup recovers pending lifecycle operations and inherited-hold mismatches.
+Thereafter notifications and stored retry/lease deadlines drive work. Stable ready,
+paused, rejected, and terminated history does not trigger recurring policy scans.
+Pending phases and inherited-hold mismatches block sleep. Lifecycle execution can
+verify configurations or resume queued work, so it waits while admission is
+draining or the instance is in warm standby; its durable obligation is retained.
+A future in-process retry timer does not grant permission to sleep.
+
+These notifications cover the existing single-active-writer ownership model.
+Independent SQL writers and additional processes need an explicit wake protocol;
+process-local notifications do not provide cross-replica delivery. Worker quiet
+alone is not evidence that the host or database actually suspended.
+
 ## Scheduled routine wake protocol
 
 Historical failed ephemeral leases and terminal custom-image setup sessions can

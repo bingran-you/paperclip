@@ -854,7 +854,7 @@ tokenize motion. Principles — reasoning only; values live in `ui/src/index.css
   block collapses the duration/stagger tokens to zero, cascading to every scoped token,
   in addition to each animation's own component-level guard.
 
-Agent Chat and regular task chats keep pending questions as compact “Unanswered question” entries at their original position in history. Dismissing the form or sending a newer user message clears it from the composer without resolving it. Questions never contribute to composer pending counts or navigation. Opening the history entry restores the original form and its draft; submitting later uses the same durable question response path. Actual permission reviews retain their permission checks.
+Agent Chat and regular task chats keep pending questions and requests as compact, reopenable entries at their original position in history. Dismissing any composer request—including completion reviews, confirmations, choices, suggested tasks, item verdicts, and runtime input—removes its form and pending reminder. Saved interactions record human dismissal on the server; raw runtime requests retain a browser-local preference. Dismissal is not an answer, approval, or rejection. Sending a newer user message also clears an ordinary question from the composer without resolving it. Questions never contribute to composer pending counts or navigation. Opening the history entry restores the original form and its draft; submitting later uses the same durable question response path. Actual permission reviews retain their permission checks.
 
 ## Canonical proposal toolbars
 
@@ -932,14 +932,14 @@ labelled primitive compositions with local state. Page navigation and
 collection filters remain in Tabs. This comparison does not migrate app styles
 or certify backend behavior or keyboard accessibility.
 
-Agents and Connectors compose the same `ToolbarSearch` with canonical Standard filled tabs. `AgentsToolbar` is shared by the roster page and
+Agents and Connectors compose the same `ToolbarSearch`. Connectors also use canonical Standard filled tabs. `AgentsToolbar` is shared by the roster page and
 toolbar references; `ConnectorsToolbar` is shared by Browse and toolbar references. Keep search
-first, status/source selection next, and view/actions last where present.
+first, source selection next where present, and view/actions last. The agent roster uses a harness filter icon without a status selector.
 Connector source choices use radio semantics and preserve Browse's existing
 automatic search expansion; they do not switch separate content panels.
-Agents status navigation retains route-backed Tabs with its associated roster
-panel. Agent search intersects the chosen status/built-in filter, matches name,
-role and title words, and retains ancestor context for matching org-chart nodes.
+Legacy agent status and built-in URLs redirect to the full roster at `/agents/all`.
+Agent search matches name, role and title words, and retains ancestor context
+for matching org-chart nodes.
 
 Projects uses `ProjectsToolbar` for shared search, the existing name/updated/
 created/target-date sort choices and direction toggling, and Add Project. Project

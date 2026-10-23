@@ -29,6 +29,8 @@ import {
 } from "@paperclipai/db";
 import {
   APP_STORE_DEFINITIONS,
+  isConnectorFeatureEnabled,
+  getAppDefinitionForApplicationKey,
   AGGREGATOR_PRIORITY, AGGREGATOR_NAMES, AGGREGATOR_CATALOG_SOURCES,
   findAggregatorService, searchAggregatorServices, prepareConnectionSearch, scoreConnectionSearch, explicitAggregatorQuery, normalizeConnectionQuery, parseAggregatorRoute, aggregatorProviderQuestion, aggregatorProviderQuestionSet,
   aggregatorContinuationInstruction, isRemoteMcpConnectorId, askUserQuestionsPayloadSchema, askUserQuestionsResultSchema,
@@ -364,6 +366,9 @@ export function connectionIntentService(db: Db) {
     if (!service.startsWith("connection:")) {
       const app = getAppStoreDefinition(service);
       if (!app) throw notFound("Connection service was not found");
+      if (app.experimentalFeatureKey && !isConnectorFeatureEnabled(app, await instanceSettingsService(db).getExperimental())) {
+        throw notFound("Connection service was not found");
+      }
       if (purpose === "channel" && service !== "agentmail") {
         throw unprocessable("This email connection is not available");
       }
@@ -389,6 +394,14 @@ export function connectionIntentService(db: Db) {
       || (grant.kind === "agent" && grant.subjectAgentId === agentId)
     ))) throw notFound("Configured connection was not found");
     const application = await access.getApplication(connection.applicationId, companyId);
+    const definition = application.applicationKey != null
+      ? getAppDefinitionForApplicationKey(application.applicationKey)
+      : typeof connection.config?.sourceTemplateKey === "string"
+        ? getAppStoreDefinition(connection.config?.sourceTemplateKey) : null;
+    if (definition?.experimentalFeatureKey && !isConnectorFeatureEnabled(definition,
+      await instanceSettingsService(db).getExperimental())) {
+      throw notFound("Configured connection was not found");
+    }
     return {
       slug: service, name: connection.name, description: application.description, searchCapabilities: "",
       branding: { logoUrl: undefined, darkLogoUrl: undefined },
@@ -413,7 +426,8 @@ export function connectionIntentService(db: Db) {
     const discoveryMethods = (app: (typeof APP_STORE_DEFINITIONS)[number]) => getAvailableConnectionMethods(app)
       .filter(method => method.purpose !== "channel" || app.slug === "agentmail"
         || (method.provider === "github" ? settings.enableGitHubReviewBots : settings.enableChatConnectors));
-    const services = [...APP_STORE_DEFINITIONS.filter(app => discoveryMethods(app).length).map((app) => app.slug),
+    const services = [...APP_STORE_DEFINITIONS.filter(app => isConnectorFeatureEnabled(app, settings)
+      && discoveryMethods(app).length).map((app) => app.slug),
       ...inventory.connections.filter((connection) =>
         sourceSlugForConnection(connection, inventory.applicationsById)?.startsWith("connection:")
         && connection.status !== "archived").map((connection) => `connection:${connection.id}`)];

@@ -1,5 +1,11 @@
 # Paperclip evaluation guide
 
+The explicit-only [necessary free-text question journey](../tests/runner-e2e/README.md#necessary-free-text-question)
+checks one essential input, the rendered prompt and context, the real answer,
+one bound continuation, and an exact saved confirmation. Its four development
+cells use the recorded Codex and Claude models. Registration and calibration do
+not establish Slack, staging authentication, warm lifecycle, or live qualification.
+
 The explicit-only [case handoff workflow](../tests/runner-e2e/README.md#persistent-case-handoffs-explicit-only)
 contains arithmetic and receipt smoke cells for a same-task round trip among three native agents using real case/task
 APIs, saved documents, handoff receipts, and browser readback. Receipt smoke has
@@ -262,6 +268,11 @@ family-specific classifier and read the attempt evidence before changing an
 analytical label.
 
 ## Evidence, provenance, and history
+
+Polling latency is an interval rather than an exact first-detection time. The
+[Product E2E timing contract](../tests/runner-e2e/README.md#latency-observation-bounds)
+keeps last-absent/first-present bounds, resolution, strict or inclusive targets,
+and pass/fail/inconclusive timing verdicts alongside the unchanged workflow grade.
 
 Retained result snapshots and dated measurement reports belong in
 `paperclip-evals`; application tests, Product E2E fixtures/graders, and executable

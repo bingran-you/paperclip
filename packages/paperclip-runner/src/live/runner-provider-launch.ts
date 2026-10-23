@@ -3,6 +3,7 @@ import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../
 import { resolve } from "node:path";
 import { codexExecutableReadOnlyRoots } from "../drivers/codex/codex-security-config.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
+import { validatePreparedLaunchWorkingDirectory } from "../drivers/codex/codex-boundaries.js";
 import { usesPreconfiguredHome } from "../drivers/preconfigured-home.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
 import { resolveAcpxProviderMode } from "../drivers/acpx/provider-mode.js";
@@ -125,6 +126,10 @@ export function validatePreparedRunnerLaunch(
   for (const [key, value] of Object.entries(expected)) {
     if (!hostFields.has(key) && JSON.stringify(value) !== JSON.stringify(descriptor[key])) reject();
   }
+  if ("cwd" in expected) {
+    try { validatePreparedLaunchWorkingDirectory(descriptor.cwd); }
+    catch { throw new Error("runner_prepared_launch_working_directory_invalid"); }
+  }
   let requiredInstructions = requirements.instructions;
   if (requirements.runtimeContext) {
     const context = parseNativeRuntimeContext(descriptor.runtimeContext);
@@ -134,6 +139,18 @@ export function validatePreparedRunnerLaunch(
   }
   if (requiredInstructions.trim()
     && (typeof descriptor.instructions !== "string" || !descriptor.instructions.includes(requiredInstructions.trim()))) reject();
+}
+
+/**
+ * The directory that the environment resolved for the provider. Core records
+ * it for session metadata and recovery; runnerd checks it on its filesystem.
+ * Providers without a filesystem working directory return null.
+ */
+export function preparedRunnerLaunchWorkingDirectory(
+  prepared: PreparedRunnerProviderLaunch,
+): string | null {
+  return prepared.provider.cwd === undefined
+    ? null : validatePreparedLaunchWorkingDirectory(prepared.provider.cwd);
 }
 
 /** Locations and provider settings resolved by the built-in execution environment. */

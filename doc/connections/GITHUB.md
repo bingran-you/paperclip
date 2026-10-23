@@ -178,6 +178,24 @@ It retains GitHub's destructive classification. Read tools include
 Provider references: [MCP toolset configuration](https://github.com/github/github-mcp-server/blob/main/docs/server-configuration.md)
 and [workflow dispatch permissions](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
 
+GitHub response reconciliation reads run status and request identity without
+loading prompts, runtime profiles, results, or log excerpts. Request ownership
+checks still use current company, agent, task, and accepted message provenance.
+The run context projection retains `issueId`, `taskId`, `wakeCommentId`, and
+`wakeCommentIds`; larger runtime data stays in its owning reads.
+
+## Webhook delivery recovery
+
+The Cloud connector authenticates the outer event batch before it processes
+individual encrypted App deliveries. If an inner delivery cannot be decrypted
+or fails its route binding check, the instance reports a failed delivery and
+leaves it unacknowledged in Cloud. A local warning includes the authenticated
+delivery ID and a fixed failure reason, without event contents or raw errors.
+Other valid events in the batch can still finish and acknowledge independently.
+Failed ciphertext never reaches the
+GitHub webhook handler. The broker retains failed deliveries for retry under
+its normal lease and retention policy; this does not recover a lost old key.
+
 ## Webhooks
 
 For the shared GitHub account connector, Paperclip Cloud verifies

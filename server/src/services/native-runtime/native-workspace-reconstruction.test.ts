@@ -17,6 +17,8 @@ import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recover
 import { settleStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import { drainHeartbeatRunsToQuiescence } from "../../__tests__/helpers/drain-heartbeat-runs.js";
+import { reserveRunBudget } from "../budget-reservations.js";
+import { accountRunCost } from "../run-cost-accounting.js";
 const providerExecute = vi.hoisted(() => vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false,
   errorMessage: null, summary: "Bounded reconstruction completed.", provider: "test", model: "test" })));
 vi.mock("../../adapters/index.js", async () => ({
@@ -173,6 +175,7 @@ describe("reconstruction after confirmed native workspace loss", () => {
     expect(successorId).not.toBe("undefined");
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successorId));
     await db.update(issues).set({ status: "in_progress", executionRunId: successorId }).where(eq(issues.id, f.issueId));
+    const reservation = await reserveRunBudget(db, f.companyId, successorId, null);
     if (kind === "changed_evidence") {
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, later.actionId!));
       await db.update(issueRecoveryActions).set({ evidence: { ...action.evidence, executionReconciliation: {
@@ -182,7 +185,7 @@ describe("reconstruction after confirmed native workspace loss", () => {
     if (kind === "extra_reconciled") await interveningCancelledRun(f);
     const dispatch = vi.fn(async () => "provider entered");
     const result = await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId,
-      runId: successorId, expectedStatus: "running", dispatch });
+      runId: successorId, reservationId: reservation.id, expectedStatus: "running", dispatch });
     expect(result.dispatched).toBe(kind === "unchanged");
     expect(dispatch).toHaveBeenCalledTimes(kind === "unchanged" ? 1 : 0);
   });
@@ -286,16 +289,17 @@ describe("reconstruction after confirmed native workspace loss", () => {
     expect(successorId).not.toBe("undefined");
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successorId));
     await db.update(issues).set({ status: "in_progress", executionRunId: successorId }).where(eq(issues.id, f.issueId));
+    const reservation = await reserveRunBudget(db, f.companyId, successorId, null);
     if (kind === "blocked") await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
     if (kind === "attachment") await db.delete(issueAttachments).where(eq(issueAttachments.id, f.attachmentId));
     if (kind === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
     if (kind === "forged_successor") await db.update(issueRecoveryActions).set({ evidence: { ...action.evidence, continuationRunId: randomUUID() } }).where(eq(issueRecoveryActions.id, f.actionId));
     const dispatch = vi.fn(async () => "provider entered");
     const outcome = await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId,
-      runId: successorId, expectedStatus: "running", dispatch });
+      runId: successorId, reservationId: reservation.id, expectedStatus: "running", dispatch });
     expect(outcome.dispatched).toBe(kind === "unchanged");
     expect(dispatch).toHaveBeenCalledTimes(kind === "unchanged" ? 1 : 0);
-    if (!outcome.dispatched) expect(outcome.cancellation).toMatchObject({ outcome: "cancelled" });
+    if (!outcome.dispatched) expect(outcome).toMatchObject({ cancellation: { outcome: "cancelled" } });
   });
   it.each(["unchanged", "attachment", "blocked", "paused", "forged_wake", "foreign_parent", "unrelated_run", "uncertain_parent", "new_recovery"] as const)("keeps bounded reconstruction retries under current authority: %s", async kind => {
     const f = await seed();
@@ -314,6 +318,7 @@ describe("reconstruction after confirmed native workspace loss", () => {
     if (retry.outcome !== "scheduled" || !retry.run) throw new Error("Expected a bounded bootstrap retry");
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, retry.run.id));
     await db.update(issues).set({ executionRunId: retry.run.id }).where(eq(issues.id, f.issueId));
+    const reservation = await reserveRunBudget(db, f.companyId, retry.run.id, null);
     if (kind === "attachment") await db.delete(issueAttachments).where(eq(issueAttachments.id, f.attachmentId));
     if (kind === "blocked") await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
     if (kind === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
@@ -330,21 +335,23 @@ describe("reconstruction after confirmed native workspace loss", () => {
       fingerprint: randomUUID(), evidence: { runId: firstId }, nextAction: "Reconcile the new execution", status: "active" });
     const dispatch = vi.fn(async () => "provider entered");
     const outcome = await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId,
-      runId: retry.run.id, expectedStatus: "running", dispatch });
+      runId: retry.run.id, reservationId: reservation.id, expectedStatus: "running", dispatch });
     expect(outcome.dispatched).toBe(kind === "unchanged");
     expect(dispatch).toHaveBeenCalledTimes(kind === "unchanged" ? 1 : 0);
     if (kind === "unchanged") {
       expect(retry.run.scheduledRetryAttempt).toBe(1);
       await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
         resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, retry.run.id));
+      await accountRunCost(db, retry.run.id);
       const second = await heartbeat.scheduleBoundedRetry(retry.run.id, { now: new Date(), random: () => 0, delayMs: 0 });
       expect(second.outcome).toBe("scheduled");
       if (second.outcome !== "scheduled" || !second.run) throw new Error("Expected the second bounded retry");
       expect(second.run.scheduledRetryAttempt).toBe(2);
       await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, second.run.id));
       await db.update(issues).set({ executionRunId: second.run.id }).where(eq(issues.id, f.issueId));
+      const secondReservation = await reserveRunBudget(db, f.companyId, second.run.id, null);
       expect(await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId,
-        runId: second.run.id, expectedStatus: "running", dispatch })).toMatchObject({ dispatched: true });
+        runId: second.run.id, reservationId: secondReservation.id, expectedStatus: "running", dispatch })).toMatchObject({ dispatched: true });
       await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
         resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, second.run.id));
       expect(await heartbeat.scheduleBoundedRetry(second.run.id)).toMatchObject({ outcome: "retry_exhausted" });

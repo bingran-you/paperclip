@@ -1,3 +1,4 @@
+import { completeSetupTokenAiConnection } from "../services/setup-token-ai-connection.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -15,12 +16,13 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
 import { readAiConnectionConfigurationFailure } from "../services/ai-connection-configuration-failure.js";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { syncConnectionCredentialBindings } from "../services/connection-credential-bindings.js";
 import * as codexAdapter from "@paperclipai/adapter-codex-local/server";
 import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -72,6 +74,84 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it.each([
+    { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
+    { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },
+    { provider: "openai", envKey: "OPENAI_API_KEY", routed: false },
+    { provider: "anthropic", envKey: "ANTHROPIC_API_KEY", routed: false },
+    { provider: "google", envKey: "GEMINI_API_KEY", routed: false },
+  ] as const)("prepares native Pi with isolated $provider credentials (routing=$routed)", async ({ provider, envKey, routed }) => {
+    const owner = `pi-managed-${provider}-${routed}`;
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const token = "fixture-pi-provider-key";
+    const account = await service.save(companyId, owner, { provider, method: "api_key", ownership: "personal", name: owner, apiKey: token, allAgents: true, agentIds: [],
+      ...(routed ? { routing: { kind: "openrouter" as const, protocol: "chat" as const, auth: "bearer" as const, models: [] } } : {}) }, token);
+    if (!routed) await service.setDefault(companyId, owner, account.grantId);
+    const selected = routed
+      ? { provider, method: "api_key" as const, mode: "delegated" as const, ...account }
+      : { provider, method: "api_key" as const, mode: "responsible_user" as const };
+    const piInput = { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner", binding: selected,
+      config: { provider: "acpx", acpxAgent: "pi", model: `${provider}/provider-model`, piThinkingLevel: "low", env: { OPENAI_API_KEY: "stale-openai", ANTHROPIC_API_KEY: "stale-anthropic" } } };
+    const runtime = await prepareManagedAiRuntime(db, piInput);
+    try {
+      expect(runtime.config).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: piInput.config.model, env: { OPENCODE_CONFIG_CONTENT: "", PAPERCLIP_PI_PROVIDERS: "" } });
+      for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "CODEX_API_KEY"]) expect(runtime.config.env[key]).toBe(key === envKey ? token : "");
+      expect(runtime.attribution).toMatchObject({ connectionId: account.connectionId, grantId: account.grantId, provider });
+    } finally { await runtime.cleanup(); }
+    await expect(prepareManagedAiRuntime(db, { ...piInput, config: { ...piInput.config, env: { PAPERCLIP_PI_PROVIDERS: "{}" } } })).rejects.toThrow("routing is incompatible");
+  });
+
+  it.each([200, 401])("reverifies native Pi OpenRouter keys without requiring the Legacy Pi CLI (HTTP %s)", async status => {
+    const owner = `pi-adoption-${status}`;
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const token = `fixture-pi-adoption-${status}`;
+    const account = await service.save(companyId, owner, { provider: "openrouter", method: "api_key", ownership: "personal", name: owner, apiKey: token, allAgents: true, agentIds: [], routing: { kind: "openrouter", protocol: "chat", auth: "bearer", models: [] } }, token);
+    const selected = { provider: "openrouter", method: "api_key", mode: "delegated", ...account } as const;
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner", binding: selected, config: { provider: "acpx", acpxAgent: "pi", model: "openrouter/anthropic/claude-sonnet-4.5" } });
+    const { requireServerAdapter } = await import("../adapters/index.js");
+    const { agentEnvironmentTestService } = await import("../services/agent-environment-test.js");
+    const native = vi.spyOn(requireServerAdapter("paperclip_runner"), "testEnvironment").mockResolvedValue({ adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [{ code: "acpx_runtime_ready", level: "info", message: "Pinned Pi runtime verified" }] });
+    const legacy = vi.spyOn(requireServerAdapter("pi_local"), "testEnvironment").mockRejectedValue(new Error("Legacy Pi CLI must not be required"));
+    const request = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: {} }), { status }));
+    try {
+      const result = await agentEnvironmentTestService(db).testManagedEnvironment("paperclip_runner", { companyId, adapterType: "paperclip_runner", config: runtime.config }, selected, runtime, agentId);
+      expect(result.status).toBe(status === 200 ? "pass" : "fail");
+      expect(result.checks).toContainEqual(expect.objectContaining({ code: status === 200 ? "ai_connection_api_key_reverified" : "ai_connection_api_key_rejected" }));
+      expect(legacy).not.toHaveBeenCalled();
+      expect(request).toHaveBeenCalled();
+    } finally { native.mockRestore(); legacy.mockRestore(); request.mockRestore(); await runtime.cleanup(); }
+  });
+
+  it("defers a new plugin agent's Copilot check until its saved-agent lifecycle can acquire the computer", async () => {
+    const { errorHandler } = await import("../middleware/index.js");
+    const owner = "copilot-plugin-bootstrap", pluginId = randomUUID();
+    const pluginKey = `test.bootstrap.${pluginId}`;
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: "@test/bootstrap", version: "1.0.0", apiVersion: 1,
+      categories: ["automation"], status: "ready", manifestJson: { id: pluginKey, apiVersion: 1, version: "1.0.0",
+        displayName: "Bootstrap", description: "Bootstrap fixture", author: "Test", categories: ["automation"],
+        capabilities: ["environment.drivers.register"], entrypoints: { worker: "worker.js" },
+        environmentDrivers: [{ driverKey: "tasks", displayName: "Tasks", supportsTasks: true, configSchema: { type: "object" } }] } });
+    const [environment] = await db.insert(environments).values({ companyId, name: "Agent computer", driver: "plugin",
+      config: { pluginKey, driverKey: "tasks", driverConfig: {} } }).returning();
+    const token = "github_pat_fixture_plugin_bootstrap";
+    const account = await service.save(companyId, owner, { provider: "github", method: "api_key", ownership: "personal", name: "Bootstrap", apiKey: token, agentIds: [], allAgents: false }, token);
+    await service.setDefault(companyId, owner, account.grantId);
+    const probe = vi.spyOn(copilotProbe, "probeCopilotExecutionTarget").mockRejectedValue(new Error("No computer exists before the agent is saved"));
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: owner, companyIds: [companyId], isInstanceAdmin: true }; next(); });
+    app.use("/api", agentRoutes(db)); app.use(errorHandler);
+    try {
+      const response = await request(app).post(`/api/companies/${companyId}/agents`).send({ name: "Plugin bootstrap", role: "general",
+        adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "copilot", model: "gpt-5.6-luna" },
+        defaultEnvironmentId: environment.id, runtimeConfig: { aiConnection: { provider: "github", method: "api_key", mode: "responsible_user" } } });
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      expect(response.body.defaultEnvironmentId).toBe(environment.id);
+      expect(response.body.lifecycleState).toBe("preparing");
+      expect(probe).not.toHaveBeenCalled();
+    } finally { probe.mockRestore(); }
+  });
+
   it.each(["create", "hire", "edit"])("refuses Copilot %s before probing or persisting when forced Kubernetes is missing", async action => {
     const { errorHandler } = await import("../middleware/index.js");
     const owner = `copilot-kubernetes-${action}`, id = randomUUID();
@@ -814,7 +894,7 @@ describe("managed AI connections", () => {
       lock = vi.spyOn(codexAdapter, "withAccountHomeSecretMutationLock")
         .mockRejectedValueOnce(Object.assign(new Error("lock timeout"), { code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE }))
         .mockRejectedValueOnce(Object.assign(new Error("lock timeout"), { code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE }));
-      saving = service.save(companyId, loginOwner, { ...intent, agentIds: [] }, credential, sessionId);
+      saving = service.save(companyId, loginOwner, { ...intent, agentIds: [] }, credential, { id: sessionId });
       void saving.catch(() => {});
       await vi.waitFor(() => expect(lock).toHaveBeenCalledTimes(3));
       expect((await db.select().from(adapterAuthSessions).where(eq(adapterAuthSessions.id, sessionId)))[0].connectionId).toBeNull();
@@ -822,7 +902,7 @@ describe("managed AI connections", () => {
       const [, saved] = await Promise.all([refreshing, saving]);
       const [row] = (await service.quotaAccounts(companyId, loginOwner)).filter(row => row.connection.id === saved.connectionId);
       expect(await service.credential(row)).toBe(credential);
-      expect(await service.save(companyId, loginOwner, { ...intent, agentIds: [] }, credential, sessionId)).toEqual(saved);
+      expect(await service.save(companyId, loginOwner, { ...intent, agentIds: [] }, credential, { id: sessionId })).toEqual(saved);
       if (kind === "new") expect(JSON.parse(await service.credential(quotaRow))).toMatchObject({ tokens: { access_token: "quota-fresh", refresh_token: "quota-replacement" } });
     } finally {
       release.resolve(); await Promise.allSettled([refreshing, saving]); lock?.mockRestore(); request.mockRestore();
@@ -1637,11 +1717,70 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const intent = { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude subscription", agentIds: [], allAgents: true } as const;
     const sessionId = randomUUID();
     await db.insert(adapterAuthSessions).values({ companyId, environmentId: environment.id, adapterType: "claude_local", startedByUserId: "alice", publicSessionId: sessionId, status: "submitting", aiConnection: { ...intent, agentIds: [] }, expiresAt: new Date(Date.now() + 60000) });
-    const first = await service.save(companyId, "alice", { ...intent, agentIds: [] }, "fixture-subscription", sessionId);
-    expect(await service.save(companyId, "alice", { ...intent, agentIds: [] }, "fixture-subscription", sessionId)).toEqual(first);
+    const first = await completeSetupTokenAiConnection(db, { scope: { companyId, ownerUserId: "alice", environmentId: environment.id, adapterType: "claude_local", aiConnection: { ...intent, agentIds: [] } }, token: "fixture-subscription", sessionId });
+    expect(await completeSetupTokenAiConnection(db, { scope: { companyId, ownerUserId: "alice", environmentId: environment.id, adapterType: "claude_local", aiConnection: { ...intent, agentIds: [] } }, token: "fixture-subscription", sessionId })).toEqual(first);
+    expect((await db.select().from(adapterAuthSessions).where(eq(adapterAuthSessions.publicSessionId, sessionId)))[0]).toMatchObject({ status: "stored", connectionId: first.connectionId, connectionGrantId: first.grantId });
     const cancelled = randomUUID();
     await db.insert(adapterAuthSessions).values({ companyId, environmentId: environment.id, adapterType: "claude_local", startedByUserId: "alice", publicSessionId: cancelled, status: "cancelled", expiresAt: new Date(Date.now() + 60000) });
-    await expect(service.save(companyId, "alice", { ...intent, agentIds: [] }, "fixture-never-save", cancelled)).rejects.toThrow("no longer active");
+    await expect(completeSetupTokenAiConnection(db, { scope: { companyId, ownerUserId: "alice", environmentId: environment.id, adapterType: "claude_local", aiConnection: { ...intent, agentIds: [] } }, token: "fixture-never-save", sessionId: cancelled })).rejects.toThrow("no longer active");
+  });
+  it.each(["anthropic", "openai"] as const)("binds %s by internal session ID without choosing its completion state", async provider => {
+    const owner = `session-owner-${provider}`;
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const [environment] = await db.insert(environments).values({ name: `Session identity ${provider}`, driver: "sandbox" }).returning();
+    const intent = { provider, method: "subscription", ownership: "personal", name: `Session identity ${provider}`, allAgents: false, agentIds: [] } as const;
+    const [session] = await db.insert(adapterAuthSessions).values({ companyId, environmentId: environment.id,
+      adapterType: provider === "anthropic" ? "claude_local" : "codex_local", startedByUserId: owner,
+      publicSessionId: randomUUID(), status: "promoting", aiConnection: { ...intent, agentIds: [] },
+      expiresAt: new Date(Date.now() + 60_000),
+    }).returning();
+    const adapterWake = vi.fn(), setupWake = vi.fn();
+    const unsubscribe = [
+      subscribeDeliveryWork(db, DELIVERY_QUEUES.adapterLoginCleanup, adapterWake),
+      subscribeDeliveryWork(db, DELIVERY_QUEUES.setupTokenCleanup, setupWake),
+    ];
+    const complete = vi.fn(async () => {
+      expect(adapterWake).not.toHaveBeenCalled();
+      expect(setupWake).not.toHaveBeenCalled();
+    });
+    try {
+      await expect(service.save(companyId, owner, { ...intent, agentIds: [] }, "fixture", { id: session.publicSessionId, complete })).rejects.toThrow("ownership mismatch");
+      await expect(service.save(companyId, "bob", { ...intent, agentIds: [] }, "fixture", { id: session.id, complete })).rejects.toThrow("ownership mismatch");
+      await expect(service.save(companyId, owner, { ...intent, agentIds: [], ownership: "shared" }, "fixture", { id: session.id, complete })).rejects.toThrow("target mismatch");
+      expect(complete).not.toHaveBeenCalled();
+      const saved = await service.save(companyId, owner, { ...intent, agentIds: [] }, "fixture", { id: session.id, complete });
+      expect((await db.select().from(adapterAuthSessions).where(eq(adapterAuthSessions.id, session.id)))[0]).toMatchObject({
+        connectionId: saved.connectionId, connectionGrantId: saved.grantId, status: "promoting",
+      });
+      expect(await service.save(companyId, owner, { ...intent, agentIds: [] }, "replacement", { id: session.id, complete })).toEqual(saved);
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(adapterWake).toHaveBeenCalledTimes(1);
+      expect(setupWake).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe.forEach(stop => stop());
+      await db.delete(adapterAuthSessions).where(eq(adapterAuthSessions.id, session.id));
+    }
+  });
+  it("rolls back credential and connection writes if setup-token completion loses its claim", async () => {
+    const owner = "lost-setup-token-claim";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const [environment] = await db.insert(environments).values({ name: "Lost setup claim", driver: "sandbox" }).returning();
+    const intent = { provider: "anthropic", method: "subscription", ownership: "personal", name: "Lost setup claim", allAgents: false, agentIds: [] } as const;
+    const [session] = await db.insert(adapterAuthSessions).values({ companyId, environmentId: environment.id,
+      adapterType: "claude_local", startedByUserId: owner, publicSessionId: randomUUID(), status: "submitting",
+      aiConnection: { ...intent, agentIds: [] }, expiresAt: new Date(Date.now() + 60_000), boundAt: new Date(),
+    }).returning();
+    try {
+      await expect(completeSetupTokenAiConnection(db, { scope: { companyId, ownerUserId: owner,
+        environmentId: environment.id, adapterType: "claude_local", aiConnection: { ...intent, agentIds: [] } },
+        sessionId: session.publicSessionId, token: "must-rollback",
+      })).rejects.toThrow();
+      expect((await db.select().from(adapterAuthSessions).where(eq(adapterAuthSessions.id, session.id)))[0]).toMatchObject({
+        connectionId: null, connectionGrantId: null, status: "submitting",
+      });
+      expect(await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.name, intent.name)))).toEqual([]);
+      expect(await db.select().from(companySecrets).where(eq(companySecrets.ownerUserId, owner))).toEqual([]);
+    } finally { await db.delete(adapterAuthSessions).where(eq(adapterAuthSessions.id, session.id)); }
   });
   it("preserves connection identity and defaults through reconnect; revocation wins over older attempts", async () => {
     const current = await service.select({ ...input, userId: "bob" });
@@ -1889,7 +2028,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const sessionId = randomUUID();
     const intent = { provider: "anthropic", method: "subscription", ownership: "personal", name: "Expired", agentIds: [], allAgents: true } as const;
     await db.insert(adapterAuthSessions).values({ companyId, environmentId: environment.id, adapterType: "claude_local", startedByUserId: "alice", publicSessionId: sessionId, status: "submitting", aiConnection: { ...intent, agentIds: [] }, expiresAt: new Date(Date.now() - 1000) });
-    await expect(service.save(companyId, "alice", { ...intent, agentIds: [] }, "fixture-never-save", sessionId)).rejects.toThrow("no longer active");
+    await expect(completeSetupTokenAiConnection(db, { scope: { companyId, ownerUserId: "alice", environmentId: environment.id, adapterType: "claude_local", aiConnection: { ...intent, agentIds: [] } }, token: "fixture-never-save", sessionId })).rejects.toThrow("no longer active");
     expect((await service.list(companyId, "alice")).some(account => account.name === "Expired")).toBe(false);
   });
   it("authorizes account creation, reconnect and defaults at the HTTP boundary before provider calls", async () => {
@@ -2010,6 +2149,7 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
       expect(started.headers["cache-control"]).toBe("no-store");
       expect(started.body.command).toBeUndefined();
       expect((await request(app).post(`${base}/attempts`).send(intent)).body).toEqual(started.body);
+      await db.update(adapterAuthSessions).set({ publicSessionId: randomUUID() }).where(eq(adapterAuthSessions.id, started.body.sessionId));
       const input = { ...intent, localSessionId: started.body.sessionId };
       for (const endpoint of [base, `${base}/check`]) {
         expect((await request(app).post(endpoint).set("x-test-user", "bob").send(input)).status).toBe(404);

@@ -912,6 +912,38 @@ describe("instance settings routes", () => {
   });
 
   describe("Cloud staging experiments", () => {
+    it.each([
+      ["team.staging.paperclip.app", 200],
+      ["team.paperclip.app", 403],
+    ] as const)(
+      "keeps private Notebook operator-only under the real hidden wildcard on %s",
+      async (primaryHost, visibleExperimentStatus) => {
+        vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "tenant-token");
+        vi.stubEnv("PAPERCLIP_PRIMARY_HOST", primaryHost);
+        vi.stubEnv("PAPERCLIP_HIDDEN_SETTINGS", "instance.experimental.*");
+        mockInstanceSettingsService.getExperimental.mockResolvedValue({
+          enablePaperclipNotebook: false, enableChatConnectors: false,
+        });
+        const app = createApp({
+          type: "board", userId: "stack-admin-1", source: "cloud_tenant",
+          companyIds: ["company-1"], isInstanceAdmin: false, canManageExperimentalSettings: true,
+        });
+        const denied = await request(app).patch("/api/instance/settings/experimental")
+          .send({ enablePaperclipNotebook: true }).expect(403);
+        expect(denied.body.details).toMatchObject({ code: "settings_operator_managed" });
+        expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+        expect(mockLogActivity).not.toHaveBeenCalled();
+
+        await request(app).patch("/api/instance/settings/experimental")
+          .send({ enableChatConnectors: true }).expect(visibleExperimentStatus);
+        if (visibleExperimentStatus === 200) {
+          expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledExactlyOnceWith({ enableChatConnectors: true });
+        } else {
+          expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+        }
+      },
+    );
+
     it.each(["team.staging.paperclip.app", "team.paperclip.app"])(
       "reads Cloud-enabled isolation and rejects disabling it through the real service on %s",
       async (primaryHost) => {

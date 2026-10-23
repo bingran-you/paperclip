@@ -6,6 +6,8 @@ import { connectionDeliveryWaitingForResponse, finishedIdleRun as finishedRun, f
 import type { Db } from "@paperclipai/db";
 import { sql } from "drizzle-orm";
 import { verifiedResourceCleanup } from "./cleanup-verification-proof.js";
+import { companyHoldMismatch } from "../modules/agent-lifecycle/index.js";
+import { pendingBudgetRunCancellationPredicate } from "./heartbeat/budget-cancellation.js";
 
 export interface IdleSleepDrainStatus {
   ownerId?: string;
@@ -52,6 +54,11 @@ const WORK_CHECKS = [
     OR process_stopped_at IS NULL OR next_attempt_at IS NOT NULL
     OR receipt ? 'baseline' OR receipt->>'cleanupPending' = 'true'`,
   `SELECT 1 FROM budget_reservations WHERE state NOT IN ('settled', 'released')`,
+  `SELECT 1 FROM budget_policies WHERE enforcement_version > enforcement_delivered_version`,
+  `SELECT 1 FROM agents WHERE lifecycle_state IN
+    ('preparing', 'verifying', 'pausing', 'resuming', 'terminating', 'cleaning_up')`,
+  `SELECT 1 FROM decision_invocations WHERE status = 'running'`,
+  `SELECT 1 FROM prompt_injection_invocations WHERE status = 'running'`,
   // Persistent machine credentials can receive work without a human opening
   // the instance. They need an ingress wake contract before we can sleep.
   `SELECT 1 FROM agent_api_keys WHERE revoked_at IS NULL`,
@@ -275,6 +282,9 @@ export async function readIdleSleepSafety(
         (!scheduledRoutines || query !== `SELECT 1 FROM routines WHERE status NOT IN ('paused', 'archived')`)
         && (!scheduledIssueMonitors || query !== `SELECT 1 FROM issues WHERE status NOT IN ('done', 'cancelled')`))
         .map((query) => sql`EXISTS (${sql.raw(query)})`);
+      checks.push(sql`EXISTS (SELECT 1 FROM agents JOIN companies ON companies.id = agents.company_id
+        WHERE ${companyHoldMismatch()})`);
+      checks.push(sql`EXISTS (SELECT 1 FROM heartbeat_runs WHERE ${pendingBudgetRunCancellationPredicate()})`);
       // Only the current worker's owned runtime drain can exempt a plugin.
       // Missing workers, old SDKs, and newly installed plugins still block.
       checks.push(quietPlugins.length === 0

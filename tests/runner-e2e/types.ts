@@ -20,6 +20,10 @@ export type RunnerTaskWorkMode = "standard" | "planning" | "ask";
 export type RunnerTaskFlow =
   | "case_handoff"
   | "task_workspaces"
+  | "automatic_repository"
+  | "repository_verification"
+  | "finalization_recovery"
+  | "followup_stop_resume"
   | "repository_skills"
   | "provider_connection"
   | "plan_task_guidance"
@@ -292,6 +296,12 @@ export interface RunnerE2EResult {
     ref: string | null;
     workflowRunUrl: string | null;
   };
+  dependableWork?: {
+    campaignId: string;
+    cell: import("./dependable-qualification.js").DependableCell;
+    phase: "candidate" | "staging";
+    evidence: Omit<import("./dependable-qualification.js").DependableAttempt["evidence"], "manifestVerified" | "secretScanPassed">;
+  };
   rankingSnapshot?: {
     snapshotId: string;
     capturedAt: string;
@@ -312,6 +322,7 @@ export interface RunnerE2EResult {
   issueId?: string;
   issueIdentifier?: string | null;
   runIds?: string[];
+  latencyProbes?: import("./latency-timing.js").LatencyResult[];
   startupReuse?: Array<{ runId: string } & import("../../packages/adapter-utils/src/startup-reuse.js").StartupReuseSummary>;
   turnTimings?: Array<{
     turn: number;

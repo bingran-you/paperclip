@@ -1,3 +1,4 @@
+import { insertIssueComment } from "../issue-comment-writes.js";
 import {
   issues,
   issueComments,
@@ -383,7 +384,7 @@ export function createHeartbeatScheduling(
     }
 
     if (input.recoveryPolicy === "escalate_to_board") {
-      await db.insert(issueComments).values({
+      await insertIssueComment(db, {
         companyId: input.claimed.companyId,
         issueId: input.claimed.id,
         body: monitorRecoveryComment({

@@ -3,10 +3,30 @@ import { environmentLeases, environments, heartbeatRuns, issueRecoveryActions, n
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { SystemRecoveryFailure } from "./system-recovery-state.js";
+import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
+import { readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
 export const workspaceExportCauses = ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"];
 export const terminalWorkspaceRunStates = ["failed", "interrupted", "timed_out", "cancelled", "succeeded"];
 export type WorkspaceRecoverySourceIdentity = { companyId: string; issueId: string; runId: string; actionId: string };
+
+/** The preservation owner may reopen only its exact stop-only allocation.
+ * This does not release the source's ordinary execution or destruction fence. */
+export async function ownedWorkspaceRecoveryLease(db: Db, input: WorkspaceRecoverySourceIdentity & {
+  leaseId: string; environmentId: string; ownership: NativeWorkspaceFinalizationOwnership;
+}) {
+  await input.ownership.assertHeld();
+  const inspected = await inspectWorkspaceRecoverySource(db, input);
+  const source = inspected.sources.find(item => item.lease.id === input.leaseId);
+  if (!source || source.environment.id !== input.environmentId || source.lease.status !== "pending_cleanup"
+    || source.lease.metadata?.pendingCleanupInFlight !== true
+    || source.lease.metadata?.pendingCleanupAttemptId !== input.ownership.token
+    || !readStopOnlyCleanup(source.lease)) {
+    throw new SystemRecoveryFailure("source_binding_invalid", "service_required");
+  }
+  await input.ownership.assertHeld();
+  return source;
+}
 
 /** Resolve only the immutable source recorded by the failed run. Never discover
  * a candidate by recency, mutable adapter configuration, or a provider search. */

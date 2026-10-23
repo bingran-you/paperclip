@@ -1,3 +1,4 @@
+import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import { activeNativeExecutionRunIds, NATIVE_PREPARATION_FENCING_VERSION } from "./native-active-runs.js";
 import {
@@ -10,6 +11,7 @@ import { and, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
@@ -626,11 +628,16 @@ export async function claimNativeRestartRecoveries(input: {
       const remoteWorkspace = readNativeWorkspaceSyncReference(
         profile.nativeWorkspaceSync,
       );
+      const [pluginTask] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, row.run.companyId), eq(environmentLeases.heartbeatRunId, row.run.id),
+        sql`${environmentLeases.metadata}->>'runnerTaskLease' = 'true'`,
+      )).limit(1);
       const remoteSandbox = profile.nativeWorkspaceSync != null;
+      const remoteProcess = remoteSandbox || !!pluginTask;
       const runnerPidAlive =
-        !remoteSandbox && processIsAlive(row.run.processPid);
+        !remoteProcess && processIsAlive(row.run.processPid);
       const runnerGroupAlive =
-        !remoteSandbox && processGroupIsAlive(row.run.processGroupId);
+        !remoteProcess && processGroupIsAlive(row.run.processGroupId);
       const observedRunnerStart =
         row.run.processPid && runnerPidAlive
           ? await observedProcessStart(row.run.processPid)
@@ -753,7 +760,7 @@ export async function claimNativeRestartRecoveries(input: {
         }
       }
       const providerProcesses = await evaluateNativeProviderProcesses({
-        identities: (remoteSandbox ? [] : providerProcessIdentities).filter(
+        identities: (remoteProcess ? [] : providerProcessIdentities).filter(
           (identity) => identity.pid !== row.run.processPid,
         ),
       });
@@ -855,6 +862,7 @@ export async function claimNativeRestartRecoveries(input: {
           recycledProviderPids: providerProcesses.recycledPids,
           stderrTail: row.run.stderrExcerpt,
         });
+        await notifyExecutionRunWork(tx);
         await tx
           .update(nativeRunFinalizations)
           .set({

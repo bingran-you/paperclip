@@ -536,13 +536,13 @@ Longer polling intervals alone do not complete an item.
   retain subscription scope, expiry, and replay safety. Source:
   [events.ts](../../server/src/services/public-mcp/events.ts).
 
-- [ ] **JOB-06 — Execution-control reconciliation.** Current: independent
-  **15s** recovery/delivery lanes, including when the main heartbeat is disabled.
-  Change: activate lanes from durable pending work and deadlines. **Complete
-  when:** empty lanes are quiet and abandoned finalizations, replacements,
-  continuations, status/disposition delivery, and login expiry still recover.
-  Sources: [index.ts](../../server/src/index.ts),
-  [execution-control-deadline.ts](../../server/src/services/execution-control-deadline.ts).
+- [x] **JOB-06 — Execution-control reconciliation.** Implemented in
+  [PR #17094](https://github.com/paperclipai/paperclip/pull/17094): six independent
+  workers wake from committed writes, saved control/login deadlines, or concrete
+  unfinished obligations. Empty queues and completed history no longer cause
+  recurring SQL. Existing 15s retries remain for pending work; Cloud sleep
+  eligibility and external alarm coverage are unchanged. See the
+  [worker and producer contract](../idle-execution-control.md).
 
 - [ ] **JOB-07 — Plugin job scheduling.** Current: **30s** SQL even without jobs.
   Change: register nearest `nextRunAt` and signal registration/update/removal.
@@ -620,12 +620,16 @@ Longer polling intervals alone do not complete an item.
   malformed/unpersisted spool entries. Source:
   [heartbeat.ts](../../server/src/services/heartbeat.ts), `sweepPendingCleanupLeases`.
 
-- [ ] **JOB-18 — Adapter login and setup-token reapers.** Current: **30s**
-  durable-session/lease scans, alongside local one-shot timers. Change: register
-  actual expiry and cleanup retry times. **Complete when:** abandoned logins and
-  interrupted teardown still release sandboxes across restart, without scans
-  when no obligations exist. Source:
-  [index.ts](../../server/src/index.ts), adapter and setup-token reaper wiring.
+- [x] **JOB-18 — Adapter login and setup-token reapers.** Replaced the default
+  **30s** empty scans with commit-aware workers, session/promotion expiry
+  deadlines, and retries for concrete failed cleanup. Existing session and lease
+  rows remain authoritative; no queue table was added. Startup reconstructs work,
+  and drain retains deferred generations. Tagged orphan recovery protects live
+  acquisitions and includes terminal/missing-session orphans. Local-subscription
+  rows remain owned by their separate worker. General failed-acquisition spool
+  recovery and host-sleep blockers are unchanged. See
+  [idle-login-cleanup.md](../idle-login-cleanup.md) for producer coverage,
+  verification and remaining provider-orphan boundaries.
 
 - [ ] **JOB-19 — Custom-image setup expiry.** Current: **30s** active-session
   expiry scans. Change: register `expiresAt` and cleanup attempts. **Complete

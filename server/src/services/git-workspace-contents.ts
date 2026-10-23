@@ -11,6 +11,9 @@ import { localRepositoryPath } from "./local-repository-path.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
 import { materializeManagedProjectWorkspace } from "./managed-repository-checkout.js";
 import { ensureSavedGitCommit, gitCacheCommand, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
+import { applyGitRestorePointToWorktree, ensureGitRestorePointCommit, type GitRestorePointRef } from "./git-restore-point-storage.js";
+import { getStorageService } from "../storage/index.js";
+import type { StorageService } from "../storage/types.js";
 
 export const CLAUDE_SETTINGS_PATH = ".claude/settings.local.json";
 const SETTINGS_LIMIT = 64 * 1024;
@@ -20,6 +23,7 @@ type Settings = { material: StoredSecretVersionMaterial } | null;
 export type ManagedCheckoutSource = { id: string; repoUrl: string; repoRef: string | null; cwd: string | null };
 export type ManagedCheckoutContents = {
   name: string; source: ManagedCheckoutSource; commit: string; branchName: string | null;
+  restorePoint?: GitRestorePointRef;
 };
 export type GitWorkspaceContents = {
   schema: "paperclip.git-workspace-contents.v1";
@@ -141,8 +145,9 @@ export async function captureGitWorkspaceContents(cwd: string, identity: Identit
 
 export async function assertGitWorkspaceContentsUnchanged(cwd: string, identity: Identity, contents: GitWorkspaceContents | undefined, checkouts: ManagedCheckoutContents[]) {
   validateGitWorkspaceContents(contents);
-  const recorded = contents?.checkouts.map(({ settings: _settings, ...checkout }) => checkout) ?? [];
-  if (!isDeepStrictEqual(recorded, checkouts.sort((a, b) => a.name.localeCompare(b.name)))) throw new Error("managed_checkouts_changed");
+  const recorded = contents?.checkouts.map(({ settings: _settings, restorePoint: _restorePoint, ...checkout }) => checkout) ?? [];
+  const actual = checkouts.map(({ restorePoint: _restorePoint, ...checkout }) => checkout).sort((a, b) => a.name.localeCompare(b.name));
+  if (!isDeepStrictEqual(recorded, actual)) throw new Error("managed_checkouts_changed");
   const assertSettings = async (root: string, saved: Settings, relative: string) => {
     if (!isDeepStrictEqual(await readSettings(root), await savedSettings(saved, identity, relative))) throw new Error("local_settings_changed");
   };
@@ -188,9 +193,11 @@ async function restoreSettings(cwd: string, settings: Settings, identity: Identi
 
 export async function restoreGitWorkspaceContents(input: Identity & { cwd: string; contents?: GitWorkspaceContents;
   prepareLocalSource?: (sourceCwd: string) => Promise<() => Promise<void>>;
+  storage?: StorageService;
   resolveGitAuth: GitRemoteAuthProvider; authorizeSource: (source: ManagedCheckoutSource) => Promise<void> }) {
   if (!input.contents) return;
   validateGitWorkspaceContents(input.contents);
+  const workspace = { companyId: input.companyId, id: input.workspaceId };
   try {
     for (const checkout of input.contents.checkouts) {
       await input.authorizeSource(checkout.source);
@@ -208,15 +215,21 @@ export async function restoreGitWorkspaceContents(input: Identity & { cwd: strin
           || (await gitCacheCommand(destination, ["config", "--local", "--null", "--get-all", "remote.origin.url"])) !== `${checkout.source.repoUrl}\0`) throw new GitCacheRestorationFailure();
         const actual = await readManagedCheckoutContents(destination, checkout.name, checkout.source);
         if (actual.commit !== checkout.commit || actual.branchName !== checkout.branchName) throw new GitCacheRestorationFailure();
+        if (checkout.restorePoint) await applyGitRestorePointToWorktree({ storage: input.storage ?? getStorageService(), workspace,
+          ref: checkout.restorePoint, repositoryCwd: destination, worktreePath: destination });
         await restoreSettings(destination, checkout.settings, input, relative);
         continue;
       }
       const result = await materializeManagedProjectWorkspace(destination, { repoUrl: checkout.source.repoUrl,
         resolveGitAuth: input.resolveGitAuth, beforePublish: async temporary => {
+          if (checkout.restorePoint) await ensureGitRestorePointCommit({ storage: input.storage ?? getStorageService(), workspace,
+            ref: checkout.restorePoint, repositoryCwd: temporary });
           await ensureSavedGitCommit(temporary, checkout.source.repoUrl, checkout.commit, input.resolveGitAuth);
           if (checkout.branchName) await gitCacheCommand(temporary, ["check-ref-format", "--branch", checkout.branchName]);
           await gitCacheCommand(temporary, checkout.branchName
             ? ["checkout", "-B", checkout.branchName, checkout.commit] : ["checkout", "--detach", checkout.commit]);
+          if (checkout.restorePoint) await applyGitRestorePointToWorktree({ storage: input.storage ?? getStorageService(), workspace,
+            ref: checkout.restorePoint, repositoryCwd: temporary, worktreePath: temporary });
           await gitCacheCommand(temporary, ["reflog", "expire", "--expire=now", "--all"]);
           await restoreSettings(temporary, checkout.settings, input, relative);
           await input.authorizeSource(checkout.source);

@@ -391,6 +391,21 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(result.executionTarget).toBeNull();
   });
 
+  it("forwards authorized project IDs to task-only providers without staging directories", async () => {
+    const environment = makeEnvironment("plugin" as Environment["driver"]);
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "remote", transport: "sandbox",
+      providerKey: "plugin", remoteCwd: "provider/project", runnerTask: vi.fn() });
+    const runtime = makeMockRuntime({ supportsTasks: vi.fn().mockResolvedValue(true) });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    const input = { ...makeRealizeInput({ environment }), adapterType: "paperclip_runner",
+      runnerTaskProjectIds: ["anchor", "authorized-reference", "anchor"] };
+    input.executionWorkspace.projectId = "anchor";
+    const result = await orchestrator.realizeForRun(input);
+    expect(result.executionTarget).toMatchObject({ runnerTaskProjectIds: ["anchor", "authorized-reference"] });
+    expect(runtime.realizeWorkspace).not.toHaveBeenCalled();
+    expect(runtime.execute).not.toHaveBeenCalled();
+  });
+
   it("persisted metadata is updated on lease and execution workspace after realization", async () => {
     const persistedExecutionWorkspace = makePersistedExecutionWorkspace();
     const updatedLease = makeLease({

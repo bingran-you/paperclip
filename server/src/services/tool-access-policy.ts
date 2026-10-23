@@ -188,6 +188,11 @@ function sha256(value: unknown): string {
   return createHash("sha256").update(stableStringify(value)).digest("hex");
 }
 
+type ConsumedRateAdmission = { policyId: string; versionHash: string };
+function ratePolicyVersionHash(policy: typeof toolPolicies.$inferSelect): string {
+  return sha256({ ...policy, createdAt: policy.createdAt.toISOString(), updatedAt: policy.updatedAt.toISOString() });
+}
+
 function isoDateOrNull(value: unknown): string | null {
   if (!value) return null;
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
@@ -1336,6 +1341,32 @@ export function toolAccessPolicyService(db: Db) {
     });
   }
 
+  async function admittedRateLimitAdmissions(ctx: ToolAccessContext, invocationId: string): Promise<ConsumedRateAdmission[]> {
+    const [invocation] = await db.select({
+      actorType: toolInvocations.actorType, actorId: toolInvocations.actorId, agentId: toolInvocations.agentId,
+      runId: toolInvocations.runId, issueId: toolInvocations.issueId, gatewayId: toolInvocations.gatewayId,
+      applicationId: toolInvocations.applicationId, connectionId: toolInvocations.connectionId,
+      catalogEntryId: toolInvocations.catalogEntryId, toolName: toolInvocations.toolName,
+      providerType: toolInvocations.providerType, applicationKey: toolInvocations.applicationKey,
+      upstreamToolName: toolInvocations.upstreamToolName, argumentsHash: toolInvocations.argumentsHash,
+      status: toolInvocations.status, policyDecision: toolInvocations.policyDecision, approvalState: toolInvocations.approvalState,
+      policyExplanation: toolInvocations.policyExplanation,
+    }).from(toolInvocations).where(and(eq(toolInvocations.companyId, ctx.companyId), eq(toolInvocations.id, invocationId)));
+    const authorized = invocation && invocation.status === "executing"
+      && (invocation.policyDecision === "allow" || (invocation.policyDecision === "require_approval" && invocation.approvalState === "approved"))
+      && invocation.actorType === ctx.actorType && invocation.actorId === ctx.actorId && invocation.agentId === ctx.agentId
+      && invocation.runId === ctx.heartbeatRunId && invocation.issueId === ctx.issueId && invocation.gatewayId === ctx.gatewayId
+      && invocation.applicationId === ctx.applicationId && invocation.connectionId === ctx.connectionId
+      && invocation.catalogEntryId === ctx.catalogEntryId && invocation.toolName === ctx.toolName
+      && invocation.providerType === ctx.providerType && invocation.applicationKey === ctx.applicationKey
+      && invocation.upstreamToolName === ctx.upstreamToolName
+      && invocation.argumentsHash === ctx.argumentsHash;
+    const stored = authorized ? invocation.policyExplanation?.consumedRateAdmissions : null;
+    return Array.isArray(stored) ? stored.filter((item): item is ConsumedRateAdmission => isRecord(item)
+      && typeof item.policyId === "string" && CANONICAL_UUID_RE.test(item.policyId)
+      && typeof item.versionHash === "string" && /^[a-f0-9]{64}$/.test(item.versionHash)) : [];
+  }
+
   /**
    * Decides one tool access request. Pass the same `cache` to every call of a
    * batch that shares one actor and run context (for example, one tools/list
@@ -1343,14 +1374,32 @@ export function toolAccessPolicyService(db: Db) {
    */
   async function decide(
     input: ToolAccessDecisionInput,
-    options: { cache?: ToolAccessDecisionCache } = {},
+    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string } = {},
+  ): Promise<ToolAccessDecision> {
+    const consumedRateAdmissions: ConsumedRateAdmission[] = [];
+    const result = await decideInternal(input, options, consumedRateAdmissions);
+    return consumedRateAdmissions.length ? { ...result,
+      policyExplanation: { ...result.policyExplanation, consumedRateAdmissions },
+    } : result;
+  }
+
+  async function decideInternal(
+    input: ToolAccessDecisionInput,
+    options: { cache?: ToolAccessDecisionCache; admittedInvocationId?: string },
+    consumedRateAdmissions: ConsumedRateAdmission[],
   ): Promise<ToolAccessDecision> {
     // A decision that consumes a rate limit can also record a trust-rule hit
     // from the policy row, so it always reads fresh rows.
-    const cache = input.consumeRateLimit === true ? undefined : options.cache;
+    const cache = input.consumeRateLimit === true || options.admittedInvocationId ? undefined : options.cache;
     const loaded = await loadContext(input, cache);
     if (!loaded.ok) return loaded.decision;
     const { ctx, redaction } = loaded;
+    // A final handoff rechecks current permissions for work already admitted by
+    // the gateway. Its own last consumed slot cannot reject that same work.
+    // Only durable consumption of an unchanged rule retains that slot; new or
+    // edited rules still apply. This option never approves or consumes a call.
+    const admittedRates = input.consumeRateLimit === false && options.admittedInvocationId
+      ? await admittedRateLimitAdmissions(ctx, options.admittedInvocationId) : [];
     const profileState = await effectiveProfiles(ctx, cache);
     const effectiveProfileIds = profileState.profiles.map((profile) => profile.id);
     const permittedByProfile = profileState.profiles.some((profile) => {
@@ -1422,10 +1471,13 @@ export function toolAccessPolicyService(db: Db) {
             { redactionPlan: redaction.redactionPlan, policyExplanation },
           );
         }
+        const versionHash = ratePolicyVersionHash(policy);
+        if (admittedRates.some(admission => admission.policyId === policy.id && admission.versionHash === versionHash)) continue;
         const state = await enforceRateLimit(policy, ctx, input.consumeRateLimit === true);
         if (state?.limited) {
           return decision("rate_limited", "rate_limited", "Tool access rate limit exceeded.", effectiveProfileIds, [policy.id], { rateLimitState: state, redactionPlan: redaction.redactionPlan, policyExplanation });
         }
+        if (state && input.consumeRateLimit === true) consumedRateAdmissions.push({ policyId: policy.id, versionHash });
         continue;
       }
       if (policy.policyType === "trust_rule") {
@@ -1608,6 +1660,7 @@ export function toolAccessPolicyService(db: Db) {
       agentId: ctx.agentId,
       issueId: ctx.issueId,
       runId: ctx.heartbeatRunId,
+      gatewayId: ctx.gatewayId,
       applicationId: ctx.applicationId,
       connectionId: ctx.connectionId,
       catalogEntryId: ctx.catalogEntryId,
@@ -1621,6 +1674,7 @@ export function toolAccessPolicyService(db: Db) {
       argumentsHash,
       argumentsSummary: redaction.summary,
       policyDecision: accessDecision.decision,
+      policyExplanation: accessDecision.policyExplanation ?? null,
       matchedPolicyIds: accessDecision.matchedPolicyIds,
       approvalState: accessDecision.decision === "require_approval" ? "pending" : "not_required",
       status,
