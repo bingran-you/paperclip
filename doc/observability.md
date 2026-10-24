@@ -1036,6 +1036,20 @@ receives a plain error with the existing generic message and default grouping.
 The context does not change the HTTP response, authentication, cookies, cache,
 deadline, or single-fetch behavior, and does not carry into unrelated events.
 
+A file storage provider failure has an event-local `storage_failure` context
+and `storage_operation` and `storage_error_code` tags. The S3 provider records
+the failed call (`put_object`, `get_object`, `head_object`, `delete_object`,
+`create_multipart_upload`, `upload_part`, or `complete_multipart_upload`),
+the provider's error code, the HTTP status, the provider-issued request ID,
+and the SDK attempt count. Values come from the SDK error's own data
+properties. A value that does not match its bounded format becomes `unknown`
+or `null`. The record never includes the bucket, object key, endpoint,
+credentials, error message, or provider response body (such as an S3
+`StringToSign`). Sentry receives the original error with default grouping,
+so existing issues keep collecting events. The record does not change
+storage behavior, not-found handling, or HTTP responses. It is attached only
+to the error that the failed call threw.
+
 An unconfirmed adapter Stop timeout has an event-local `adapter_stop` context:
 the run UUID, built-in adapter type, native/legacy runtime mode, configured
 wait duration, and whether abort was requested. Invalid identities become

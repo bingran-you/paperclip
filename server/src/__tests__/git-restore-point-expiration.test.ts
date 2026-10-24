@@ -56,7 +56,7 @@ describeEmbeddedPostgres("git restore point expiration", () => {
     git(source, "init", "--initial-branch=main");
     await fs.writeFile(path.join(source, "marker.txt"), "commit A\n");
     await fs.writeFile(path.join(source, "remove-me.txt"), "tracked\n");
-    await fs.writeFile(path.join(source, ".gitignore"), "node_modules/\n.env\n.claude/settings.local.json\n");
+    await fs.writeFile(path.join(source, ".gitignore"), "node_modules/\n.env\n.claude/settings.local.json\n*.tsbuildinfo\nevidence/\n");
     git(source, "add", "."); git(source, "commit", "-m", "A");
     git(location, "clone", "--bare", source, remote); git(source, "remote", "add", "origin", remote);
     await db.insert(companies).values({ id: companyId, name: "Restore point fixture", issuePrefix: `RP${companyId.slice(0, 6)}` });
@@ -354,6 +354,35 @@ describeEmbeddedPostgres("git restore point expiration", () => {
       expect(await f.expire(idle())).toMatchObject({ expired: false, skipReason: "live_or_unresolved_consumer" });
       expect(await exists(f.cwd)).toBe(true);
     });
+  });
+
+  it("expires a worktree whose only extra files are ignored, and restores them on reopen", async () => {
+    const f = await fixture();
+    await fs.mkdir(path.join(f.cwd, "ui"), { recursive: true });
+    await fs.writeFile(path.join(f.cwd, "ui", "tsconfig.tsbuildinfo"), "{\"version\":\"5\"}\n");
+    await fs.mkdir(path.join(f.cwd, "evidence"));
+    await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "agent evidence\n");
+    await fs.mkdir(path.join(f.cwd, "node_modules", "pkg"), { recursive: true });
+    await fs.writeFile(path.join(f.cwd, "node_modules", "pkg", "index.js"), "regenerable\n");
+    expect(git(f.cwd, "status", "--porcelain")).toBe("");
+    expect(await f.expire({ restorePoint: undefined })).toMatchObject({ expired: false, skipReason: "unique_ignored_files" });
+    expect(await f.expire()).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+    expect(await exists(f.cwd)).toBe(false);
+    expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+    expect(await fs.readFile(path.join(f.cwd, "ui", "tsconfig.tsbuildinfo"), "utf8")).toBe("{\"version\":\"5\"}\n");
+    expect(await fs.readFile(path.join(f.cwd, "evidence", "run.log"), "utf8")).toBe("agent evidence\n");
+    expect(await exists(path.join(f.cwd, "node_modules", "pkg", "index.js"))).toBe(false);
+  });
+
+  it("rolls back when an ignored file changes after capture", async () => {
+    const f = await fixture();
+    await fs.mkdir(path.join(f.cwd, "evidence"));
+    await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "agent evidence\n");
+    const result = await f.expire({ beforeDelete: async () => {
+      await fs.writeFile(path.join(f.cwd, "evidence", "run.log"), "written after capture\n");
+    } });
+    expect(result).toMatchObject({ expired: false, skipReason: "restore_point_contents_changed" });
+    expect(await fs.readFile(path.join(f.cwd, "evidence", "run.log"), "utf8")).toBe("written after capture\n");
   });
 
   it("reports a restore point candidate in dry run without storing anything", async () => {

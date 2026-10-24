@@ -755,6 +755,7 @@ V1 non-terminal liveness rule:
 
 - agent-owned `todo`, `in_progress`, `in_review`, and `blocked` issues must have a live execution path, an explicit waiting path, or an explicit recovery path
 - `in_review` is healthy only when a typed execution participant, pending issue-thread interaction or approval, user owner, active run, queued wake, or explicit recovery action owns the next action
+- A published advisory GitHub review can also remain `in_review` through an authorized external response wait or a saved monitor. Rating, CI state, and merge state alone do not create human attention. The current committed wait is an action path while its assigned endpoint and conversation remain active; it creates no Mine participation.
 - a blocked chain is covered only when each unresolved leaf issue is live or explicitly waiting
 - external waits are durable only when persisted as a bounded monitor/scheduled wake, a first-class blocker with a named owner and action, or healthy delegated child work connected by a blocker edge when the source must wait; parent/child structure alone is not a wait path
 - unmanaged shell jobs, detached sessions, adapter child processes, local polling loops, PIDs, logs, and comments are evidence rather than liveness; a managed runtime service counts only when paired with a persisted monitor, wake, blocker, or delegated issue that owns the next check

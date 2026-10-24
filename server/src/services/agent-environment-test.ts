@@ -472,21 +472,27 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
     environmentId: string,
     adapterType?: string,
   ): Promise<void> {
+    if (!await assertAdapterTestEnvironmentBinding(companyId, environmentId)) return;
+    await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
+      allowedDrivers: adapterType === "paperclip_runner" ? [...ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS, "plugin"] : ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS,
+    });
+  }
+
+  // The company-binding half of the guard. A route that must resolve the
+  // runner before it knows the adapter type runs this first, then runs the
+  // full guard with the resolved adapter type. Returns the environment, or
+  // null for a missing one, which leaks no tenant state; the execution-context
+  // resolver surfaces the existing environment_not_found check.
+  async function assertAdapterTestEnvironmentBinding(companyId: string, environmentId: string) {
     const environment = await environmentsSvc.getById(environmentId);
-    if (!environment) {
-      // A missing environment leaks no tenant state. The execution-context
-      // resolver surfaces the existing environment_not_found check.
-      return;
-    }
+    if (!environment) return null;
     const boundCompanyIds = await environmentsSvc.listBoundCompanyIds(environmentId);
     if (boundCompanyIds.length > 0 && !boundCompanyIds.includes(companyId)) {
       throw forbidden("The selected environment belongs to another company.", {
         code: "environment_company_mismatch",
       });
     }
-    await assertEnvironmentSelectionForCompany(environmentsSvc, companyId, environmentId, {
-      allowedDrivers: adapterType === "paperclip_runner" ? [...ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS, "plugin"] : ADAPTER_TEST_ALLOWED_ENVIRONMENT_DRIVERS,
-    });
+    return environment;
   }
 
   async function testManagedEnvironment(adapterType: string, context: Parameters<ReturnType<typeof requireServerAdapter>["testEnvironment"]>[0], binding: AiConnectionBinding, managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>>, agentId?: string) {
@@ -579,5 +585,5 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
   }
 
 
-  return { resolveAdapterTestEnvironmentId, resolveAdapterTestExecutionContext, assertAdapterTestEnvironmentForCompany, testManagedEnvironment };
+  return { resolveAdapterTestEnvironmentId, resolveAdapterTestExecutionContext, assertAdapterTestEnvironmentForCompany, assertAdapterTestEnvironmentBinding, testManagedEnvironment };
 }

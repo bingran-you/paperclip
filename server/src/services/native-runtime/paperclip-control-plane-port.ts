@@ -420,6 +420,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
         set: {
           phase: "workspace_finalizing",
           resultId: inserted.id,
+          recoveryState: null,
+          recoveryRequestId: null,
           failureCode: null,
           failureDetail: null,
           nextAttemptAt: null,

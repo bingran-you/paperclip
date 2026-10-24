@@ -7686,11 +7686,12 @@ export function issueRoutes(
     return commentCreatedAtMs >= activeRunStartedAtMs;
   }
   async function getClosedIssueExecutionWorkspace(issue: {
+    companyId: string;
     executionWorkspaceId?: string | null;
   }) {
     if (!issue.executionWorkspaceId) return null;
-    const workspace = await executionWorkspacesSvc.getById(
-      issue.executionWorkspaceId,
+    const workspace = await executionWorkspacesSvc.getStoredById(
+      issue.companyId, issue.executionWorkspaceId,
     );
     if (!workspace || !isClosedIsolatedExecutionWorkspace(workspace))
       return null;
@@ -8925,7 +8926,7 @@ export function issueRoutes(
         : null;
 
     const currentExecutionWorkspacePromise = issue.executionWorkspaceId
-      ? executionWorkspacesSvc.getById(issue.executionWorkspaceId)
+      ? executionWorkspacesSvc.getStoredById(issue.companyId, issue.executionWorkspaceId, { includeRuntimeServices: true })
       : Promise.resolve(null);
     const [
       { project, goal },
@@ -9292,7 +9293,7 @@ export function issueRoutes(
       inboxArchiveFieldsPromise,
       timing.time("channel", () => getExternalChannelBindingSummary(db, issue.companyId, issue.id)),
       timing.time("workspace", () => issue.executionWorkspaceId
-        ? executionWorkspacesSvc.getById(issue.executionWorkspaceId)
+        ? executionWorkspacesSvc.getStoredById(issue.companyId, issue.executionWorkspaceId, { includeRuntimeServices: true })
         : Promise.resolve(null)),
       timing.time("work_products", () => workProductsSvc.listForIssue(issue.id)),
       timing.time("created_from", () => resolveVisibleIssueCreationSource(req, issue)),

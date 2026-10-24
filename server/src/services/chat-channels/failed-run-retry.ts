@@ -1,5 +1,5 @@
 import { continuingTeamsFilePublication, type ContinuingTeamsFileTransfer } from "./microsoft-teams/file-transfer-source.js";
-import { readTaskChatRetryIntent, taskChatRetryExecutionStopped } from "./task-retry-authority.js";
+import { readTaskChatRetryIntent, taskChatRetryCanAwaitRecovery, taskChatRetryExecutionStopped } from "./task-retry-authority.js";
 import { notifyChatActionWork, notifyChatPublicationWork } from "../chat-work-notifications.js";
 import { FAILED_RUN_RETRY_STALE_MS, dueChatAction } from "../chat-action-work.js";
 
@@ -549,6 +549,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     source: Pick<FailedChatRetrySource, "failedRunId" | "issueId" | "agentId">,
     companyId: string,
     taskRetryIntentId?: string,
+    allowPendingRecovery = false,
   ) {
     const [run] = await tx
       .select()
@@ -566,6 +567,9 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       if (!await readTaskChatRetryIntent(tx as unknown as Db, { companyId, issueId: source.issueId,
         agentId: source.agentId, sourceRunId: run.id, intentId: taskRetryIntentId })) throw failedChatRetryDenied();
       if (await taskChatRetryExecutionStopped(tx as unknown as Db, run)) return;
+      if (allowPendingRecovery && await taskChatRetryCanAwaitRecovery(
+        tx as unknown as Db, run, source.issueId, taskRetryIntentId,
+      )) return;
       // A still-live/unknown executor remains held. The exact pre-provider
       // proof below can establish a never-started native attempt.
       if (run.runtimeMode !== "native") throw failedChatRetryDenied();
@@ -1437,7 +1441,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         retryActionId: input.wakeupRequestId,
       });
       await assertFailedNativeRetryState(tx, source, input.companyId,
-        typeof source.intent.payload.taskRetryIntentId === "string" ? source.intent.payload.taskRetryIntentId : undefined);
+        typeof source.intent.payload.taskRetryIntentId === "string" ? source.intent.payload.taskRetryIntentId : undefined,
+        input.phase === "admission");
       const context = input.contextSnapshot;
       const hint = context.chatFailedRunRetry as
         | Record<string, unknown>
@@ -1587,10 +1592,13 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         authorizeFailedChatRunRetry(tx, scope),
       );
       const existing = await db
-        .select({ id: agentWakeupRequests.id })
+        .select()
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, claimed.id));
-      if (!existing.length) {
+      const resumeTaskRetry = typeof claimed.payload.taskRetryIntentId === "string" &&
+        existing[0]?.status === "deferred_issue_execution" && !existing[0].runId &&
+        existing[0].payload?.taskRetryRequestId === claimed.payload.taskRetryIntentId;
+      if (!existing.length || resumeTaskRetry) {
         const context = {
           issueId: source.issueId,
           ...(typeof claimed.payload.taskRetryIntentId === "string" ? {
@@ -1641,6 +1649,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
                 current,
                 claimed.companyId,
                 typeof claimed.payload.taskRetryIntentId === "string" ? claimed.payload.taskRetryIntentId : undefined,
+                true, // The durable wake callback validates admission; later phases recheck containment.
               );
             },
           }),
@@ -1662,11 +1671,6 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         .select()
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, claimed.id));
-      if (receipt)
-        return settle("processed", {
-          code: "failed_chat_retry_durable",
-          attemptCount,
-        });
       const denied =
         error &&
         typeof error === "object" &&
@@ -1678,6 +1682,24 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           "chat_failed_run_retry_not_authorized",
           "chat_action_authorization_changed",
         ].includes(String(error.details.code));
+      if (receipt) {
+        if (denied && typeof claimed.payload.taskRetryIntentId === "string" &&
+            receipt.status === "deferred_issue_execution" && !receipt.runId &&
+            receipt.payload?.taskRetryRequestId === claimed.payload.taskRetryIntentId) {
+          // Receipt existence proves the earlier wait, not current authority.
+          // Retire only this unadmitted wake; an admitted run keeps its history.
+          await db.update(agentWakeupRequests).set({
+            status: "failed", error: "chat_failed_run_retry_not_authorized",
+            finishedAt: new Date(), updatedAt: new Date(),
+          }).where(and(eq(agentWakeupRequests.id, receipt.id),
+            eq(agentWakeupRequests.companyId, claimed.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
+          return settle("failed", { code: "failed_chat_retry_not_authorized", attemptCount });
+        }
+        return settle(["skipped", "failed", "cancelled"].includes(receipt.status) ? "failed" : "processed", {
+          code: "failed_chat_retry_durable", attemptCount,
+        });
+      }
       const retryable = !denied && attemptCount < 8;
       return settle(retryable ? "issued" : "failed", {
         code: retryable

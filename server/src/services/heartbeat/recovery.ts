@@ -8,7 +8,7 @@ import {
   hasStopOnlyCleanup,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
-import { recordNativeLocalProcessStop } from "../native-local-process-stop.js";
+import { discoverSettledNativeRunProcesses, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
@@ -1920,6 +1920,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  let settledProcessesDiscovered = false;
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     await preserveCancelledNativeWorkspaces(db);
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
@@ -2049,6 +2051,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         return cleared;
       });
       if (cleared) claimableNativeRunIds.add(cleared.id);
+    }
+
+    const executingRun = (runId: string) => activeRunExecutions.has(runId) || runningProcesses.has(runId);
+    if (!settledProcessesDiscovered) {
+      settledProcessesDiscovered = await discoverSettledNativeRunProcesses(db, { skip: executingRun }).then(() => true, (error) => {
+        logger.warn({ err: error }, "failed to discover settled native process identities");
+        return false;
+      });
+    } else {
+      await retryPendingSettledNativeRunProcesses(db, { skip: executingRun }).catch((error) => {
+        logger.warn({ err: error }, "failed to retry settled native process identity release");
+      });
     }
 
     // An explicit result-less retryable failure resumes on the original run.

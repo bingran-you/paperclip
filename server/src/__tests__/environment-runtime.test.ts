@@ -1,5 +1,6 @@
 import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
 import { collectRunFailureDiagnostics } from "../services/run-failure-diagnostics.js";
+import { createSandboxOrphanCleanupSpool } from "../services/sandbox-orphan-cleanup-spool.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
@@ -2367,6 +2368,34 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       factorySpy.mockRestore();
       destroySpy.mockRestore();
     }
+  });
+
+  it("ingests a replacement orphan appended after startup without duplicate concurrent cleanup", async () => {
+    const {companyId,environment,runId}=await seedEnvironment({driver:"sandbox",name:"Late plugin orphan",config:{provider:"fake",image:"ubuntu:24.04",reuseLease:false}});
+    let release!:()=>void,entered!:()=>void;
+    const pending=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{entered=resolve;});
+    const realEnvironmentService=environmentsModule.environmentService;
+    const factory=vi.spyOn(environmentsModule,"environmentService").mockImplementation(database=>{
+      const real=realEnvironmentService(database);
+      return {...real,insertPendingCleanupLease:async input=>{entered();await pending;return real.insertPendingCleanupLease(input);}};
+    });
+    try {
+      const spool=createSandboxOrphanCleanupSpool(process.env.SANDBOX_ORPHAN_CLEANUP_SPOOL_DIR!);
+      const active=environmentRuntimeService(db,{orphanCleanupSpool:spool});
+      expect(await active.flushDeferredOrphanCleanups()).toEqual({recovered:0,pending:0});
+      const record={companyId,environmentId:environment.id,executionWorkspaceId:null,issueId:null,heartbeatRunId:runId,
+        provider:"plugin:fixture:tasks",providerLeaseId:"late-task",metadata:{driver:"plugin",runnerTaskDispatched:false}};
+      expect(await spool.append(record)).toBe(true);
+      const first=active.flushDeferredOrphanCleanups();await started;
+      const second=active.flushDeferredOrphanCleanups();
+      release();
+      expect(await first).toEqual({recovered:1,pending:0});
+      expect(await second).toEqual({recovered:1,pending:0});
+      expect(await spool.load()).toEqual([]);
+      expect(await active.flushDeferredOrphanCleanups()).toEqual({recovered:0,pending:0});
+      const rows=await db.select().from(environmentLeases).where(eq(environmentLeases.environmentId,environment.id));
+      expect(rows).toEqual([expect.objectContaining({providerLeaseId:"late-task",status:"pending_cleanup"})]);
+    } finally {release();factory.mockRestore();}
   });
 
   it("persists the orphan to the durable spool so a restart recovers and lands the durable row", async () => {

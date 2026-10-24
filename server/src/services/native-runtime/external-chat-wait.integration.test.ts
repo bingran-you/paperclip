@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
   agents,
+  authUsers,
   approvals,
   chatActions,
   chatConversations,
@@ -16,6 +17,7 @@ import {
   chatEndpoints,
   chatExternalPrincipals,
   chatGitHubConfigurations,
+  chatGitHubReviews,
   chatIdentityLinks,
   chatMessageLinks,
   chatPublications,
@@ -46,6 +48,8 @@ import type {
 
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
+import { nativeCompletionFeedback } from "./native-completion-feedback.js";
+import { hasPublishedGitHubReview } from "../chat-channels/github/review-wait.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import {
   authorizeNativeChatReviewPresentation,
@@ -107,6 +111,7 @@ describe("native external-chat response wait", () => {
       | "microsoft-teams"
       | "slack" = "telegram",
     attentionRequests: PrpStructuredRunResult["attentionRequests"] = [],
+    resultOverrides: Partial<PrpStructuredRunResult> = {},
   ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -265,6 +270,8 @@ describe("native external-chat response wait", () => {
       paperclipUserId: userId,
       status: "linked",
     });
+    await db.insert(authUsers).values({ id: userId, name: "Review owner", email: `${userId}@example.test`,
+      createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({
       companyId,
       principalType: "user",
@@ -365,12 +372,13 @@ describe("native external-chat response wait", () => {
         summary: "Wait for the next authorized Telegram message.",
         idempotencyKey: `telegram-response-wait:${conversationId}`,
       },
+      ...resultOverrides,
     };
     const terminal: PrpTerminalState = {
       schema: "paperclip.prp.terminal.v1",
       turnTerminalState: "completed",
       runTerminalState: "succeeded",
-      reportedWorkDisposition: "yielded",
+      reportedWorkDisposition: result.reportedWorkDisposition,
       workAssessmentId: randomUUID(),
       statusDecisionId: randomUUID(),
     };
@@ -4291,6 +4299,126 @@ describe("native external-chat response wait", () => {
         state: "active",
       }),
     ]);
+  });
+
+  it.each([
+    [3, "yielded", "in_review", "response_wake", false],
+    [5, "yielded", "in_review", "response_wake", false],
+    [5, "done", "done", null, false],
+    [3, "yielded", "in_review", "monitor", false],
+    [3, "yielded", "in_review", "response_wake", true],
+  ] as const)("settles a published %s/5 review reporting %s in %s with %s, separate approval: %s", async (score, disposition, status, continuationKind, separateApproval) => {
+    const fixture = await seedWaitTurn("github", [], {
+      reportedWorkDisposition: disposition,
+      summary: disposition === "done" ? "Review is 5/5 and required checks passed." : "Review published; waiting for the next PR update.",
+      ...(disposition === "done" ? { continuation: undefined } : {}),
+      ...(continuationKind === "monitor" ? { continuation: { kind: "monitor", summary: "Wait for the saved check.", idempotencyKey: "review-monitor" } } : {}),
+    });
+    await db.update(issues).set({ title: "Review the pull request", originKind: "chat_channel",
+      createdByUserId: fixture.userId, responsibleUserId: fixture.userId }).where(eq(issues.id, fixture.issueId));
+    const oldRequest = score === 3 ? await seedPriorCompletionReview(fixture) : null;
+    if (continuationKind === "monitor") {
+      await new PaperclipRunnerToolAuthority(db, fixture).execute({ tool: "set_task_monitor", callId: randomUUID(),
+        arguments: { idempotencyKey: "review-monitor", monitor: { nextCheckAt: new Date(Date.now() + 60_000).toISOString(), notes: "Check PR status." } } });
+    }
+    const [review] = await db.insert(chatGitHubReviews).values({
+      companyId: fixture.companyId, endpointId: fixture.endpointId, issueId: fixture.issueId,
+      runId: fixture.runId, repositoryId: "1", repository: "paperclip/test-repository", pullNumber: 1,
+      headSha: "a".repeat(40), deliveryId: fixture.deliveryId, configurationRevision: 1,
+      policySnapshot: defaultGitHubReviewPolicy(), event: {
+        event: "opened", deliveryId: fixture.deliveryId, repositoryId: "1", repository: "paperclip/test-repository",
+        pullNumber: 1, title: "Review the pull request", body: "", baseSha: "b".repeat(40), headSha: "a".repeat(40),
+        baseBranch: "master", author: { id: "1", login: "author", isBot: false }, sender: { id: "1", login: "author" },
+        draft: false, labels: [],
+      },
+      state: "completed", assessment: { complete: true, score, reviewedCommit: "a".repeat(40),
+        summary: "Review published", rationale: "Review complete", findings: [],
+        coverage: { reviewedPaths: [], omittedPaths: [], limitations: [] },
+      },
+      checkId: "123",
+    }).returning();
+    await expect(hasPublishedGitHubReview(db, fixture)).resolves.toBe(false);
+    // A completed but unpublished head must not hide another published head from this run.
+    const [published] = await db.insert(chatGitHubReviews).values({ ...review!, id: randomUUID(), deliveryId: randomUUID(), headSha: "c".repeat(40) }).returning();
+    await db.insert(chatActions).values({
+      companyId: fixture.companyId, endpointId: fixture.endpointId, kind: "github_review_publication",
+      providerActionId: `github_publication:${fixture.issueId}:assessment:${createHash("sha256").update(JSON.stringify(published!.id)).digest("hex")}`,
+      status: "processed", payload: { operation: "assessment", reviewId: published!.id },
+      result: { reviewId: published!.id, checkUrl: "https://github.com/paperclip/test-repository/runs/123" },
+    });
+    if (oldRequest) {
+      const [older] = await db.insert(chatGitHubReviews).values({
+        ...review!, id: randomUUID(), runId: oldRequest.sourceRunId, deliveryId: randomUUID(),
+      }).returning();
+      await db.insert(chatActions).values({ companyId: fixture.companyId, endpointId: fixture.endpointId,
+        kind: "github_review_publication", status: "processed",
+        providerActionId: `github_publication:${fixture.issueId}:assessment:${createHash("sha256").update(JSON.stringify(older!.id)).digest("hex")}`,
+      });
+    }
+    await expect(hasPublishedGitHubReview(db, fixture)).resolves.toBe(true);
+    await expect(hasPublishedGitHubReview(db, { ...fixture, runId: randomUUID() })).resolves.toBe(false);
+    const [stored] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, fixture.runId));
+    await expect(nativeCompletionFeedback(db, fixture.runId, stored!.resultJson.result as PrpStructuredRunResult)).resolves.toContain("accepted");
+    if (oldRequest) {
+      const pending = async () => (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, oldRequest.id)))[0]!.status;
+      expect(await pending()).toBe("pending");
+      const reported = stored!.resultJson.result as PrpStructuredRunResult;
+      await expect(nativeCompletionFeedback(db, fixture.runId, { ...reported,
+        completionClaim: { ...reported.completionClaim, contractRevision: "stale" } })).rejects.toThrow("Stale completionClaim");
+      expect(await pending()).toBe("pending");
+      if (separateApproval) {
+        const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "hire_agent", status: "pending", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId: fixture.companyId, issueId: fixture.issueId, approvalId: approval!.id });
+        await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+        expect(await pending()).toBe("pending");
+        expect((await issueService(db).list(fixture.companyId, { touchedByUserId: fixture.userId })).map(issue => issue.id)).toContain(fixture.issueId);
+        return;
+      }
+      expect(await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true,
+        failpoint: "status_projection" })).toMatchObject({ phase: "retryable_failure" });
+      expect(await pending()).toBe("pending");
+    }
+    await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const all = await issueService(db).list(fixture.companyId);
+    expect(all.find(issue => issue.id === fixture.issueId)).toMatchObject({ status,
+      ...(status === "in_review" ? { reviewAttention: { state: "covered", paths: [expect.objectContaining({ kind: continuationKind === "monitor" ? "monitor" : "external_response" })] } } : {}),
+    });
+    expect(await issueService(db).list(fixture.companyId, { touchedByUserId: fixture.userId })).toEqual([]);
+    expect(await db.select().from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.issueId, fixture.issueId), eq(issueThreadInteractions.status, "pending"),
+    ))).toEqual([]);
+    if (oldRequest) expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, oldRequest.id)))
+      .toEqual([expect.objectContaining({ status: "cancelled", result: expect.objectContaining({ outcome: "withdrawn" }) })]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, fixture.companyId))).toEqual([]);
+    if (status === "in_review" && continuationKind === "response_wake") {
+      const attention = async () => (await issueService(db).listReviewAttention(fixture.companyId, [{ id: fixture.issueId, companyId: fixture.companyId, status }])).get(fixture.issueId)?.state;
+      await db.update(chatEndpointResources).set({ enabled: false }).where(eq(chatEndpointResources.endpointId, fixture.endpointId));
+      expect(await attention()).toBe("stalled");
+      await db.update(chatEndpointResources).set({ enabled: true }).where(eq(chatEndpointResources.endpointId, fixture.endpointId));
+      await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, fixture.companyId));
+      expect(await attention()).toBe("stalled");
+      await db.update(companyMemberships).set({ status: "active" }).where(eq(companyMemberships.companyId, fixture.companyId));
+      await db.update(chatEndpoints).set({ status: "revoked" }).where(eq(chatEndpoints.id, fixture.endpointId));
+      expect((await issueService(db).listReviewAttention(fixture.companyId, [{
+        id: fixture.issueId, companyId: fixture.companyId, status,
+      }])).get(fixture.issueId)?.state).toBe("stalled");
+    }
+  });
+
+  it("admits a real repository-access request to Mine until it is resolved", async () => {
+    const fixture = await seedWaitTurn("github", [{ kind: "approval", ownerClass: "human", summary: "Grant repository access so I can read the diff." }], {
+      reportedWorkDisposition: "needs_review", continuation: undefined,
+    });
+    await db.update(issues).set({ responsibleUserId: fixture.userId }).where(eq(issues.id, fixture.issueId));
+    await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    expect((await issueService(db).list(fixture.companyId, { touchedByUserId: fixture.userId })).map(issue => issue.id)).toContain(fixture.issueId);
+    const [request] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, fixture.issueId));
+    expect(request).toMatchObject({ status: "pending", addresseeUserId: fixture.userId });
+    await issueThreadInteractionService(db).withdrawInteraction(
+      { id: fixture.issueId, companyId: fixture.companyId }, request!.id,
+      { reason: "Repository access restored." }, { userId: fixture.userId },
+    );
+    expect(await issueService(db).list(fixture.companyId, { touchedByUserId: fixture.userId })).toEqual([]);
   });
 
   it("does not schedule a fallback run when current chat permission is revoked", async () => {

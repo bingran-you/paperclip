@@ -341,11 +341,15 @@ const heartbeatRunSqlAsciiSafeColumns = {
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
 } as const;
 
-const heartbeatRunLogAccessColumns = {
+const heartbeatRunReadAccessColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
   scopeKind: heartbeatRuns.scopeKind,
   issueId: heartbeatRuns.issueId,
+} as const;
+
+const heartbeatRunLogAccessColumns = {
+  ...heartbeatRunReadAccessColumns,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
 } as const;
@@ -1115,6 +1119,27 @@ export function createHeartbeatRunState(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getRunStatus(runId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        companyId: heartbeatRuns.companyId,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getRunReadAccess(runId: string) {
+    return db
+      .select(heartbeatRunReadAccessColumns)
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function getRunLogAccess(runId: string) {
     return db
       .select(heartbeatRunLogAccessColumns)
@@ -1672,6 +1697,8 @@ export function createHeartbeatRunState(db: Db) {
     clearTaskSessions,
     resolveExplicitResumeSessionOverride,
     hasResolvablePriorSessionWorkspaceForWake,
+    getRunStatus,
+    getRunReadAccess,
     getRunLogAccess,
 
     listRuns: async (

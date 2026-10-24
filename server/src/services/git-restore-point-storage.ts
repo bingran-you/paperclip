@@ -34,6 +34,7 @@ export type GitRestorePointRef = {
   head: string;
   index: string | null;
   worktree: string | null;
+  ignored?: string;
   modes: Array<{ path: string; mode: number }>;
   history?: string;
   headOnRemote: boolean;
@@ -64,6 +65,7 @@ export function validateGitRestorePointRef(value: unknown, workspace: { companyI
     || !Number.isSafeInteger(ref.generation) || ref.generation < 1
     || !sha.test(ref.head) || (ref.index !== null && !sha.test(ref.index)) || (ref.worktree !== null && !sha.test(ref.worktree))
     || (ref.index === null) !== (ref.worktree === null) || typeof ref.headOnRemote !== "boolean"
+    || (ref.ignored !== undefined && (typeof ref.ignored !== "string" || !sha.test(ref.ignored)))
     || (ref.history !== undefined && !/^[0-9a-f]{64}$/.test(ref.history))
     || !Array.isArray(ref.modes) || ref.modes.length > 20_000 || ref.modes.some((entry) => !entry || typeof entry.path !== "string"
       || entry.path.startsWith("/") || entry.path.split("/").includes("..") || !Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777)
@@ -83,11 +85,14 @@ export async function storeGitRestorePoint(input: {
   checkout?: string;
   upstreamCommits: readonly string[];
   headOnRemote: boolean;
+  resolvePreserveCommits?: () => Promise<readonly string[]>;
   limits?: Partial<RestorePointLimits>;
   signal?: AbortSignal;
 }): Promise<{ ref: GitRestorePointRef; ledgerId: string; manifest: RestorePointManifest } | null> {
   const history = await restorePointHistoryDigest(input.cwd, input.signal);
-  const captured = await captureRestorePoint({ cwd: input.cwd, upstreamCommits: input.upstreamCommits, limits: input.limits, signal: input.signal });
+  const preserveCommits = await input.resolvePreserveCommits?.();
+  const captured = await captureRestorePoint({ cwd: input.cwd, upstreamCommits: input.upstreamCommits, preserveCommits,
+    limits: input.limits, signal: input.signal });
   if (!captured) return null;
   if (await restorePointHistoryDigest(input.cwd, input.signal) !== history) throw new RestorePointRestoreFailure("restore_point_history_changed");
   const id = randomUUID();
@@ -96,6 +101,11 @@ export async function storeGitRestorePoint(input: {
   const objectKey = restorePointObjectKey(input.workspace.companyId, input.workspace.id, input.generation, id, input.checkout);
   const [ledger] = await input.db.transaction(async (tx) => {
     await notifyGitRestorePointWork(tx, `workspace:${input.workspace.id}`);
+    await tx.update(executionWorkspaceRestorePoints).set({ status: "superseded", updatedAt: new Date() })
+      .where(and(eq(executionWorkspaceRestorePoints.executionWorkspaceId, input.workspace.id),
+        eq(executionWorkspaceRestorePoints.generation, input.generation),
+        eq(executionWorkspaceRestorePoints.checkoutName, input.checkout ?? ""),
+        eq(executionWorkspaceRestorePoints.status, "pending")));
     return tx.insert(executionWorkspaceRestorePoints).values({
       companyId: input.workspace.companyId,
       executionWorkspaceId: input.workspace.id,
@@ -140,6 +150,7 @@ export async function storeGitRestorePoint(input: {
       head: manifest.head,
       index: manifest.index,
       worktree: manifest.worktree,
+      ...(manifest.ignored ? { ignored: manifest.ignored } : {}),
       modes: manifest.modes,
       history,
       headOnRemote: input.headOnRemote,
@@ -167,9 +178,12 @@ export async function restorePointHistoryUnchanged(ref: GitRestorePointRef, cwd:
   return ref.history === undefined || await restorePointHistoryDigest(cwd, signal) === ref.history;
 }
 
-export function restorePointSnapshotMatches(ref: GitRestorePointRef, snapshot: { head: string; index: string | null; worktree: string | null; modes: Array<{ path: string; mode: number }> }) {
-  return snapshot.head === ref.head && snapshot.index === ref.index && snapshot.worktree === ref.worktree
-    && JSON.stringify(snapshot.modes) === JSON.stringify(ref.modes);
+const modesKey = (modes: Array<{ path: string; mode: number }>) => JSON.stringify(modes.map(entry => [entry.path, entry.mode]));
+
+export function restorePointSnapshotMatches(ref: GitRestorePointRef, snapshot: { head: string; index: string | null; worktree: string | null;
+  ignored: string | null; modes: Array<{ path: string; mode: number }> }) {
+  return snapshot.head === ref.head && snapshot.index === ref.index && snapshot.worktree === ref.worktree && snapshot.ignored === (ref.ignored ?? null)
+    && modesKey(snapshot.modes) === modesKey(ref.modes);
 }
 
 export async function abandonGitRestorePointsByKey(db: Db, workspaceId: string, objectKeys: string[]) {
@@ -221,7 +235,8 @@ export async function loadGitRestorePoint(input: {
   });
   const { manifest } = decodeRestorePointPayload(payload);
   if (manifest.head !== input.ref.head || manifest.index !== input.ref.index || manifest.worktree !== input.ref.worktree
-    || JSON.stringify(manifest.modes) !== JSON.stringify(input.ref.modes)) {
+    || (manifest.ignored ?? null) !== (input.ref.ignored ?? null)
+    || modesKey(manifest.modes) !== modesKey(input.ref.modes)) {
     throw new RestorePointRestoreFailure("restore_point_manifest_mismatch");
   }
   return { payload, manifest };
@@ -255,7 +270,7 @@ export async function applyGitRestorePointToWorktree(input: {
 }) {
   const current = await currentRestorePointSnapshot(input.worktreePath, input.signal);
   const matches = restorePointSnapshotMatches(input.ref, current);
-  if (!matches && (current.head !== input.ref.head || current.index !== null || current.worktree !== null || current.modes.length > 0)) {
+  if (!matches && (current.head !== input.ref.head || current.index !== null || current.worktree !== null || current.ignored !== null || current.modes.length > 0)) {
     throw new RestorePointRestoreFailure("worktree_diverged_from_restore_point");
   }
   const { payload } = await loadGitRestorePoint(input);

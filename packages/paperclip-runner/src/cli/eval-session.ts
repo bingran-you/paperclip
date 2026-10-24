@@ -340,6 +340,9 @@ export function boundedEvalSessionUsage(
   ) {
     throw new EvalSessionBudgetError("provider-reported cost limit exceeded");
   }
+  if (usage?.legacyLedgerCostNanodollars !== undefined && usage.legacyLedgerCostNanodollars > request.limits.maxEstimatedCostNanodollars) {
+    throw new EvalSessionBudgetError("legacy ledger cost limit exceeded");
+  }
   if (unavailable || usage === null || (usage.estimatedCostNanodollars === null && usage.providerReportedCostNanodollars === null)) {
     throw new EvalSessionBudgetError("budget cost coverage is unavailable for one or more completed turns", true);
   }

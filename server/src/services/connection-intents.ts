@@ -58,6 +58,7 @@ import { lockToolConnectionRuntimeInputs, toolAccessService } from "./tool-acces
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { restConnectorFor } from "./connectors/rest-registry.js";
 
 type ConnectionRunClaims = Pick<RuntimeToolsTokenClaims, "sub" | "company_id" | "run_id" | "responsible_user_id">;
 
@@ -296,7 +297,7 @@ export function connectionIntentService(db: Db) {
     const usable = (connection: ToolConnection | undefined) => connection
       && installedIds.has(connection.id) && permittedIds.has(connection.id)
       && connection.status === "active" && connection.enabled
-      && ["mcp_remote", "local_stdio"].includes(connection.transport)
+      && (["mcp_remote", "local_stdio"].includes(connection.transport) || Boolean(restConnectorFor(connection)))
       && !isToolConnectionAttentionHealth(connection.healthStatus) ? connection : null;
     if (input.serviceSlug === "github") {
       const selection = await resolveManagedGitHubIdentitySelection(db, input.companyId, {

@@ -3,6 +3,7 @@ import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
+import { listExternalReviewWaits } from "../native-runtime/external-review-wait.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -1239,7 +1240,7 @@ export function recoveryService(
     latestRun: LatestIssueRun,
   ): Promise<boolean> {
     if (
-      issue.status !== "in_progress" ||
+      !["in_progress", "in_review"].includes(issue.status) ||
       latestRun?.status !== "succeeded" ||
       latestRun.agentId !== issue.assigneeAgentId
     )
@@ -1292,7 +1293,7 @@ export function recoveryService(
           eq(statusDecisions.issueId, binding.issueId),
           eq(statusDecisions.runId, binding.runId),
           eq(statusDecisions.applicationState, "applied"),
-          eq(statusDecisions.toStatus, "in_progress"),
+          eq(statusDecisions.toStatus, issue.status),
           inArray(statusDecisions.reasonCode, [
             "board_response_waiting",
             "external_chat_response_waiting",
@@ -1305,7 +1306,7 @@ export function recoveryService(
           eq(issues.id, binding.issueId),
           eq(issues.companyId, binding.companyId),
           eq(issues.assigneeAgentId, binding.agentId),
-          eq(issues.status, "in_progress"),
+          eq(issues.status, issue.status),
           eq(issues.lastStatusDecisionId, statusDecisions.id),
           isNull(issues.hiddenAt),
           sql`coalesce(${issues.executionState}->>'status', '') <> 'pending'`,
@@ -1449,6 +1450,8 @@ export function recoveryService(
     latestRun: LatestIssueRun,
   ) {
     if (issue.monitorNextCheckAt) return true;
+    if (issue.status === "in_review" && latestRun?.status === "succeeded" &&
+      (await listExternalReviewWaits(db, issue.companyId, [issue.id])).length > 0) return true;
     if (issue.status === "in_progress" && latestRun?.status === "succeeded" && latestRun.agentId === issue.assigneeAgentId &&
       await hasCommittedNativePlanWait(db, { companyId: issue.companyId, issueId: issue.id, runId: latestRun.id, agentId: latestRun.agentId })) return true;
     if (
@@ -3484,17 +3487,14 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
-      const wakePolicy = parseObject(action.wakePolicy);
-      const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      if (
-        wakePolicyType !== "bounded_recovery_owner" &&
-        wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
-      ) {
-        continue;
-      }
-
       if (issue.status === "done" || issue.status === "cancelled") {
+        const systemRecoveryState = readNonEmptyString(
+          parseObject(parseObject(action.evidence).systemRecovery).state,
+        );
+        if (systemRecoveryState && ["scheduled", "running", "awaiting_evidence"].includes(systemRecoveryState)) {
+          result.skipped += 1;
+          continue;
+        }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
           sourceIssueId: action.sourceIssueId,
@@ -3507,6 +3507,16 @@ export function recoveryService(
           result.resolved += 1;
           result.issueIds.push(issue.id);
         }
+        continue;
+      }
+
+      const wakePolicy = parseObject(action.wakePolicy);
+      const wakePolicyType = readNonEmptyString(wakePolicy.type);
+      if (
+        wakePolicyType !== "bounded_recovery_owner" &&
+        wakePolicyType !== "bounded_owner_disposition_repair" &&
+        action.ownerType !== "board"
+      ) {
         continue;
       }
 

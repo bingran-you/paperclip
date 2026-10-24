@@ -1,15 +1,17 @@
+import { pendingNativeGovernance } from "./native-governance.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { reconcileMuseNativeTerminalRun } from "./muse-terminal-reconciliation.js";
 import { assertNativeCaseHandoffResult } from "./native-case-handoff.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
+import { hasPublishedGitHubReview } from "../chat-channels/github/review-wait.js";
 import { readNativeMonitorDelivery } from "./native-monitor-delivery.js";
 import { isNativePlanWaitResult, readNativePlanWait } from "./native-plan-wait.js";
-import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { hasPendingNativeChildCompletion } from "./native-child-completion-delivery.js";
 import { settleExternalConversation } from "../slack-conversation-lifecycle.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { readPersistedNativeFailureEvidence } from "./native-provider-failure-evidence.js";
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
+import { findSupersededExternalReviewRequests } from "./superseded-external-review-requests.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { conversationNativeDecision, isConversation } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
@@ -18,12 +20,10 @@ import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-re
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
-  approvals,
   agentWakeupRequests,
   completionContracts,
   heartbeatRuns,
   heartbeatRunEvents,
-  issueApprovals,
   issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -40,7 +40,6 @@ import {
   arbitrateNativeStatus,
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
-  type NativeGovernanceGate,
 } from "./status-arbiter.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
 import {
@@ -141,54 +140,7 @@ export function resolveNativeFinalizerStatus(
   return arbitrateNativeStatus(input);
 }
 
-export async function pendingNativeGovernance(input: {
-  db: Db;
-  companyId: string;
-  issueId: string;
-  runId: string;
-  executionState: Record<string, unknown> | null;
-}): Promise<NativeGovernanceGate | null> {
-  // Execution policy is issue-owned state and takes priority over the two
-  // durable review surfaces. Completion must mediate all three authorities.
-  if (record(input.executionState).status === "pending") {
-    return { kind: "execution_stage", id: input.runId };
-  }
-  const [issue] = await input.db.select({ conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId })
-    .from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
-  const [pendingInteraction, pendingApproval] = await Promise.all([
-    input.db
-      .select({ id: issueThreadInteractions.id })
-      .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(issueThreadInteractions.companyId, input.companyId),
-          eq(issueThreadInteractions.issueId, input.issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          activeIssueInteractionCondition({ runId: input.runId, conversationMode: isConversation(issue) }),
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null),
-    input.db
-      .select({ id: approvals.id })
-      .from(issueApprovals)
-      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-      .where(
-        and(
-          eq(issueApprovals.companyId, input.companyId),
-          eq(issueApprovals.issueId, input.issueId),
-          eq(approvals.companyId, input.companyId),
-          inArray(approvals.status, ["pending", "revision_requested"]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null),
-  ]);
-  if (pendingInteraction)
-    return { kind: "interaction", id: pendingInteraction.id };
-  if (pendingApproval) return { kind: "approval", id: pendingApproval.id };
-  return null;
-}
+export { pendingNativeGovernance } from "./native-governance.js";
 
 async function acceptedInteractionFromRun(input: {
   db: Db;
@@ -270,6 +222,8 @@ async function claimCoordinator(input: {
               ? "arbitrating"
               : "workspace_finalizing"
             : coordinator.phase,
+        recoveryState: null,
+        recoveryRequestId: null,
         failureCode: null,
         failureDetail: null,
         nextAttemptAt: null,
@@ -1317,13 +1271,6 @@ export async function finalizeNativeRun(input: {
       .then((rows) => rows[0] ?? null);
     if (!authoritativeIssue)
       throw new Error("native_finalization_issue_missing");
-    const governanceGate = await pendingNativeGovernance({
-      db: input.db,
-      companyId: run.companyId,
-      issueId: authoritativeIssue.id,
-      runId: run.id,
-      executionState: record(authoritativeIssue.executionState),
-    });
     const externalChatResponseWaitAuthorization =
       assessment.reportedDisposition === "yielded" &&
       assessment.continuation?.kind === "response_wake"
@@ -1337,6 +1284,22 @@ export async function finalizeNativeRun(input: {
             },
           })
         : "not_applicable";
+    const monitorWaitAt = scheduledIssueMonitorWait(authoritativeIssue, run.agentId);
+    const supersededReviews = terminalState === "succeeded" && input.workspaceFinalizeStatus === "succeeded" &&
+      assessment.attentionRequests.length === 0 && (assessment.reportedDisposition === "done" ||
+        (assessment.reportedDisposition === "yielded" && (externalChatResponseWaitAuthorization === "authorized" ||
+          (assessment.continuation?.kind === "monitor" && monitorWaitAt !== null))))
+      ? await findSupersededExternalReviewRequests(input.db, {
+        companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId,
+      }) : [];
+    const governanceGate = await pendingNativeGovernance({
+      db: input.db,
+      companyId: run.companyId,
+      issueId: authoritativeIssue.id,
+      runId: run.id,
+      executionState: record(authoritativeIssue.executionState),
+      ignoredInteractionIds: supersededReviews.map(({ interaction }) => interaction.id),
+    });
     const boardResponseWaitOrigin =
       externalChatResponseWaitAuthorization === "not_applicable" &&
       assessment.reportedDisposition === "yielded" &&
@@ -1402,7 +1365,6 @@ export async function finalizeNativeRun(input: {
     };
     const hasPendingChildCompletion = !reviewContext &&
       await hasPendingNativeChildCompletion(input.db, childCompletionRecipient);
-    const monitorWaitAt = scheduledIssueMonitorWait(authoritativeIssue, run.agentId);
     const monitorDelivery = assessment.reportedDisposition === "yielded" &&
       assessment.continuation?.kind === "monitor" &&
       authoritativeIssue.executionRunId !== run.id && authoritativeIssue.checkoutRunId !== run.id
@@ -1433,6 +1395,11 @@ export async function finalizeNativeRun(input: {
         dependencyReadiness.unresolvedBlockerCount > 0,
       governanceResolvedForRun: resolvedInteraction !== null,
       externalChatResponseWaitAuthorization,
+      publishedExternalReview: assessment.reportedDisposition === "yielded" &&
+        (externalChatResponseWaitAuthorization === "authorized" || monitorWaitAt !== null)
+        ? await hasPublishedGitHubReview(input.db, {
+            companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id,
+          }) : false,
       boardResponseWaitAuthorized: boardResponseWait !== null,
       boardResponseWaitOrigin: boardResponseWaitOrigin !== null,
       isConversation: isConversation(authoritativeIssue),
@@ -1502,6 +1469,9 @@ export async function finalizeNativeRun(input: {
         priorStatusVersion: Number(authoritativeIssue.statusVersion),
         priorDecisionId: authoritativeIssue.lastStatusDecisionId,
         decision,
+        supersededExternalReviewRequests: supersededReviews.length && !governanceGate &&
+          ["completion_claim_policy_accepted", "completion_contract_satisfied", "external_chat_response_waiting", "scheduled_monitor_waiting"].includes(decision.reasonCode ?? "")
+          ? { agentId: run.agentId, resultId: resultRow.id, interactionIds: supersededReviews.map(({ interaction }) => interaction.id) } : undefined,
         requireMonitorWait: decision.reasonCode === "scheduled_monitor_waiting" && monitorWaitAt
           ? { agentId: run.agentId, nextCheckAt: monitorWaitAt } : undefined,
         requireMonitorDelivery: decision.reasonCode === "scheduled_monitor_dispatched"

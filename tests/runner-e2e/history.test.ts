@@ -69,6 +69,41 @@ function result(execution: MatrixExecution, status: "passed" | "failed") {
 }
 
 describe("runner E2E campaign history", () => {
+  it("retains the supervisor trace outcome independently of the worker export through regeneration", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-finalized-trace-"));
+    temporaryDirectories.push(root);
+    const execution = runnerMatrix[0]!;
+    const attempt: RunnerE2EResult = { ...result(execution, "failed"), failureClass: "permanent_infrastructure",
+      tracing: { projectId: "11111111-1111-4111-8111-111111111111", traceId: "a".repeat(32), spanId: "b".repeat(16),
+        status: "accepted", verification: "unverified", nativeConfiguration: "configured",
+        finalization: { spanId: "c".repeat(16), status: "accepted", outcome: "failed", verification: "unverified" } },
+    };
+    const campaign = buildRunnerCampaign({ campaignId: "finalized-trace", generatedAt: attempt.finishedAt,
+      expected: [execution.id], results: [attempt], attempts: [attempt] });
+    await writeFile(path.join(root, "normalized-results.json"), JSON.stringify(campaign));
+    await regenerateRunnerDashboard({ bundle: root, historyFile: null });
+    const rebuilt = JSON.parse(await readFile(path.join(root, "normalized-results.json"), "utf8"));
+    expect(rebuilt.results[0].tracing).toEqual(attempt.tracing);
+    expect(rebuilt.accounting.attempts[0].tracing).toEqual(attempt.tracing);
+    expect(rebuilt.failed).toBe(1);
+    expect(await readFile(path.join(root, "dashboard.html"), "utf8")).toContain("Supervisor outcome: failed; finalization export: accepted");
+  });
+
+  it("preserves all-attempt costs when regenerating a retained report", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-attempt-costs-"));
+    temporaryDirectories.push(root);
+    const execution = runnerMatrix[0]!;
+    const first = result(execution, "failed");
+    const last = { ...result(execution, "passed"), attempt: 2, usage: { inputTokens: 200, outputTokens: 50, costUsd: 0.02 } };
+    const campaign = buildRunnerCampaign({ campaignId: "retries", generatedAt: last.finishedAt,
+      expected: [execution.id], results: [last], attempts: [first, last] });
+    await writeFile(path.join(root, "normalized-results.json"), JSON.stringify(campaign));
+    await regenerateRunnerDashboard({ bundle: root });
+    const regenerated = JSON.parse(await readFile(path.join(root, "normalized-results.json"), "utf8"));
+    expect(regenerated.accounting).toEqual(campaign.accounting);
+    expect(regenerated.billing.reportedLlmCostUsd).toBe(0.03);
+    expect(regenerated.results[0].billing.reportedCostUsd).toBe(0.02);
+  });
   it("does not let empty legacy provenance hide a later measured source", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "runner-legacy-source-"));
     temporaryDirectories.push(root);

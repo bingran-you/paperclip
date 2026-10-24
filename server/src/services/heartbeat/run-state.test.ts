@@ -91,6 +91,38 @@ describe("heartbeat run state module", () => {
     expect(raw.execute).not.toHaveBeenCalled();
     expect(raw.columns[0].resultJson).toBe(heartbeatRuns.resultJson);
   });
+
+  it("loads current run status without large fields or an encoding probe", async () => {
+    const binding = { id: "run", companyId: "company", agentId: "agent", status: "running" };
+    const reader = readingDatabase("SQL_ASCII", [binding], []);
+    const state = extracted.createHeartbeatRunState(reader.db);
+    expect(await state.getRunStatus("run")).toEqual(binding);
+    expect(await state.getRunStatus("missing")).toBeNull();
+    expect(reader.execute).not.toHaveBeenCalled();
+    expect(reader.columns).toEqual(Array(2).fill({
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status,
+    }));
+    expect(reader.scopes).toEqual([["run"], ["missing"]]);
+  });
+
+  it("loads run read bindings without large fields or an encoding probe", async () => {
+    const binding = { id: "run", companyId: "company", scopeKind: "issue", issueId: "issue" };
+    const reader = readingDatabase("SQL_ASCII", [binding], []);
+    const state = extracted.createHeartbeatRunState(reader.db);
+    expect(await state.getRunReadAccess("run")).toEqual(binding);
+    expect(await state.getRunReadAccess("missing")).toBeNull();
+    expect(reader.execute).not.toHaveBeenCalled();
+    expect(reader.columns).toEqual(Array(2).fill({
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      scopeKind: heartbeatRuns.scopeKind,
+      issueId: heartbeatRuns.issueId,
+    }));
+    expect(reader.scopes).toEqual([["run"], ["missing"]]);
+  });
 });
 
 const postgresSupport = await getEmbeddedPostgresTestSupport();

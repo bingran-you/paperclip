@@ -1,3 +1,4 @@
+import { FEEDBACK_PERSISTENCE_SUITE, feedbackPersistenceTask, feedbackPersistenceDigest } from "./feedback-persistence.js";
 import { followupStopTask, followupStopDigest } from "./followup-stop-resume.js";
 import { finalizationRecoveryTask, finalizationRecoveryDigest } from "./finalization-recovery.js";
 import { necessaryQuestionTask, necessaryQuestionDigest } from "./necessary-question.js";
@@ -1665,6 +1666,17 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
+    id: FEEDBACK_PERSISTENCE_SUITE, label: "Feedback Persistence", manualOnly: true,
+    description: "Real complaint and suggestion submissions, durable bodies, and retained tool receipts.",
+    groups: ["native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id)),
+    environments: [localEnvironment], tasks: [feedbackPersistenceTask(runnerTasks.find(task => task.id === "message-marker")!)], expectedMatrixSize: 2,
+    definitionMetadata: { version: 1, owner: "runner-e2e-maintainers", scheduling: "explicit-only",
+      sourceDigest: feedbackPersistenceDigest(runnerTasks.find(task => task.id === "message-marker")!), expectedWorkRuns: 1, automaticRetryPolicy: "single_attempt",
+      budgetCents: 1_000, forecast: "unmeasured; gateway manifest required for bounded qualification",
+      grading: "retained-exact-bodies-and-run-attributed-completed-tools", feedback: "synthetic-disposable-items" },
+  },
+  {
     id: "core-compatibility",
     label: "Core Runner Compatibility",
     description:
@@ -2042,3 +2054,5 @@ export function runnerExecutionById(id: string): MatrixExecution {
   if (!execution) throw new Error(`Unknown runner E2E execution id: ${id}`);
   return execution;
 }
+
+export { productJourneys } from "./product-journeys/catalog.js";

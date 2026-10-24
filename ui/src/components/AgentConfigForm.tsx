@@ -669,6 +669,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     if (props.values.resolvedRunner !== resolvedRunner) props.onChange({ resolvedRunner });
   }, [props.mode, harnessType, isRunnerHarness, runner, runnerAvailability?.defaultRunner,
     isCreate ? props.values.resolvedRunner : undefined, isCreate ? props.onChange : undefined]);
+  // A Runner-only environment, such as a plugin environment that runs Runner
+  // tasks, offers no Legacy runner. Switch a Legacy choice to Paperclip Runner
+  // so the test and the save both resolve the Runner.
+  const legacyRunnerUnavailable = isRunnerHarness && runner === "legacy"
+    && runnerAvailability?.supportedRunners !== undefined && !runnerAvailability.supportedRunners.includes("legacy");
+  useEffect(() => {
+    if (!legacyRunnerUnavailable) return;
+    if (props.mode === "create") props.onChange({ runner: "paperclip" });
+    else setOverlay(prev => ({ ...prev, runner: "paperclip" }));
+  }, [legacyRunnerUnavailable, props.mode, props.mode === "create" ? props.onChange : undefined]);
   const getCapabilities = useAdapterCapabilities();
   const adapterCaps = getCapabilities(isRunnerHarness ? harnessType : adapterType);
   const runnerProvider = adapterType === "paperclip_runner"

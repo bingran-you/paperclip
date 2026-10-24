@@ -14,6 +14,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
+  getRunReadAccess: vi.fn(),
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
   wakeup: vi.fn(),
@@ -363,6 +364,12 @@ describe("agent live run routes", () => {
       null,
     );
     mockHeartbeatService.buildRunOutputSilence.mockResolvedValue(null);
+    mockHeartbeatService.getRunReadAccess.mockResolvedValue({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      scopeKind: "company",
+      issueId: null,
+    });
     mockHeartbeatService.getRunLogAccess.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -442,6 +449,7 @@ describe("agent live run routes", () => {
           expect(response.body).toEqual({ error: "Invalid heartbeat run ID" });
         }
         expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.getRunReadAccess).not.toHaveBeenCalled();
         expect(mockHeartbeatService.getRunLogAccess).not.toHaveBeenCalled();
         expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
         expect(mockProviderTraceStore.inspect).not.toHaveBeenCalled();
@@ -458,9 +466,11 @@ describe("agent live run routes", () => {
       expect(mockHeartbeatService.getRunLogAccess).toHaveBeenCalledWith(runId);
     });
 
-    it.each(["get", "log"])("keeps missing and cross-company %s lookups indistinguishable", async (kind) => {
-      const lookup = kind === "log" ? mockHeartbeatService.getRunLogAccess : mockHeartbeatService.getRun;
-      const suffix = kind === "log" ? "/log" : "";
+    it.each(["get", "log", "events"])("keeps missing and cross-company %s lookups indistinguishable", async (kind) => {
+      const lookup = kind === "events"
+        ? mockHeartbeatService.getRunReadAccess
+        : kind === "log" ? mockHeartbeatService.getRunLogAccess : mockHeartbeatService.getRun;
+      const suffix = kind === "get" ? "" : `/${kind}`;
       const app = await createApp({}, {
         type: "board", userId: "test-user", source: "session", companyIds: ["company-1"],
       });

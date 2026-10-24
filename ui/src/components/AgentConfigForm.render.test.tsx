@@ -787,6 +787,27 @@ describe("AgentConfigForm environment selector", () => {
     expect(findButton(container, "Upgrade runner")).toBeDefined();
   });
 
+  it("switches a saved legacy Claude agent to Paperclip Runner on a Runner-only environment", async () => {
+    mockAdaptersApi.list.mockResolvedValue([{ type: "claude_local", supportedRunners: ["paperclip"], defaultRunner: "paperclip" }]);
+    try {
+      const result = await renderForm([], { adapterType: "claude_local", adapterConfig: { model: "claude-opus-5-5" } });
+      roots.push(result.root);
+      await clickByText(result.container, "Advanced");
+      expect(result.container.querySelector('[aria-label="Runner"]')?.textContent).toContain("Paperclip Runner");
+      await clickByText(result.container, "Save");
+      expect(result.onSave).toHaveBeenCalledWith(expect.objectContaining({ runner: "paperclip" }));
+    } finally { mockAdaptersApi.list.mockResolvedValue([{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]); }
+  });
+
+  it("switches a new agent's Legacy choice to Paperclip Runner on a Runner-only environment", async () => {
+    mockAdaptersApi.list.mockResolvedValue([{ type: "claude_local", supportedRunners: ["paperclip"], defaultRunner: "paperclip" }]);
+    try {
+      const result = await renderCreateForm([], { ...defaultCreateValues, adapterType: "claude_local", runner: "legacy" });
+      roots.push(result.root);
+      expect(result.onChange).toHaveBeenCalledWith({ runner: "paperclip" });
+    } finally { mockAdaptersApi.list.mockResolvedValue([{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]); }
+  });
+
   it("does not offer an upgrade when the target only supports Legacy", async () => {
     mockAdaptersApi.list.mockResolvedValueOnce([{ type: "codex_local", supportedRunners: ["legacy"], defaultRunner: "legacy" }]);
     const result = await renderForm([]);

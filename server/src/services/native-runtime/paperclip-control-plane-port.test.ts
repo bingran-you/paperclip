@@ -1242,6 +1242,36 @@ describe("PaperclipControlPlanePort conformance", () => {
     }
   });
 
+  it.each(["port", "coordinator"])("clears a resumed session's recovery state when %s persists its result", async (kind) => {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId,
+      nativeSessionId: identity.sessionId, runnerInstanceId: conformanceRunnerId,
+      completionContractId: contractId, completionContractSha256: contractSha,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId, companyId: identity.companyId, issueId: identity.issueId,
+      phase: "observed", recoveryState: "resuming_session", recoveryRequestId: "restart-request",
+    });
+    const port = kind === "port" ? new PaperclipControlPlanePort(db, {
+      ...identity, runId, completionContractId: contractId, completionContractSha256: contractSha,
+      sourceInstanceId: conformanceRunnerId, controlPlaneSourceInstanceId: "resumed-result",
+    }) : new NativeRunCoordinatorStore(db, {
+      ...identity, runId, completionContractId: contractId, completionContractSha256: contractSha,
+      normalizedSessionId: identity.sessionId, runnerSourceInstanceId: conformanceRunnerId,
+      completionContractRevision: "standalone-v1", completionContractCriterionIds: ["objective"],
+    });
+    await port.completeRun({
+      result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: "resumed-result",
+    });
+    await expect(db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).resolves.toEqual([
+      expect.objectContaining({ phase: "workspace_finalizing", recoveryState: null, recoveryRequestId: null }),
+    ]);
+  });
+
   it("does not let native completion bypass a pending issue interaction", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const port = new PaperclipControlPlanePort(db, {

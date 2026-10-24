@@ -13,6 +13,10 @@ import {
   nativeHarnessBackupExpirationService,
 } from "./services/native-runtime/native-harness-backup-expiration.js";
 import { gitRestorePointRetentionService, registerGitRestorePointWork } from "./services/git-restore-point-ledger.js";
+import {
+  nativeWorkspaceSyncRetentionService,
+  registerNativeWorkspaceSyncRetentionWork,
+} from "./services/native-runtime/native-workspace-sync-retention.js";
 import { markGitRestorePointExpired } from "./services/git-restore-point-storage.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
@@ -1351,6 +1355,7 @@ async function startServerWithDatabaseTeardown(
     hasPending: () => caseHandoffDeliveries.hasPending(),
   });
   let unregisterTerminalWorkspaceProbe: (() => void) | undefined;
+  let unsubscribeNativeWorkspaceSyncRetention: (() => void) | undefined;
   const fastResponses = app.locals.fastResponses as ReturnType<typeof import("./services/fast-responses.js").fastResponseService>;
   const fastResponseWorker = deliveryWork.register(DELIVERY_QUEUES.fastResponse, {
     retryMs: 100, run: (signal) => fastResponses.sweepPending(signal), hasPending: () => fastResponses.hasPending(),
@@ -1480,6 +1485,10 @@ async function startServerWithDatabaseTeardown(
       gitCacheExpirationEnabled: config.gitCacheExpirationEnabled,
       gitBaseExpirationEnabled: config.gitBaseExpirationEnabled,
       gitCacheExpirationDryRun: config.gitCacheExpirationDryRun,
+      isolatedSourceRehomeEnabled: config.isolatedSourceRehomeEnabled,
+      isolatedSourceRehomeDryRun: config.isolatedSourceRehomeDryRun,
+      nestedCloneMigrationEnabled: config.nestedCloneMigrationEnabled,
+      nestedCloneMigrationDryRun: config.nestedCloneMigrationDryRun,
       gitRestorePoints: config.gitRestorePointsEnabled ? {
         storage: storageService,
         terminalDelayMs: config.gitRestorePointTerminalDelayDays * 24 * 60 * 60 * 1000,
@@ -1514,6 +1523,19 @@ async function startServerWithDatabaseTeardown(
         logger.info(result, "git restore point retention");
       }
     });
+    if (config.nativeWorkspaceSyncRetentionEnabled) {
+      unsubscribeNativeWorkspaceSyncRetention = registerNativeWorkspaceSyncRetentionWork(deliveryWork, nativeWorkspaceSyncRetentionService(db as any, {
+        retentionDays: config.nativeWorkspaceSyncRetentionDays,
+        dryRun: config.nativeWorkspaceSyncRetentionDryRun,
+      }), {
+        shouldContinue: () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby(),
+        onResult: (result) => {
+          if (result.candidates > 0 || result.leftoversRemoved > 0 || result.failed > 0) {
+            logger.info({ ...result, dryRun: config.nativeWorkspaceSyncRetentionDryRun }, "native workspace sync retention");
+          }
+        },
+      }).unsubscribe;
+    }
     let lastTerminalWorkspaceSkipLogAt = 0;
     const terminalWorkspaceWorker = registerTerminalWorkspaceWork(deliveryWork, {
       ...terminalWorkspaces,
@@ -2072,6 +2094,7 @@ async function startServerWithDatabaseTeardown(
     unsubscribeChatCompletions();
     await deliveryWork.stop();
     unregisterTerminalWorkspaceProbe?.();
+    unsubscribeNativeWorkspaceSyncRetention?.();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
