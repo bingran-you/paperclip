@@ -13,7 +13,7 @@ import { GIT_CACHE_RESTORATION_KEY, readGitCacheRestoration, type GitCacheRestor
 import { readManagedCheckoutContents, selectRestoredProjectRepositories } from "./git-workspace-contents.js";
 import { applyRestorePoint, captureRestorePoint, currentRestorePointSnapshot, importRestorePoint } from "./git-restore-point.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
-import { createGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
+import { createIssueGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { isNestedWorktreeBranchName, isVerifiedNestedRepositoryBase, moveNestedRepositoryWorktree, nestedRepositoryBaseCandidates, nestedWorktreeBranchPrefix,
   readLinkedNestedCheckout, removeStaleNestedRegistrations, trackNestedWorktreeUpstream, withNestedRepositoryBaseLock } from "./nested-repository-worktrees.js";
 import { assertSafeBaseConfig, assertTransferredItems, historyKey, linkedCheckoutBases, moveTransferItems, presentCommits, returnTransferItems,
@@ -442,7 +442,7 @@ export async function migrateNestedRepositoryClone(db: Db, snapshot: Workspace, 
         const base = source.base;
         await assertSafeBaseConfig(base, signal);
         await fetchBase(base, source.repoUrl, options.resolveGitAuth
-          ?? withAnonymousGitFallback(createGitRemoteAuthProvider(db, row!.companyId, { issueId: row!.sourceIssueId! })), signal);
+          ?? withAnonymousGitFallback(createIssueGitRemoteAuthProvider(db, row!.companyId, row!.sourceIssueId!)), signal);
         await assertSafeBaseConfig(base, signal);
         await assertNoBranchOnlyReflogHistory(inspected, signal);
         const planned = await planRefs(inspected, base, prefix, signal);

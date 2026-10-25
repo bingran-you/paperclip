@@ -5,7 +5,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
 import {
@@ -73,6 +73,14 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = typeof issues.$inferSelect;
+
+const releaseRunFields = {
+  ...getTableColumns(heartbeatRuns),
+  resultJson: sql<Record<string, unknown> | null>`case
+    when jsonb_typeof(${heartbeatRuns.resultJson}) = 'object'
+      then ${heartbeatRuns.resultJson} - 'stdout' - 'stderr'
+    else ${heartbeatRuns.resultJson} end`,
+};
 
 function normalizeAgentNameKey(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
@@ -1051,7 +1059,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
       return db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as Db;
         const run = await tx
-          .select()
+          .select(releaseRunFields)
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null);

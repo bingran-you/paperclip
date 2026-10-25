@@ -1,3 +1,5 @@
+import { beginIdleTrackedWork } from "./task-admission.js";
+import { registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { environmentService } from "./environments.js";
 import { createSandboxOrphanCleanupSpool, type DeferredOrphanCleanupRecord } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
@@ -46,9 +48,6 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
   const activeProbe = lease.heartbeatRunId === null && lease.issueId === null && probe
     && typeof probe.runId === "string" && typeof probe.sessionId === "string"
     && typeof probe.expiresAtMs === "number" && probe.expiresAtMs > Date.now();
-  if ((operation.kind === "read_file" || operation.kind === "describe" || operation.kind === "prepare" || operation.kind === "submit" || operation.kind === "connection" || (operation.kind === "read_state" && metadata.runnerTaskExecutionStopped !== true) || operation.kind === "archive_state" || operation.kind === "check_project_auth" || operation.kind === "copilot_metadata") &&
-      (metadata.runnerTaskRetiring === true || !environment || (!activeProbe && run?.status !== "running") || lease.status !== "active" || (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()))) throw new Error("Plugin-provided Runner execution lease is not active");
-  if (operation.kind === "copilot_metadata" && !activeProbe) throw new Error("Copilot metadata requires a private setup lease");
   const checkpointIdentity = operation.kind === "read_state" || operation.kind === "read_file" ? operation.identity
     : operation.kind === "archive_state" ? operation.priorIdentity : null;
   const runner = checkpointIdentity ? { runnerId: checkpointIdentity.runnerInstanceId, leaseId: checkpointIdentity.environmentLeaseId,
@@ -70,6 +69,13 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
   const ownCheckpoint = checkpointIdentity && !resumeFrom &&
     (matches(checkpointIdentity,savedIdentity) || operation.kind !== "read_file" && matches(checkpointIdentity,priorSaved));
   if (checkpointIdentity && !resumeFrom && !ownCheckpoint) throw new Error("Plugin Runner state identity mismatch");
+  const retainedCheckpointRead = operation.kind === "read_state" && ownCheckpoint &&
+    lease.leasePolicy === "reuse_by_environment" && ["retained", "expired"].includes(lease.status) &&
+    run?.status === "succeeded" && metadata.runnerTaskDispatched === true &&
+    (metadata.runnerTaskLifecyclePolicy as {mode?:unknown}|undefined)?.mode === "warm";
+  if ((operation.kind === "read_file" || operation.kind === "describe" || operation.kind === "prepare" || operation.kind === "submit" || operation.kind === "connection" || (operation.kind === "read_state" && metadata.runnerTaskExecutionStopped !== true && !retainedCheckpointRead) || operation.kind === "archive_state" || operation.kind === "check_project_auth" || operation.kind === "copilot_metadata") &&
+      (metadata.runnerTaskRetiring === true || !environment || (!activeProbe && run?.status !== "running") || lease.status !== "active" || (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()))) throw new Error("Plugin-provided Runner execution lease is not active");
+  if (operation.kind === "copilot_metadata" && !activeProbe) throw new Error("Copilot metadata requires a private setup lease");
   const warmAttachment = !!prior && metadata.runnerTaskReused === true &&
     (matches(prior, savedIdentity) || matches(prior, priorSaved) && operation.kind === "prepare" && matches(operation.requirements.identity, savedIdentity)) && runner?.runnerId === prior.runnerInstanceId &&
     runner?.leaseId === prior.environmentLeaseId && runner?.sessionId === prior.normalizedSessionId;
@@ -241,7 +247,22 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
               await environmentService(db).insertPendingCleanupLease({...orphan,failureReason:"plugin_task_replacement_unowned"});
             } catch {
               // The existing orphan spool recovers cleanup even when the database is unavailable.
-              const persisted=await createSandboxOrphanCleanupSpool().append(orphan);
+              const spool = createSandboxOrphanCleanupSpool();
+              const persisted = await spool.append(orphan);
+              const finish = beginIdleTrackedWork();
+              let flushing: Promise<{ recovered: number; pending: number }> | null = null;
+              const unregister = registerDeferredEnvironmentCleanup(db, () => {
+                flushing ??= (async () => {
+                  await environmentService(db).insertPendingCleanupLease({...orphan,failureReason:"plugin_task_replacement_unowned"});
+                  await spool.remove(orphan);
+                  unregister();
+                  finish();
+                  return { recovered: 1, pending: 0 };
+                })().catch(error => { flushing = null; throw error; });
+                // Keep successful completion for a concurrent sweep that already
+                // captured this callback before it was unregistered.
+                return flushing;
+              });
               logger.error({providerLeaseId:fresh.providerLeaseId,persisted},"Plugin replacement cleanup requires recovery");
             }
           }
@@ -348,9 +369,9 @@ export async function settleDispatchedEnvironmentTask(db: Db, workers: PluginWor
     await executeEnvironmentTask(db, workers, { ...scope, operation: { kind: "complete" } });
     return true;
   } catch {
-    await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed",
+    await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed",
       failureReason: "plugin_runner_task_cleanup_unconfirmed", releasedAt: new Date(), updatedAt: new Date(),
-    }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId)));
+    }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId))));
     throw new Error("Plugin Runner termination is unconfirmed; the saved lease requires cleanup");
   }
 }

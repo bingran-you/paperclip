@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -105,10 +105,7 @@ function isolatedEnv(extra: Record<string, string> = {}) {
 }
 
 async function git(cwd: string, args: string[], options: GitOptions = {}): Promise<Buffer> {
-  const child = execFile("git", [
-    "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false",
-    "-c", `core.hooksPath=${os.devNull}`, "-C", cwd, ...args,
-  ], {
+  const child = execFile("git", gitArgs(cwd, args), {
     env: isolatedEnv(options.env),
     encoding: "buffer",
     maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
@@ -118,6 +115,32 @@ async function git(cwd: string, args: string[], options: GitOptions = {}): Promi
   if (options.input !== undefined) child.child.stdin?.end(options.input);
   const { stdout } = await child;
   return stdout as Buffer;
+}
+
+function gitArgs(cwd: string, args: string[]) {
+  return ["-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", `core.hooksPath=${os.devNull}`, "-C", cwd, ...args];
+}
+
+async function gitPipe(cwd: string, from: string[], to: string[], signal?: AbortSignal) {
+  const options = { env: isolatedEnv(), signal, timeout: 15 * 60_000 };
+  const source = spawn("git", gitArgs(cwd, from), { ...options, stdio: ["ignore", "pipe", "pipe"] });
+  const sink = spawn("git", gitArgs(cwd, to), { ...options, stdio: ["pipe", "ignore", "pipe"] });
+  source.stdout.pipe(sink.stdin);
+  sink.stdin.on("error", () => {});
+  const finished = (child: ReturnType<typeof spawn>) => new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => { if (stderr.length < 4096) stderr += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(Object.assign(new Error(`git exited with ${code}`), { code, stderr })));
+  });
+  const done = [finished(source), finished(sink)];
+  try { await Promise.all(done); }
+  catch (error) {
+    source.kill("SIGKILL");
+    sink.kill("SIGKILL");
+    await Promise.allSettled(done);
+    throw error;
+  }
 }
 
 async function gitText(cwd: string, args: string[], options: GitOptions = {}) {
@@ -232,21 +255,21 @@ async function rawIgnoredTree(cwd: string, env: Record<string, string>, temporar
 }
 
 async function writeIgnoredFiles(cwd: string, commit: string, signal?: AbortSignal) {
-  const listing = nulList(await git(cwd, ["ls-tree", "-r", "-z", `${commit}^{tree}`], { signal }));
+  const listing = nulList(await git(cwd, ["ls-tree", "-r", "-z", "--long", `${commit}^{tree}`], { signal }));
   const entries = listing.map((line) => {
-    const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t(.+)$/s.exec(line);
+    const match = /^(100644|100755|120000) blob ([0-9a-f]{40}) +(\d+)\t(.+)$/s.exec(line);
     if (!match) throw new RestorePointRestoreFailure("invalid_payload");
-    const target = path.join(cwd, match[3]!);
-    if (path.isAbsolute(match[3]!) || match[3]!.split("/").includes("..") || !target.startsWith(`${cwd}${path.sep}`)) {
+    const target = path.join(cwd, match[4]!);
+    if (path.isAbsolute(match[4]!) || match[4]!.split("/").includes("..") || !target.startsWith(`${cwd}${path.sep}`)) {
       throw new RestorePointRestoreFailure("invalid_payload");
     }
-    return { mode: match[1]!, blob: match[2]!, target };
+    return { mode: match[1]!, blob: match[2]!, size: Number(match[3]), target };
   });
   for (const entry of entries) {
     if (await fs.lstat(entry.target).then(() => true, () => false)) throw new RestorePointRestoreFailure("ignored_files_conflict");
   }
   const contents = await git(cwd, ["cat-file", "--batch"], { signal, input: entries.map((entry) => entry.blob).join("\n") + "\n",
-    maxBuffer: 2 * DEFAULT_RESTORE_POINT_LIMITS.maxTotalBytes });
+    maxBuffer: entries.reduce((total, entry) => total + entry.size + 128, 4096) });
   const blobs: Buffer[] = [];
   let offset = 0;
   for (const entry of entries) {
@@ -487,8 +510,12 @@ export async function applyRestorePoint(input: { cwd: string; manifest: RestoreP
   const head = await gitText(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], { signal: input.signal });
   if (head !== manifest.head) throw new RestorePointRestoreFailure("head_mismatch");
   if (manifest.index && manifest.worktree) {
-    const diff = await git(cwd, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", manifest.worktree], { signal: input.signal });
-    if (diff.length > 0) await git(cwd, ["apply", "--binary", "--whitespace=nowarn", "-"], { input: diff, signal: input.signal });
+    const changed = await git(cwd, ["diff", "--quiet", "--no-ext-diff", "--no-textconv", "HEAD", manifest.worktree], { signal: input.signal }).then(() => false, (error: { code?: unknown }) => {
+      if (error.code === 1) return true;
+      throw error;
+    });
+    if (changed) await gitPipe(cwd, ["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", manifest.worktree],
+      ["apply", "--binary", "--whitespace=nowarn", "-"], input.signal);
     await git(cwd, ["read-tree", `${manifest.index}^{tree}`], { signal: input.signal });
   }
   if (manifest.ignored) await writeIgnoredFiles(cwd, manifest.ignored, input.signal);

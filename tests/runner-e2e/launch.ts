@@ -1074,6 +1074,13 @@ async function main() {
   }
 
   if (process.env.PAPERCLIP_E2E_OPERATIONS_MANIFEST && executions.some(execution => execution.task.flow === "provider_connection")) throw new Error("Provider connection campaign has no budgeted routing qualification");
+  if (executions.some(execution => execution.task.flow === "github_review_journey")) {
+    if (options.connectionConfig) throw new Error("Use --github-review-config for the GitHub journey.");
+    const { runGitHubReviewCampaign } = await import("./github-review-launch.js");
+    await runGitHubReviewCampaign({ executions, catalog: runnerMatrix, configFile: options.githubReviewConfig, repositoryRoot, provisionRepository: options.provisionGitHubRepository });
+    return;
+  }
+  if (options.githubReviewConfig || options.provisionGitHubRepository) throw new Error("GitHub journey options require an explicit GitHub review journey selection.");
   if (executions.some(execution => execution.task.flow === "provider_connection")) {
     const { runConnectionCampaign } = await import("./connection-launch.js");
     await runConnectionCampaign({ executions, catalog: runnerMatrix, configFile: options.connectionConfig, repositoryRoot });

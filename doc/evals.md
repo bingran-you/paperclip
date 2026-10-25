@@ -1,5 +1,12 @@
 # Paperclip evaluation guide
 
+The explicit-only [GitHub review bot journey](../tests/runner-e2e/GITHUB-REVIEW-JOURNEY.md)
+converts the Ponytail walkthrough into attended App setup, scoped installation,
+automatic PR review, and independent two-service checks. It supports attached
+self-hosted/Cloud targets and separately selected local/Daytona agents. Account
+and credential bindings stay in the private eval repo; registration and oracle
+tests do not establish a completed live pass or unattended CI qualification.
+
 The explicit-only [necessary free-text question journey](../tests/runner-e2e/README.md#necessary-free-text-question)
 checks one essential input, the rendered prompt and context, the real answer,
 one bound continuation, and an exact saved confirmation. Its four development

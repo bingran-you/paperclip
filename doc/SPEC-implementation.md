@@ -891,6 +891,15 @@ grant privileged tools. Backlog assignments retain the existing human requester
 without starting a run. Reassignment transactionally cancels prior human requests,
 including service/plugin writes; cancelled runs cannot authorize later retries. See `doc/LOW-TRUST-PRESETS.md` for containment details.
 
+Project or repository access is a separate boundary from exact-task direction.
+A workspace project denial appears on the task with a link to the agent's
+Permissions / Trust settings. Board operators with `agents:create` can add
+same-company projects through `POST /api/agents/:id/project-access`; the operation
+locks the agent, preserves existing permissions and audits added projects.
+Saving does not retry work. The task offers explicit Retry after the required
+project is allowed, and dispatch rechecks authorization. Existing setup failures
+with the exact project-boundary denial also receive the explanation on reload.
+
 Cross-issue writes are contained per heartbeat run. An agent-authored comment
 may wake the target assignee, including an explicit `resume: true` comment on a
 `done` or `cancelled` issue, but the wake remains agent-class and is subject to

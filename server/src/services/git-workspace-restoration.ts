@@ -402,7 +402,7 @@ async function tipsMissingUpstream(checkout: string, tips: string[], repoUrl: st
   return tips.filter(tip => missing.has(tip)).sort();
 }
 
-async function hasCommitsMissingUpstream(checkout: string, localTips: string[], repoUrl: string,
+export async function hasCommitsMissingUpstream(checkout: string, localTips: string[], repoUrl: string,
   resolveGitAuth: GitRemoteAuthProvider, signal?: AbortSignal, covered: string[] = []) {
   return (await commitsMissingUpstream(checkout, localTips, repoUrl, resolveGitAuth, signal, covered, 1)).length > 0;
 }

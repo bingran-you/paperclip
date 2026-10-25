@@ -804,6 +804,10 @@ describe("agent test-environment route", () => {
     expect(mockEnvironmentRuntime.acquireRunLease).toHaveBeenCalledWith(
       expect.objectContaining({
         applyCustomImageTemplate: true,
+        configuredEnvironment: expect.objectContaining({
+          id: "11111111-1111-4111-8111-111111111111",
+          config: { provider: "fake-plugin" },
+        }),
         // The Test lease re-checks the company binding, so a binding change
         // between the route guard and the lease cannot open a foreign sandbox.
         assertCompanyBinding: true,

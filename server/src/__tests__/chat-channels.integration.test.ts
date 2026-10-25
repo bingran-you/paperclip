@@ -40886,6 +40886,46 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it.each(["request_confirmation", "request_checkbox_confirmation", "request_item_verdicts", "suggest_tasks", "connection_intent"] as const)("delivers and replaces a Slack %s card through the publication service", async kind => {
+    const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
+    process.env.PAPERCLIP_PUBLIC_URL = "https://paperclip.example";
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture);
+    try {
+      const thread = makeThread({ channelId: "C-REVIEW", id: "slack:C-REVIEW:4500.1", name: "reviews" });
+      await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread, message: makeMessage({ id: "4500.1", text: "@maya review this change", mentioned: true, userId: `U-REVIEW-${randomUUID()}` }), trigger: "mention" });
+      await qualifySetupRoundTrip(service, endpoint.id);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
+      const sourceRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: fixture.companyId, agentId: fixture.assignedAgentId, status: "succeeded", responsibleUserId: "owner-user", contextSnapshot: { issueId: conversation.issueId, taskId: conversation.issueId, source: "automation" } });
+      const interactions = issueThreadInteractionService(db);
+      const issue = { id: conversation.issueId, companyId: fixture.companyId };
+      const interaction = kind === "connection_intent"
+        ? await interactions.createConnectionIntent(issue, { sourceRunId, addresseeUserId: "owner-user", idempotencyKey: `slack-review:${sourceRunId}`, payload: { version: 1, serviceSlug: "notion", serviceName: "Notion", requestingAgentId: fixture.assignedAgentId, requestingAgentName: "Maya", phase: "requested" } })
+        : await interactions.create(issue, { kind, sourceRunId, payload: kind === "suggest_tasks" ? { version: 1, tasks: [{ clientKey: "docs", title: "Review migration notes" }] } : kind === "request_item_verdicts" ? { version: 1, prompt: "Review migration notes", items: [{ id: "docs", label: "Migration notes" }] } : { version: 1, prompt: "Review migration notes", ...(kind === "request_checkbox_confirmation" ? { options: [{ id: "docs", label: "Migration notes" }] } : {}) } } as Parameters<typeof interactions.create>[1], { agentId: fixture.assignedAgentId });
+      await service.processPendingPublications();
+      const rows = () => db.select().from(chatPublications).where(and(eq(chatPublications.endpointId, endpoint.id), eq(sql<string>`${chatPublications.payload}->>'interactionId'`, interaction.id)));
+      const [original] = await rows();
+      expect(original?.state).toBe("published");
+      expect(original?.payload.card?.actions).toEqual(expect.arrayContaining([expect.objectContaining({ type: "callback" })]));
+      if (kind === "connection_intent") expect(original?.payload.card?.actions).toContainEqual({ type: "link", label: "Review connection", url: expect.any(String) });
+      if (kind === "connection_intent") await interactions.resolveConnectionIntent(issue, interaction.id, { version: 1, outcome: "declined" }, { userId: "owner-user" });
+      else if (kind === "request_item_verdicts") await interactions.submitItemVerdicts(issue, interaction.id, { verdicts: [{ id: "docs", verdict: "approve" }] }, { userId: "owner-user" });
+      else await interactions.rejectInteraction(issue, interaction.id, {}, { userId: "owner-user" });
+      await service.processPendingPublications();
+      const publications = await rows();
+      const terminal = publications.find(row => row.id !== original.id);
+      expect(terminal?.state).toBe("published");
+      expect(terminal?.providerMessageId).toBe(original.providerMessageId);
+      expect(terminal?.payload.card?.actions).toBeUndefined();
+    } finally {
+      await service.shutdown();
+      if (previousPublicUrl === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
+      else process.env.PAPERCLIP_PUBLIC_URL = previousPublicUrl;
+    }
+  });
+
   it("publishes a closed-choice question, settles its Slack card, and delivers its exact continuation response", async () => {
     const fixture = await seedCompany();
     const continuationRunId = randomUUID();
@@ -41944,10 +41984,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
       expect(metadata).toEqual({ c: expect.any(String), m: view.callback_id });
       const select = view.blocks.find(
-        (block) => block.element.type === "static_select",
+        (block) => block.element?.type === "radio_buttons",
       )!;
       const text = view.blocks.find(
-        (block) => block.element.type === "plain_text_input",
+        (block) => block.element?.type === "plain_text_input",
       )!;
       const production = select.element.options!.find(
         (option) => option.text.text === "Production",
@@ -41966,7 +42006,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               values: {
                 [select.block_id]: {
                   [select.element.action_id]: {
-                    type: "static_select",
+                    type: "radio_buttons",
                     selected_option: production,
                   },
                 },
@@ -42631,7 +42671,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         privateMetadata?: string;
       };
       const selectField = modal.children.find(
-        (child) => child.type === "select",
+        (child) => child.type === (provider === "slack" ? "radio_select" : "select"),
       );
       const textField = modal.children.find(
         (child) => child.type === "text_input",

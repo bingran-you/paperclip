@@ -92,11 +92,13 @@ export async function startConnectionTarget(config: ConnectionConfig, executions
   } catch (error) { await stop(); throw error; }
 }
 
-export async function verifyConnectionTarget(origin: string, config: ConnectionConfig) {
+export async function verifyConnectionTarget(origin: string, config: ConnectionConfig, request?: APIRequestContext) {
   let health: any;
   try {
-    const response = await fetch(`${targetOrigin(origin)}/api/health`, { redirect: "error", signal: AbortSignal.timeout(15_000) });
-    if (!response.ok) throw new ConnectionFailure();
+    const response = request
+      ? await request.get(`${targetOrigin(origin)}/api/health`, { maxRedirects: 0, timeout: 15_000 })
+      : await fetch(`${targetOrigin(origin)}/api/health`, { redirect: "error", signal: AbortSignal.timeout(15_000) });
+    if (!(typeof response.ok === "function" ? response.ok() : response.ok)) throw new ConnectionFailure();
     health = await response.json();
   } catch { throw new ConnectionBlock("blocked_target", "target_health_unavailable_or_redirected"); }
   if (typeof health.commit !== "string" || !/^[a-f0-9]{40}$/.test(health.commit)) throw new ConnectionBlock("blocked_target", "target_revision_unavailable");

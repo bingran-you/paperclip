@@ -231,6 +231,7 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
         ...(environment.driver === "plugin" && input.adapterType === "paperclip_runner"
           ? { requestedExpiresAt: new Date(Date.now() + 180_000) } : {}),
         environment: testEnvironment,
+        configuredEnvironment: environment,
         issueId: null,
         heartbeatRunId: null,
         persistedExecutionWorkspace: null,

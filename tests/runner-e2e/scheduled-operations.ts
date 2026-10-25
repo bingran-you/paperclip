@@ -64,7 +64,7 @@ export function scheduledManifest(input: {
   const { executionIds, executions, models } = validateScheduledBudget(input);
   const manifest: EvalOperationsManifest = {
     version: 1, limits: { campaignId: input.campaignId, maxUsd: budget(input.cadence), overhead: input.overhead,
-      deadlineAt: new Date(input.now + 30 * 60_000).toISOString(), maxRequests: input.cadence === "daily" ? 60 : 120,
+      deadlineAt: new Date(input.now + 30 * 60_000).toISOString(), maxRequests: input.cadence === "daily" ? 30 : 60,
       maxConcurrent: 1, maxAttemptsPerExecution: 1 },
     ledgerPath: input.ledgerPath, executionIds, maxAttemptsPerExecution: 1, route: "braintrust", projectId: input.projectId,
     models,

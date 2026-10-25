@@ -1,3 +1,6 @@
+import { connectionIntentService } from "../../connection-intents.js";
+import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../../issue-assignment-wakeup.js";
+import { chatInteractionPresentation } from "../../chat-interaction-presentation.js";
 import type { DbTransaction, RuntimeContext, LifecycleRuntimeFence } from "../runtime-types.js";
 
 import { notifyChatPublicationWork } from "../../chat-work-notifications.js";
@@ -37,8 +40,8 @@ import { issueThreadInteractionService } from "../../issue-thread-interactions.j
 
 import type { EndpointRecord } from "../runtime-types.js";
 import type { ActionEvent } from "chat";
-import { nativeTelegramConfirmation } from "../../chat-interaction-publications.js";
-type TelegramConfirmationInput = {
+import { nativeChatConfirmation, nativeChatCheckbox, nativeChatSuggestions } from "../../chat-interaction-publications.js";
+type ChatConfirmationInput = {
   record: EndpointRecord;
   event: ChatSdkCallbackEvent<ActionEvent>;
   runtimeContext: RuntimeContext;
@@ -49,21 +52,22 @@ type TelegramConfirmationInput = {
   deny: (known?: { conversationId?: string | null; principalId?: string | null }) => Promise<void>;
   safelyKnown: { conversationId: string; principalId: string };
 };
-type TelegramConfirmationOptions = {
+type ChatConfirmationOptions = {
+  heartbeat: IssueAssignmentWakeupDeps;
   requireCurrentExternalActionAuthorization: (tx: DbTransaction, input: { conversationId: string; endpointId: string; expectedUserId: string; principalId: string; runtimeContext: LifecycleRuntimeFence }) => Promise<void>;
   isExternalActionAuthorizationChange: (error: unknown) => boolean;
   scheduleMessageProcessing: (task: () => Promise<void>) => void;
   processPendingPublications: () => Promise<unknown>;
   confirmationResolutionPersistBarrier?: () => Promise<void>;
 };
-export function createTelegramConfirmationActions(db: Db, options: TelegramConfirmationOptions) {
+export function createChatConfirmationActions(db: Db, options: ChatConfirmationOptions) {
   const { requireCurrentExternalActionAuthorization, isExternalActionAuthorizationChange, scheduleMessageProcessing, processPendingPublications } = options;
-  async function handleTelegramConfirmation(input: TelegramConfirmationInput) {
+  async function handleChatConfirmation(input: ChatConfirmationInput) {
     const { record, event, runtimeContext, conversation, principal, issued, interaction, deny, safelyKnown } = input;
 
     if (
-      event.provider !== "telegram" ||
-      !nativeTelegramConfirmation(interaction)
+      (event.provider !== "telegram" && event.provider !== "slack") ||
+      !(nativeChatConfirmation(interaction) || event.provider === "slack" && (nativeChatCheckbox(interaction) || nativeChatSuggestions(interaction) || interaction.kind === "connection_intent"))
     ) {
       return deny(safelyKnown);
     }
@@ -134,107 +138,95 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
     }
 
     const decision = tokenPayload.decision;
+    if (interaction.kind === "connection_intent" && decision !== "reject") return deny(safelyKnown);
+    let selectedOptionIds: string[] | undefined;
+    if (interaction.kind === "request_checkbox_confirmation" && decision === "accept") {
+      const mappings = tokenPayload.selectionOptions as Array<{ value: string; optionId: string }> | undefined;
+      const values = event.selectionValues;
+      if (!Array.isArray(mappings) || !values || new Set(values).size !== values.length ||
+          values.some(value => !mappings.some(item => item.value === value))) return deny(safelyKnown);
+      selectedOptionIds = values.map(value => mappings.find(item => item.value === value)!.optionId);
+      const minimum = interaction.payload.minSelected ?? 0;
+      const maximum = interaction.payload.maxSelected ?? interaction.payload.options.length;
+      if (values.length < minimum || values.length > maximum) {
+        await event.event.thread?.postEphemeral(event.event.user, { markdown: `That selection was not saved. ${minimum === maximum ? `Select exactly ${minimum}` : `Select between ${minimum} and ${maximum}`} checks, then save.` }, { fallbackToDM: false });
+        return;
+      }
+    }
+    let selectedClientKeys: string[] | undefined;
+    if (interaction.kind === "suggest_tasks" && decision === "accept") {
+      const mappings = tokenPayload.selectionOptions as Array<{ value: string; optionId: string }> | undefined;
+      if (!Array.isArray(mappings) || !mappings.length) return deny(safelyKnown);
+      const values = mappings.length === 1 ? [mappings[0].value] : event.selectionValues;
+      if (!values || new Set(values).size !== values.length || values.some(value => !mappings.some(item => item.value === value))) return deny(safelyKnown);
+      if (!values.length) {
+        await event.event.thread?.postEphemeral(event.event.user, { markdown: "No tasks were created. Select at least one task, then choose Create selected." }, { fallbackToDM: false });
+        return;
+      }
+      selectedClientKeys = values.map(value => mappings.find(item => item.value === value)!.optionId);
+    }
+    const mutationOptions = {
+            beforeResolveInTransaction: async (tx: DbTransaction) => {
+              await requireCurrentExternalActionAuthorization(tx, {
+                conversationId: conversation.id,
+                endpointId: record.endpoint.id,
+                expectedUserId: principal.userId!,
+                principalId: principal.principal.id,
+                runtimeContext,
+              });
+            },
+            afterResolveInTransaction: async (tx: DbTransaction, resolved: import("@paperclipai/shared").IssueThreadInteraction) => {
+              const [owned] = await tx
+                .update(chatActions)
+                .set({
+                  principalId: principal.principal.id,
+                  status: "processing",
+                  payload: {
+                    ...tokenPayload,
+                    messageId: event.event.messageId,
+                    actionId: event.event.actionId,
+                    value: event.event.value ?? null,
+                    ...(selectedOptionIds ? { selectedOptionIds } : {}),
+                  },
+                  result: {
+                    code: "confirmation_resolution_committed_by_provider",
+                    interactionId: resolved.id,
+                    interactionStatus: resolved.status,
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(chatActions.id, action.id),
+                    eq(chatActions.status, "issued"),
+                  ),
+                )
+                .returning({ id: chatActions.id });
+              if (!owned) {
+                throw new Error(
+                  "External confirmation action ownership changed before interaction commit",
+                );
+              }
+            },
+          };
+    let createdIssues: Array<{ id: string; assigneeAgentId: string | null; status: string }> = [];
     try {
       if (decision === "accept") {
-        await issueThreadInteractionService(db).acceptInteraction(
+        const accepted = await issueThreadInteractionService(db).acceptInteraction(
           issue,
           interaction.id,
-          {},
+          { ...(selectedOptionIds ? { selectedOptionIds } : {}), ...(selectedClientKeys ? { selectedClientKeys } : {}) },
           { userId: principal.userId },
-          {
-            beforeResolveInTransaction: async (tx) => {
-              await requireCurrentExternalActionAuthorization(tx, {
-                conversationId: conversation.id,
-                endpointId: record.endpoint.id,
-                expectedUserId: principal.userId!,
-                principalId: principal.principal.id,
-                runtimeContext,
-              });
-            },
-            afterResolveInTransaction: async (tx, resolved) => {
-              const [owned] = await tx
-                .update(chatActions)
-                .set({
-                  principalId: principal.principal.id,
-                  status: "processing",
-                  payload: {
-                    ...tokenPayload,
-                    messageId: event.event.messageId,
-                    actionId: event.event.actionId,
-                    value: null,
-                  },
-                  result: {
-                    code: "confirmation_resolution_committed_by_provider",
-                    interactionId: resolved.id,
-                    interactionStatus: resolved.status,
-                  },
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(chatActions.id, action.id),
-                    eq(chatActions.status, "issued"),
-                  ),
-                )
-                .returning({ id: chatActions.id });
-              if (!owned) {
-                throw new Error(
-                  "External confirmation action ownership changed before interaction commit",
-                );
-              }
-            },
-          },
+          mutationOptions,
         );
+        createdIssues = accepted.createdIssues;
       } else {
-        await issueThreadInteractionService(db).rejectInteraction(
-          issue,
-          interaction.id,
-          {},
-          { userId: principal.userId },
-          {
-            beforeResolveInTransaction: async (tx) => {
-              await requireCurrentExternalActionAuthorization(tx, {
-                conversationId: conversation.id,
-                endpointId: record.endpoint.id,
-                expectedUserId: principal.userId!,
-                principalId: principal.principal.id,
-                runtimeContext,
-              });
-            },
-            afterResolveInTransaction: async (tx, resolved) => {
-              const [owned] = await tx
-                .update(chatActions)
-                .set({
-                  principalId: principal.principal.id,
-                  status: "processing",
-                  payload: {
-                    ...tokenPayload,
-                    messageId: event.event.messageId,
-                    actionId: event.event.actionId,
-                    value: null,
-                  },
-                  result: {
-                    code: "confirmation_resolution_committed_by_provider",
-                    interactionId: resolved.id,
-                    interactionStatus: resolved.status,
-                  },
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(chatActions.id, action.id),
-                    eq(chatActions.status, "issued"),
-                  ),
-                )
-                .returning({ id: chatActions.id });
-              if (!owned) {
-                throw new Error(
-                  "External confirmation action ownership changed before interaction commit",
-                );
-              }
-            },
-          },
-        );
+
+        if (interaction.kind === "connection_intent") {
+          await connectionIntentService(db).decline(interaction.id, principal.userId, undefined, { mutationOptions });
+        } else {
+          await issueThreadInteractionService(db).rejectInteraction(issue, interaction.id, {}, { userId: principal.userId }, mutationOptions);
+        }
       }
     } catch (error) {
       if (isExternalActionAuthorizationChange(error)) {
@@ -264,6 +256,7 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
       throw error;
     }
 
+    for (const createdIssue of createdIssues) await queueIssueAssignmentWakeup({ heartbeat: options.heartbeat, issue: createdIssue, reason: "issue_assigned", mutation: "interaction_accept", contextSource: "issue.interaction.accept", requestedByActorType: "user", requestedByActorId: principal.userId });
     await options.confirmationResolutionPersistBarrier?.();
     if (!(await settleTerminalConfirmationAction(action.id))) {
       throw new Error(
@@ -355,7 +348,7 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
       !conversation ||
       !publication ||
       !endpoint ||
-      endpoint.provider !== "telegram" ||
+      (endpoint.provider !== "telegram" && endpoint.provider !== "slack") ||
       publication.conversationId !== conversation.id ||
       publication.payload.interactionId !== token.interactionId
     ) {
@@ -379,8 +372,8 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
     ).find((candidate) => candidate.id === token.interactionId);
     if (
       !interaction ||
-      interaction.kind !== "request_confirmation" ||
-      !nativeTelegramConfirmation(interaction)
+      (interaction.kind !== "request_confirmation" && interaction.kind !== "request_checkbox_confirmation" && interaction.kind !== "suggest_tasks" && interaction.kind !== "connection_intent") ||
+      !(nativeChatConfirmation(interaction) || endpoint.provider === "slack" && (nativeChatCheckbox(interaction) || nativeChatSuggestions(interaction) || interaction.kind === "connection_intent"))
     ) {
       await db
         .update(chatActions)
@@ -480,14 +473,14 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
     }
     const resolvedByUserId = interaction.resolvedByUserId;
     const shouldWake =
-      Boolean(issue.assigneeAgentId) &&
+      interaction.kind !== "connection_intent" && Boolean(issue.assigneeAgentId) &&
       issue.status !== "done" &&
       issue.status !== "cancelled" &&
       (interaction.continuationPolicy === "wake_assignee" ||
         (interaction.continuationPolicy === "wake_assignee_on_accept" &&
           interaction.status === "accepted"));
     const resolutionLabel =
-      interaction.status === "accepted" ? "Accepted" : "Rejected";
+      interaction.status === "accepted" ? "Accepted" : interaction.kind === "connection_intent" ? "Declined" : "Rejected";
     const resolvedByThisProviderAction =
       action.result?.code === "confirmation_resolution_committed_by_provider";
     return db.transaction(async (tx) => {
@@ -556,13 +549,15 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
           payload: projectSafeChatPublication({
             classification: "external",
             source: "issue_interaction",
-            text: `${resolutionLabel}: ${interaction.payload.prompt}`,
+            text: `${resolutionLabel}: ${chatInteractionPresentation(interaction).title}`,
             interaction: {
               id: interaction.id,
               card: {
                 kind: "confirmation",
-                title: interaction.payload.prompt,
-                body: resolutionLabel,
+                title: chatInteractionPresentation(interaction).title,
+                body: interaction.kind === "request_checkbox_confirmation" && interaction.status === "accepted"
+                  ? `Saved checks: ${interaction.payload.options.filter(option => interaction.result?.selectedOptionIds?.includes(option.id)).map(option => option.label).join("; ") || "none selected"}`
+                  : resolutionLabel,
                 actions: [],
               },
             },
@@ -652,5 +647,5 @@ export function createTelegramConfirmationActions(db: Db, options: TelegramConfi
     }
     return settled;
   }
-  return { settleTerminalConfirmationAction, reconcileTerminalConfirmationActions, handleTelegramConfirmation };
+  return { settleTerminalConfirmationAction, reconcileTerminalConfirmationActions, handleChatConfirmation };
 }

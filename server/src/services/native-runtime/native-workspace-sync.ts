@@ -1,3 +1,4 @@
+import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { emitStartupReuse, type StartupReuseReason } from "@paperclipai/adapter-utils/startup-reuse";
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
@@ -647,6 +648,7 @@ async function persistLeaseStamp(input: {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!lease) throw new Error("native_workspace_sync_lease_missing");
+    await notifyEnvironmentCleanup(tx);
     await tx
       .update(environmentLeases)
       .set({

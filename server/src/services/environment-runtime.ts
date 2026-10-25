@@ -1,3 +1,4 @@
+import { flushDeferredEnvironmentCleanup, registerDeferredEnvironmentCleanup, writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { executeEnvironmentTask, pluginEnvironmentSupportsTasks, settleDispatchedEnvironmentTask } from "./environment-task-runtime.js";
 import type { PluginEnvironmentTaskOperation } from "@paperclipai/plugin-sdk";
 import { allowLegacyShutdownWorkspaceCleanup, legacyShutdownWorkspaceResourceProtected } from "./legacy-shutdown-workspace-settlement.js";
@@ -1350,12 +1351,14 @@ function createSandboxEnvironmentDriver(
   // Keep the token through queue splices, failed flushes and buffer overflow.
   // Release only when the database durably owns cleanup of this exact orphan.
   const orphanIdleWork = new Map<string, () => void>();
+  let unregisterDeferredCleanup: (() => void) | undefined;
   const orphanIdleKey = (record: DeferredOrphanCleanupRecord) => JSON.stringify([
     record.companyId, record.provider, record.providerLeaseId ?? record,
   ]);
   const trackOrphanIdleWork = (record: DeferredOrphanCleanupRecord) => {
     const key = orphanIdleKey(record);
     if (!orphanIdleWork.has(key)) orphanIdleWork.set(key, beginIdleTrackedWork());
+    unregisterDeferredCleanup ??= registerDeferredEnvironmentCleanup(db, flushDeferredOrphanCleanups);
   };
   const DEFERRED_ORPHAN_CLEANUP_FAILURE_REASON = "acquire_rejected_teardown_failed";
 
@@ -1390,10 +1393,15 @@ function createSandboxEnvironmentDriver(
   };
 
   const flushDeferredOrphanCleanupsOnce = async (): Promise<{ recovered: number; pending: number }> => {
-    // Other task paths can append after startup; each pass must ingest their records.
-    for (const record of await orphanCleanupSpool.load()) enqueueDeferredOrphanCleanup(record);
+    // Other task paths append after startup. Read on each concrete cleanup pass;
+    // the worker disarms entirely when no pending obligation remains.
+    const loaded = orphanCleanupSpool.loadWithStatus
+      ? await orphanCleanupSpool.loadWithStatus()
+      : { records: await orphanCleanupSpool.load(), readFailed: false };
+    for (const record of loaded.records) enqueueDeferredOrphanCleanup(record);
     if (deferredOrphanCleanups.length === 0) {
-      return { recovered: 0, pending: 0 };
+      if (loaded.readFailed) throw new Error("Orphan cleanup spool has unread records");
+      return { recovered: 0, pending: orphanIdleWork.size };
     }
     // New acquisitions can enqueue while this batch is being persisted.
     const batch = deferredOrphanCleanups.splice(0, deferredOrphanCleanups.length);
@@ -1441,7 +1449,9 @@ function createSandboxEnvironmentDriver(
         );
       }
     }
-    return { recovered, pending: deferredOrphanCleanups.length };
+    if (orphanIdleWork.size === 0) { unregisterDeferredCleanup?.(); unregisterDeferredCleanup = undefined; }
+    if (loaded.readFailed) throw new Error("Orphan cleanup spool has unread records");
+    return { recovered, pending: orphanIdleWork.size };
   };
   let orphanFlush: Promise<{ recovered: number; pending: number }> | null = null;
   const flushDeferredOrphanCleanups = (): Promise<{ recovered: number; pending: number }> => {
@@ -1846,8 +1856,8 @@ function createSandboxEnvironmentDriver(
       // or account used for qualification and custom-template resolution.
       if (configuredEnvironment.id !== input.environment.id
         || configuredEnvironment.driver !== input.environment.driver
-        || stableStringify({ ...configuredEnvironment.config, reuseLease: undefined })
-          !== stableStringify({ ...input.environment.config, reuseLease: undefined })) {
+        || stableStringify({ ...configuredEnvironment.config, reuseLease: undefined, archiveOnRelease: undefined })
+          !== stableStringify({ ...input.environment.config, reuseLease: undefined, archiveOnRelease: undefined })) {
         throw new Error("Run environment does not match its saved configuration.");
       }
       const storedParsed = parseEnvironmentDriverConfig(input.environment);
@@ -1867,7 +1877,7 @@ function createSandboxEnvironmentDriver(
         && hasSandboxSnapshotQualification(configuredEnvironment, input.companyId)) {
         throw new Error("sandbox_snapshot_qualification_required: The snapshot qualification is missing or stale. Test this environment again before running Paperclip Runner.");
       }
-      if (input.configuredEnvironment) parsed.config = { ...parsed.config, reuseLease: storedParsed.config.reuseLease };
+      if (input.configuredEnvironment) parsed.config = { ...parsed.config, reuseLease: storedParsed.config.reuseLease, archiveOnRelease: storedParsed.config.archiveOnRelease };
       if (pinnedSnapshotId) parsed.config = { ...parsed.config, snapshot: pinnedSnapshotId };
 
       // Check if this provider should be handled by a plugin.
@@ -4021,7 +4031,7 @@ export function environmentRuntimeService(
     // Persist recovery ownership before any provider work. Re-check scope and
     // run liveness in this write: the earlier selection cannot fence a resume.
     // The in-flight lease also excludes concurrent closures and cleanup sweeps.
-    const [claimed] = await db.update(environmentLeases).set({
+    const [claimed] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
       status: "pending_cleanup",
       failureReason: input.failureReason,
       cleanupStatus: "failed",
@@ -4045,7 +4055,7 @@ export function environmentRuntimeService(
         WHERE ${heartbeatRuns.id} = ${environmentLeases.heartbeatRunId}
           AND ${heartbeatRuns.status} IN ('queued', 'scheduled_retry', 'running')
       )`,
-    )).returning();
+    )).returning());
     if (!claimed) return null;
     const lease = toEnvironmentLeaseSnapshot(claimed);
     let renewalInFlight = false;
@@ -4080,11 +4090,11 @@ export function environmentRuntimeService(
       clearInterval(renewal);
       // A crash skips this write; the bounded ownership lease lets the sweep
       // recover. A completed failure becomes eligible for a later explicit retry.
-      await db.update(environmentLeases).set({
+      await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
         metadata: sql`${environmentLeases.metadata} || '{"pendingCleanupInFlight":false}'::jsonb`,
       }).where(and(eq(environmentLeases.id, lease.id),
         sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${attemptId}`,
-      )).catch(() => {
+      ))).catch(() => {
         logger.warn({ leaseId: lease.id }, "scoped cleanup ownership settlement failed");
       });
     }
@@ -4240,7 +4250,7 @@ export function environmentRuntimeService(
           if (hasStopOnlyCleanup(leaseSnapshot)) {
             const intentKey = stopOnlyCleanupKey(leaseSnapshot);
             const attemptId = randomUUID();
-            const [claimed] = await db.update(environmentLeases).set({
+            const [claimed] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
               status: "pending_cleanup", cleanupStatus: "failed", releasedAt: new Date(),
               metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ pendingCleanupAttemptId: attemptId,
                 pendingCleanupInFlight: true, pendingCleanupLeaseExpiresAtMs: Date.now() + 15 * 60_000 })}::jsonb`,
@@ -4248,7 +4258,7 @@ export function environmentRuntimeService(
               inArray(environmentLeases.status, ["active", "pending_cleanup"]),
               sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') = 'false'`,
               sql`${environmentLeases.metadata}->${intentKey} = ${JSON.stringify(leaseSnapshot.metadata?.[intentKey])}::jsonb`,
-            )).returning();
+            )).returning());
             if (!claimed) continue;
             const snapshot = toEnvironmentLeaseSnapshot(claimed);
             try {
@@ -4419,15 +4429,8 @@ export function environmentRuntimeService(
     // it down. The dispatcher sums the recovered and pending counts across all
     // drivers. A driver with no buffer contributes nothing.
     async flushDeferredOrphanCleanups(): Promise<{ recovered: number; pending: number }> {
-      let recovered = 0;
-      let pending = 0;
-      for (const driver of drivers.values()) {
-        if (!driver.flushDeferredOrphanCleanups) continue;
-        const result = await driver.flushDeferredOrphanCleanups();
-        recovered += result.recovered;
-        pending += result.pending;
-      }
-      return { recovered, pending };
+      return flushDeferredEnvironmentCleanup(db, Array.from(drivers.values())
+        .flatMap(driver => driver.flushDeferredOrphanCleanups ? [driver.flushDeferredOrphanCleanups] : []));
     },
 
     async destroyReusableSandboxLeases(input: {

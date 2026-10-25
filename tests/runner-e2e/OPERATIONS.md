@@ -156,16 +156,17 @@ keys. The server environment strips the gateway token and upstream credentials.
 
 Every upstream attempt reserves its maximum estimated charge in an fsynced
 journal before dispatch. Requests, retries, and cancelled calls retain distinct
-IDs. Braintrust gateway requests propagate the reserved request ID, campaign,
+IDs. Braintrust gateway requests include the reserved request ID, campaign,
 execution, attempt and phase as allowlisted `paperclip_eval_*` metadata in the
-SDK-compatible parent context. The exact context is retained in the private
-receipt before dispatch, so a request canceled before response headers can
-still be looked up by `metadata.paperclip_eval_request_id` in project logs.
-This context contains no provider credential, prompt or response, and does not
-create an extra model call or a synthetic parent span. Direct provider routes
-receive no Braintrust context. Older project-only receipts cannot acquire this
-identity retroactively; time or session matches remain candidate evidence.
-A matching logged span does not itself prove complete usage or final billing.
+SDK-compatible parent context. The private receipt saves that context before
+dispatch. A live hosted probe did not retain the propagated metadata, so this
+header alone does not prove lookup by request ID after a pre-header cancellation.
+The returned `x-bt-span-id`, when present, identifies the Braintrust log row's
+`id`; the stored `span_id` and `root_span_id` can differ. The private receipt's
+historical field name `gatewaySpanId` continues to hold that returned row ID.
+Direct provider routes receive no Braintrust context. Older receipts cannot
+acquire a missing gateway row ID from a time or session match.
+A matching logged row does not itself prove complete usage or final billing.
 Unknown usage keeps the reservation held. One shared writer serializes
 admission across cells, so concurrent requests cannot each spend the same remaining
 allowance. Campaign deadline, request count, and in-flight count are also enforced.
@@ -364,8 +365,10 @@ rejects ambiguous singular fields and routing values.
 
 Each relay allows at most 2,048 admitted exports, 8 MiB per request before and
 after decompression, 64 MiB of forwarded payloads, and four simultaneous exports.
-It also limits each attempt to 16,384 records and 256 MiB of expanded source
-JSON. This measurement includes the full decoded source plus each record in
+The default allowance limits each attempt to 4,096 records and 16 MiB of
+expanded source JSON. Historical receipts with up to 16,384 records and 256 MiB
+remain readable; controller callers may still supply explicit limits up to
+those maxima. This measurement includes the full decoded source plus each record in
 its own envelope with the shared resource and scope fields repeated. It counts
 span names, IDs, times, events, links and log bodies, not only routing attributes.
 Protobuf fields use the pinned OTLP v1.9 schema; unknown fields fail admission
@@ -408,7 +411,7 @@ or an invoice. Vendor charges remain unreconciled. The current two-attempt daily
 maximum is 132.125 MiB and the four-attempt weekly maximum is 260.25 MiB,
 including finalization and the campaign's experiment payload allowance. These
 bounds do not include other projects, standalone imports or retained storage.
-The corresponding expanded-source ceilings are 514 MiB daily and 1,028 MiB
+The corresponding default expanded-source ceilings are 34 MiB daily and 68 MiB
 weekly before the separate 4-MiB experiment allowance. These source measurements
 support a priced forecast; they are not Braintrust's processed-data meter or a
 vendor-enforced dollar limit. Gateway auto-logging is a separate input to that
@@ -463,7 +466,12 @@ the existing AWS/GitHub runner choice.
 
 Daily selects native Claude's marker and feedback-persistence cases with a shared
 $20 allowance. Weekly adds native Codex's two corresponding cases with a
-shared $100 allowance. Model requests and declared operating overhead share
+shared $100 allowance. Daily campaigns admit at most 30 model requests; weekly
+campaigns admit at most 60. The October 23 qualification campaigns used 10 model
+requests each. The largest observed native attempt exported 6,531,801 expanded
+source bytes and 2,455 records. The defaults retain headroom for those measured
+cases; exhausting a limit remains visible and never silently drops required
+evidence. Model requests and declared operating overhead share
 this limit. Each campaign runs sequentially in one job with one
 journal, one attempt per execution, zero automatic retries, a 30-minute request
 deadline and a finite request count. Codex's worst-case request reservation exceeds
@@ -727,6 +735,24 @@ not distinct provider requests or charges. Codex exports can be high volume and
 Braintrust can double-count native/log observations; use the deduplicated gateway
 ledger as the estimate authority. Private indexing receipts contain only counts,
 identities and verification status, without trace contents or credentials.
+
+Scheduled finalization separately verifies every non-infrastructure request in
+the campaign journal against its private gateway receipt. It queries Braintrust
+by row `id`, checks the expected provider and model, and retains the actual span
+and trace IDs in `gateway-indexing-receipt.json`. Setup, failed and canceled
+requests remain in the denominator. Missing receipts, missing row IDs, duplicate
+row attribution, conflicting records and query errors fail the gateway coverage
+gate. A receipt or journal change during inspection also prevents verification.
+The file reports whether campaign metadata was retained, independently of the
+receipt-to-row match. It contains no prompts, responses or credentials.
+
+Each lookup batches at most 100 rows, makes at most three rounds, and has a
+45-second deadline. It performs no inference, writes no vendor records, changes
+no journal amounts and releases no holds. The findings include
+`gatewayIndexVerification`; a missing match is `gateway_indexing_incomplete`.
+This verifies stored identity and coverage, not provider billing or automatic
+nesting of gateway spans under native attempt traces. Those remain separate
+qualification requirements.
 
 ## Inspection and limits
 

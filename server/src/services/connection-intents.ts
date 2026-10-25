@@ -53,7 +53,7 @@ import {
 import { instanceSettingsService } from "./instance-settings.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";
-import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { issueThreadInteractionService, type InteractionResolutionMutationOptions } from "./issue-thread-interactions.js";
 import { lockToolConnectionRuntimeInputs, toolAccessService } from "./tool-access.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { captureRunIdentity } from "./run-identity.js";
@@ -1180,7 +1180,7 @@ export function connectionIntentService(db: Db) {
     interactionId: string,
     userId: string,
     reason?: string,
-    options: { bypassCurrentMembershipCheck?: boolean } = {},
+    options: { bypassCurrentMembershipCheck?: boolean; mutationOptions?: InteractionResolutionMutationOptions } = {},
   ) {
     const loaded = await loadIntent(interactionId);
     if (loaded.interaction.addresseeUserId !== userId) throw forbidden("Only the addressed user can decline this request");
@@ -1194,6 +1194,7 @@ export function connectionIntentService(db: Db) {
       interactionId,
       { version: 1, outcome: "declined", reason: reason?.trim() || null },
       { userId },
+      options.mutationOptions,
     );
   }
 

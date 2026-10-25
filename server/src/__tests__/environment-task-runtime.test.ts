@@ -134,6 +134,30 @@ describe("plugin-provided Runner execution", () => {
     expect(environmentTaskOperationSchema.safeParse({ ...operation, path: "/arbitrary" }).success).toBe(false);
     expect(environmentTaskOperationSchema.safeParse({ kind: "archive_state", priorIdentity: identity, archiveKey: "../escape", resumeFrom: "prior" }).success).toBe(false);
   });
+  it.each(["retained", "expired"])("reads the exact successful warm owner's state during %s cleanup", async status => {
+    const value = row();
+    value.lease.status = status;
+    value.run!.status = "succeeded";
+    Object.assign(value.lease, {leasePolicy:"reuse_by_environment"});
+    Object.assign(value.lease.metadata, {runnerTaskDispatched:true,runnerTaskLifecyclePolicy:{mode:"warm",idleTimeoutMs:120000},runnerTaskIdentity:{...submit.runner}});
+    const identity = {runnerInstanceId:"runner",environmentLeaseId:leaseId,runId:"run",normalizedSessionId:"session",turnId:"turn",itemId:"item"};
+    const operation = {kind:"read_state" as const,identity};
+    const result = {kind:"state",taskId:"attempt-1",state:{schema:"paperclip.runner.durable.state.v1",...identity,lifecycle:"suspended"}};
+    const workers = worker(result);
+    await expect(executeEnvironmentTask(database(value).db,workers as never,{companyId:"company",leaseId,operation})).resolves.toEqual(result);
+    expect(workers.call).toHaveBeenCalledOnce();
+    for (const change of ["identity","policy","dispatch","lease","run"] as const) {
+      const changed = structuredClone(value);
+      if (change === "policy") Object.assign(changed.lease.metadata,{runnerTaskLifecyclePolicy:{mode:"per_turn",idleTimeoutMs:null}});
+      if (change === "dispatch") Object.assign(changed.lease.metadata,{runnerTaskDispatched:false});
+      if (change === "lease") changed.lease.status="released";
+      if (change === "run") changed.run!.status="cancelled";
+      const denied=worker(result);
+      await expect(executeEnvironmentTask(database(changed).db,denied as never,{companyId:"company",leaseId,
+        operation:change === "identity" ? {...operation,identity:{...identity,itemId:"other"}} : operation})).rejects.toThrow();
+      expect(denied.call).not.toHaveBeenCalled();
+    }
+  });
   it("requires project validation for the exact configuration, provider, and projects before credential dispatch", async () => {
     const operation = { ...submit, preparedLaunchId: "configuration", accountIdentity: "account",
       credential: { type: "codex-auth-json" as const, authJson: '{"OPENAI_API_KEY":"never-leak"}' } };

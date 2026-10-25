@@ -816,7 +816,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
 
   it("preserves live descendants and pending reopening", async () => {
     const f = await fixture();
-    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId });
+    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId,
+      executionWorkspaceId: f.workspaceId, executionWorkspacePreference: "reuse_existing" });
     expect((await f.expire()).expired).toBe(false);
     await db.delete(issues).where(eq(issues.parentId, f.issueId));
     const row = await f.row();

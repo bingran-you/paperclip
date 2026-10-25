@@ -239,12 +239,29 @@ it.each(["json", "protobuf"])("meters repeated resource/scope data and full reco
 
 it("accepts thousands of small native records while bounding their total count", async () => {
   const upstream = vi.fn<typeof fetch>(async () => Response.json({}));
-  const f = await fixture({ transport: upstream, limits: { ...EVAL_OTLP_LIMITS, maxRecords: 3000 } });
+  const f = await fixture({ transport: upstream });
   const body = JSON.stringify({ resource_logs: [{ scope_logs: [{ log_records: Array.from({ length: 2533 }, () => ({ body: { stringValue: "event" } })) }] }] });
   expect((await f.send(body, {}, "/v1/logs")).status).toBe(200);
   expect((await f.send(body, {}, "/v1/logs")).status).toBe(429);
   expect(upstream).toHaveBeenCalledTimes(1);
   expect((await f.records()).find(row => row.type === "admitted").recordCount).toBe(2533);
+});
+
+it("enforces the smaller default expanded-source allowance before export", async () => {
+  const upstream = vi.fn<typeof fetch>(async () => Response.json({}));
+  const f = await fixture({ transport: upstream });
+  const body = JSON.stringify({ resourceLogs: [{ scopeLogs: [{ logRecords: [
+    { body: { stringValue: "x".repeat(3 * 1024 * 1024) } },
+  ] }] }] });
+  expect((await f.send(body, {}, "/v1/logs")).status).toBe(200);
+  expect((await f.send(body, {}, "/v1/logs")).status).toBe(200);
+  expect((await f.send(body, {}, "/v1/logs")).status).toBe(429);
+  expect(upstream).toHaveBeenCalledTimes(2);
+  await f.relay.close();
+  const rows = await f.records();
+  expect(rows[0].limits.maxExpandedBytes).toBe(16 * 1024 * 1024);
+  expect(rows.at(-1).admittedExpandedBytes).toBeGreaterThan(12 * 1024 * 1024);
+  expect(rows.filter(row => row.type === "quota_exhausted")).toHaveLength(1);
 });
 
 it("rejects unknown protobuf fields instead of excluding forwarded data from sizing", async () => {

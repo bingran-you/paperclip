@@ -1,3 +1,4 @@
+import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
@@ -698,6 +699,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"])),
           )).limit(1);
           if (otherOwner) continue;
+          await notifyEnvironmentCleanup(tx);
           await tx.update(environmentLeases).set({ status: "pending_cleanup", updatedAt: new Date() })
             .where(eq(environmentLeases.id, lease.id));
         }
@@ -813,7 +815,15 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     options: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] } = {},
   ) {
     try {
-      const source = await getRun(run.id);
+      const [source] = await db.select({
+        errorCode: heartbeatRuns.errorCode,
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: sql<Record<string, unknown>>`jsonb_build_object(
+          'configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete'
+        )`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      ));
       const sourceHandoff = await pendingCaseHandoffForRun(db, run.id, run.companyId);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
@@ -829,9 +839,18 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       } else {
         await applyWakeQueuePostCommitEffects(postCommitEffects);
       }
-      const completed = await getRun(run.id);
-      const issueId = readNonEmptyString(completed?.contextSnapshot?.issueId)
-        ?? readNonEmptyString(completed?.contextSnapshot?.taskId) ?? completed?.nativeIssueId;
+      const [completed] = await db.select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        nativeIssueId: heartbeatRuns.nativeIssueId,
+        contextIssueId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'issueId'`,
+        contextTaskId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'taskId'`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      ));
+      const issueId = readNonEmptyString(completed?.contextIssueId)
+        ?? readNonEmptyString(completed?.contextTaskId) ?? completed?.nativeIssueId;
       if (sourceHandoff && completed?.status === "cancelled" && !completed.startedAt && issueId) {
         // A cancelled queue entry has no executeRun.finally. The canonical
         // bootstrap proof still needs to release and wake its durable handoff.

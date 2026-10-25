@@ -9,12 +9,14 @@ import { evalOtlpRejected, evalOtlpResponse, isEvalProjectId, validateEvalOtlpPa
 export const EVAL_OTLP_LIMITS = { maxRequests: 2048, maxRequestBytes: 8 * 1024 * 1024,
   maxTotalBytes: 64 * 1024 * 1024, maxConcurrent: 4,
   maxExpandedBytes: 256 * 1024 * 1024, maxRecords: 16_384 } as const;
+export const EVAL_OTLP_DEFAULT_LIMITS = { ...EVAL_OTLP_LIMITS,
+  maxExpandedBytes: 16 * 1024 * 1024, maxRecords: 4096 } as const;
 
 export async function startEvalOtlpRelay(input: {
   projectId: string; apiKey: string; campaignId: string; attemptId: string; receiptPath: string; deadlineAt: number;
   limits?: { [K in keyof typeof EVAL_OTLP_LIMITS]: number }; transport?: typeof fetch;
 }) {
-  const limits = input.limits ?? EVAL_OTLP_LIMITS;
+  const limits = input.limits ?? EVAL_OTLP_DEFAULT_LIMITS;
   if (!isEvalProjectId(input.projectId) || !input.apiKey.trim() || /[\r\n]/.test(input.apiKey)
     || ![input.campaignId, input.attemptId].every(value => /^[A-Za-z0-9_.:-]{1,512}$/.test(value))
     || !path.isAbsolute(input.receiptPath) || !Number.isFinite(input.deadlineAt)

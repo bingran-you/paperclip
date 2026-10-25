@@ -1807,7 +1807,11 @@ experimental isolated-workspaces UI. Ordinary workspace updates remain gated;
 the runtime can bind only a validated shared workspace in the issue's company
 and project. Follow-ups can therefore reuse the same sandbox and provider
 session. A staged provider package is reused only after the complete expected
-manifest and artifact hashes verify. A missing, changed, or incompatible package
+manifest and artifact hashes verify. Exact live-process reattachment uses the
+controller-owned pack and runner identities recorded after the original session
+passed authentication. It preserves protocol and capability checks. Fresh or
+replacement launches use current release authority. A missing historical receipt
+retains the current release gate; guest files cannot establish old authority. A missing, changed, or incompatible package
 must be replaced and verified before launch.
 
 Warm attachment requires two consecutive authenticated readiness snapshots.

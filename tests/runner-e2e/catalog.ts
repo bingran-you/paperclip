@@ -19,6 +19,7 @@ import { NATIVE_INSTRUCTION_SUITE, NATIVE_INSTRUCTION_BASE_SHA, nativeInstructio
 import { nativeCompletionProfile, NATIVE_COMPLETION_BUDGET_CENTS } from "./native-completion-defaults.js";
 import { chatConfirmationTasks } from "./chat-cases.js";
 import { buildConnectionSuite } from "./connection-cases.js";
+import { buildGitHubReviewJourneySuite } from "./github-review-cases.js";
 import { hiringTemplateTasks, hiringTemplateProfile, hiringTemplateDefinitionDigest } from "./hiring-template-cases.js";
 import { copilotProviderDeathTasks } from "./copilot-active-stop-tasks.js";
 import { instructionPersistenceTask } from "./instruction-persistence.js";
@@ -1800,6 +1801,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       } },
   },
   buildConnectionSuite(runnerProfiles, runnerEnvironments),
+  buildGitHubReviewJourneySuite(runnerProfiles, runnerEnvironments),
   {
     id: "repository-skills", label: "Repository skill packages", manualOnly: true,
     description: "Live private Poteto import and byte-for-byte delivery to local and Daytona agent runtimes.",
@@ -1875,8 +1877,8 @@ export function buildRunnerMatrix(
                 ]),
               ],
               requiredCredentials: [
-                ...(task.flow === "provider_connection" ? [] : [profile.credential]),
-                ...(task.flow !== "provider_connection" && environment.credential ? [environment.credential] : []),
+                ...(["provider_connection", "github_review_journey"].includes(task.flow) ? [] : [profile.credential]),
+                ...(!["provider_connection", "github_review_journey"].includes(task.flow) && environment.credential ? [environment.credential] : []),
                 ...(task.requiredCredentials ?? []),
               ],
             }))

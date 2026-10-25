@@ -26,6 +26,8 @@ OpenCode and ACPX require the existing qualified provider profiles.
 Workspace-free providers are not supported here. Codex warm retention is opt-in through `warmTaskVersion: 1`; ACPX and OpenCode remain per-turn.
 The plugin owns project workspace preparation. Core does not prepare or reuse
 a Core Git worktree for a task-only environment.
+Selecting a plain task directory does not add redundant default configuration.
+Retaining that directory does not itself change the run configuration.
 For plugin-backed project storage, Core uses the workspace provider contract.
 The storage plugin must also provide the selected execution environment.
 Its declared workspace modes and strategies remain in effect.
@@ -170,6 +172,10 @@ supports authorized run attachment. Select the agent's warm lifecycle or set
 `runnerLifecycleMode: "warm"` and `runnerIdleTimeoutMs` on its plugin environment.
 Core requires an explicitly selected account. Setup probes remain ephemeral.
 
+Plugin task execution does not create a Core-managed GitHub broker. Warm reuse
+and restart recovery use the same broker-ownership rule as initial startup.
+Project authorization is still checked for each new run.
+
 A Launcher task owns one Runner process, independently of Core heartbeat runs.
 Successful warm run completion retains the task and its mounts. The reuse
 fingerprint includes the authorized project set; changing it retires the previous
@@ -185,6 +191,9 @@ the process owner's listener and TLS settings while rotating the run identity.
 
 Idle retirement suspends and stops Runner, saves its exact checkpoint, writes
 credentials through the durable lease handoff, then completes the provider task.
+Core permits read-only suspension proof for the exact saved identity of a
+successful warm run after its reuse lease is retained or superseded. This does
+not authorize new work or file access through that lease.
 Temporary credential homes are not needed after the originating run ends.
 Termination receipts cover all run leases that owned the retired physical task.
 A stopped task gets a new provider task ID for checkpoint resumption. Inspection

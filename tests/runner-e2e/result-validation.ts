@@ -1,5 +1,6 @@
 import { validateWorkerTiming } from "./worker-timing.js";
 import { connectionCheckpoints, connectionEvidencePasses, connectionRunSignals } from "./connection-evidence.js";
+import { githubJourneyCheckpoints, gradeGitHubReviewJourney } from "./github-review-evidence.js";
 import { STARTUP_REUSE_LAYERS, STARTUP_REUSE_REASONS } from "../../packages/adapter-utils/src/startup-reuse.js";
 import type { RunnerE2ECampaignAccounting, RunnerE2EResult } from "./types.js";
 import { DEPENDABLE_CELLS } from "./dependable-qualification.js";
@@ -379,6 +380,17 @@ const fields = {
     scores: array(shape({ dimension: oneOf("questionRelevance", "useOfFacts", "proposalUsefulness", "clarity", "lowFriction"), score: integer, rationale: string, evidence: array(string) })),
     inputTokens: nullable(integer), outputTokens: nullable(integer), estimatedCostUsd: nullable(number), reservedCostUsd: number, recordedAt: date, error: optional(string),
   })),
+  githubReviewJourney: optional(closedShape({ version: integer, outcome: oneOf("running", "passed", "failed", "awaiting_user", "missing_credential", "blocked_target"),
+    phase: string, setupId: string, hosting: oneOf("self-hosted", "paperclip-cloud"), targetCommit: nullable(string), assisted: boolean,
+    dependencies: array(closedShape({ alias: string, consumer: oneOf("harness", "browser", "product-agent"), status: oneOf("ready", "unverified", "created-in-journey"), source: oneOf("onepassword", "environment", "browser-session", "product-connection") })),
+    checkpoints: closedShape(Object.fromEntries(githubJourneyCheckpoints.map(id => [id, optional(boolean)]))),
+    cleanup: closedShape({ endpoint: boolean, pullRequest: boolean, branch: boolean, app: boolean }), definitionHash: optional(string), score: optional(integer), conclusion: optional(string),
+    budgetPolicyRead: optional(oneOf("verified", "unavailable")),
+    budgetPolicies: optional(array(closedShape({ scopeType: oneOf("agent", "company"), amount: number, hardStopEnabled: boolean, unpricedUsagePolicy: oneOf("allow", "block") }))),
+    execution: optional(closedShape({ reviewId: string, issueId: string, runId: nullable(string), runStatus: optional(string), issueStatus: optional(string),
+      runtimeMode: optional(string), environmentId: optional(string), provider: optional(string), model: optional(string) })),
+    review: optional(closedShape({ id: string, repository: string, pullNumber: integer, headSha: string, state: string, score: optional(integer), conclusion: nullable(string), summaryUrl: nullable(string), checkUrl: nullable(string) })),
+    inlinePublication: optional(closedShape({ url: string, fileUrl: string, path: string, author: string, text: string })) })),
   cleanup: oneOf("not_started", "passed", "failed"),
 } satisfies Record<keyof RunnerE2EResult, Rule>;
 const result = shape(fields);
@@ -404,4 +416,5 @@ export function validateRetainedRunnerResult(
     if (checked.caseId === "cloud-onboarding" && (!checked.runIds?.length || !evidence.operations || !evidence.operations.requestCount || !evidence.operations.traceIds.length || evidence.operations.campaignId !== evidence.campaignId || evidence.operations.attemptId !== evidence.attemptId)) invalid("result.paidJourneyReceipt");
   }
   if (checked.suiteId === "provider-connections" && checked.status === "passed" && (!checked.providerConnection || !connectionEvidencePasses(checked.providerConnection))) invalid("result.providerConnection");
+  if (checked.suiteId === "github-review-journey" && checked.status === "passed" && (!checked.githubReviewJourney || checked.githubReviewJourney.outcome !== "passed" || !checked.githubReviewJourney.targetCommit || !gradeGitHubReviewJourney(checked.githubReviewJourney).every(check => check.passed))) invalid("result.githubReviewJourney");
 }

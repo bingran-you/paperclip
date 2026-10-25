@@ -161,6 +161,9 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
 
   it.each(["legacy", "native"])("resumes an accepted non-assignee queue through its %s owner", async runtimeMode => {
     const { run, pending } = await strandedMention(runtimeMode);
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...run.contextSnapshot, prompt: "large context".repeat(20_000) },
+      runnerProfileJson: { instructions: "large profile".repeat(20_000) }, stdoutExcerpt: "large output".repeat(20_000),
+    }).where(eq(heartbeatRuns.id, run.id));
     const deps = callbacks(db);
     await createHeartbeatQueue(db, deps).resumeQueuedRuns();
     expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(
@@ -170,6 +173,11 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       status: "deferred_issue_execution", runId: null, payload: pending.payload,
     });
     expect(deps.executeRun).not.toHaveBeenCalled();
+    const selected = deps.releaseIssueExecutionAndPromote.mock.calls[0][0];
+    expect(Buffer.byteLength(JSON.stringify(selected))).toBeLessThan(512);
+    expect(selected).not.toHaveProperty("contextSnapshot");
+    expect(selected).not.toHaveProperty("runnerProfileJson");
+    expect(selected).not.toHaveProperty("stdoutExcerpt");
   });
 
   it("preserves a former owner's ordinary messages for the assignment handoff", async () => {

@@ -596,7 +596,7 @@ function recoveredExecutionFailureMetadata() {
 
 async function projectCommittedRun(input: {
   db: Db;
-  run: typeof heartbeatRuns.$inferSelect;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "finishedAt" | "runtimeMode" | "nativePhase">;
   coordinator: typeof nativeRunFinalizations.$inferSelect;
 }) {
   if (!input.coordinator.resultId) return;
@@ -764,7 +764,9 @@ async function materializeCommittedReviewResponse(db: Db, runId: string) {
 
 async function acceptedResponseDigestMatches(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: Pick<typeof heartbeatRuns.$inferSelect,
+    "id" | "companyId" | "agentId" | "nativeIssueId" | "nativeSessionId" |
+    "completionContractId" | "completionContractSha256" | "runnerInstanceId">,
   accepted: typeof nativeRunResults.$inferSelect,
 ): Promise<boolean> {
   const envelope = record(accepted.resultJson);
@@ -842,7 +844,30 @@ export async function repairCommittedNativeChatResponse(
         .for("update");
       if (!issue) return false;
       const [run] = await tx
-        .select()
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          nativeIssueId: heartbeatRuns.nativeIssueId,
+          nativeSessionId: heartbeatRuns.nativeSessionId,
+          completionContractId: heartbeatRuns.completionContractId,
+          completionContractSha256: heartbeatRuns.completionContractSha256,
+          runnerInstanceId: heartbeatRuns.runnerInstanceId,
+          runtimeMode: heartbeatRuns.runtimeMode,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          nativePhase: heartbeatRuns.nativePhase,
+          finishedAt: heartbeatRuns.finishedAt,
+          resultJson: heartbeatRuns.resultJson,
+          contextSnapshot: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.contextSnapshot} is null then null
+            else jsonb_build_object(
+              'skipIssueComment', ${heartbeatRuns.contextSnapshot}->'skipIssueComment',
+              'source', ${heartbeatRuns.contextSnapshot}->'source',
+              'externalChatContinuation', ${heartbeatRuns.contextSnapshot}->'externalChatContinuation',
+              'paperclipWake', jsonb_build_object('externalInteractionContinuation',
+                ${heartbeatRuns.contextSnapshot} #> '{paperclipWake,externalInteractionContinuation}')
+            ) end`,
+        })
         .from(heartbeatRuns)
         .where(
           and(

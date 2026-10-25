@@ -371,6 +371,26 @@ and operator guidance remain under Recovery details. Source-only repair remains
 available through the board-authorized recovery resolution API and its original
 stop-receipt and evidence checks.
 
+After a remote provider pack passes full integrity verification and the session
+passes authenticated admission, the controller saves its manifest and runner
+binary identity in `provider-pack-authority.json`. The receipt binds the company,
+agent, workspace, session, runner instance, environment lease, remote working
+directory, and provider descriptor. It stays in private controller state, outside
+guest workspace and harness backup directories. Projectless runs use their
+original environment lease as the workspace identity because each run otherwise
+has a new workspace placeholder. Real workspace identities still require an exact
+match. A receipt write failure warns and returns the admitted session to its
+normal owner; it does not discard the live session handle. Future recovery still
+fails closed without matching authority.
+
+Exact process reattachment uses that saved release authority. It still verifies
+the full remote pack, runner protocol and capabilities, exact process identity,
+and authenticated PRP handshake. A new controller release alone does not require
+a live provider to change its executable files. Fresh launches and explicit
+session replacement select current release artifacts. Invalid or mismatched
+receipts fail closed. Older sessions without a receipt retain the strict current
+release gate; a sandbox's own manifest cannot supply missing launch authority.
+
 Remote provider-pack verification retries an interrupted read at most once.
 Each command retains its 30-second transport timeout. A timeout, signal, absent
 exit status, or transport exception does not prove artifact incompatibility.
@@ -380,7 +400,9 @@ a new provider attempt, so it cannot renew this exhausted read budget. A
 completed nonzero verification, digest mismatch, or
 wrong OpenCode version remains incompatible and cannot authorize a new provider
 turn. Recovery retains the exact source workspace and existing ownership gates;
-these read-only retries do not replay tools or alter a retained pack.
+these read-only retries do not replay tools or alter a retained pack. Verification
+errors include bounded, redacted output from both transport streams, including
+providers that combine stderr into stdout.
 
 ### Continue after confirmed source destruction
 

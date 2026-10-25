@@ -56,6 +56,11 @@ while keeping the harness, selected model, account bindings, instructions, and
 history. Unsupported settings produce an actionable error without changing the
 saved agent. Future runs start fresh sessions.
 
+Qualifying an existing agent's sandbox for that upgrade uses the same agent
+configuration permission as saving the upgrade. The server checks the saved
+computer and its company binding. Company owners do not need instance-admin
+access for this step; general instance environment management remains restricted.
+
 Paperclip supports several ways to run an agent's heartbeat:
 
 1. **Local CLI/session adapters** — Paperclip starts or resumes local coding-tool sessions such as Claude Code, Codex, Gemini, OpenCode, Pi, and Cursor, then tracks the run.

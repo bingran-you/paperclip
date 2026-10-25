@@ -8,6 +8,8 @@ import { openExperimentIngestion } from "./experiment-ingestion.js";
 import { collectScheduledIngestion } from "./ingestion-usage.js";
 import { importBraintrustExperiment, type BraintrustExperimentReceipt } from "./braintrust-experiment.js";
 import { verifyBraintrustIndexing } from "./braintrust-indexing.js";
+import { verifyBraintrustGatewayIndexing } from "./braintrust-gateway-indexing.js";
+import { runnerMatrix } from "./catalog.js";
 import { feedbackReviewTemplate, validateCampaignFeedbackReview, type CampaignFeedbackReview } from "./feedback-dispositions.js";
 import { expectedFixtureFeedback } from "./feedback-persistence.js";
 import { feedbackReview, summarizeCampaignFeedback, type FeedbackEvidence } from "./feedback.js";
@@ -110,8 +112,24 @@ export async function finalizeScheduledCampaign(env: NodeJS.ProcessEnv) {
     await writeFile(path.join(directory, "indexing-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
   } catch {}
   if (indexing !== "verified") findings.push("trace_or_experiment_indexing_incomplete");
+  let gatewayIndexing = "unavailable";
+  try {
+    if (!config || config.projectId !== manifest.projectId || manifest.route !== "braintrust") throw new Error("Missing gateway index scope");
+    const expected = manifest.executionIds.map(executionId => {
+      const execution = runnerMatrix.find(row => row.id === executionId);
+      if (!execution) throw new Error("Missing gateway execution");
+      const provider = execution.profile.credential === "ANTHROPIC_API_KEY" ? "anthropic" as const : "openai" as const;
+      if (!manifest.models.some(model => model.provider === provider && model.price.model === execution.profile.model)) throw new Error("Missing gateway model");
+      return { executionId, provider, model: execution.profile.model };
+    });
+    const receipt = await verifyBraintrustGatewayIndexing(config, { ledgerPath: manifest.ledgerPath,
+      campaignId: manifest.limits.campaignId, expected });
+    gatewayIndexing = receipt.status;
+    await writeFile(path.join(directory, "gateway-indexing-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+  } catch {}
+  if (gatewayIndexing !== "verified") findings.push("gateway_indexing_incomplete");
   await writeFile(path.join(directory, "findings.json"), `${JSON.stringify({ version: 1, findings,
-    nativeIndexVerification: indexing, invoiceReconciliation: "pending",
+    nativeIndexVerification: indexing, gatewayIndexVerification: gatewayIndexing, invoiceReconciliation: "pending",
     accountingStatus: campaign.operations ? evalAccountingStatus(campaign.operations) : "unavailable",
     feedbackReviewMethod: "Only exact synthetic fixture bodies with all corroborating graders are automatically dismissed; all other feedback requires review" }, null, 2)}\n`, { mode: 0o600 });
   for (const finding of findings) console.error(`::error title=Eval operations::${finding}`);
